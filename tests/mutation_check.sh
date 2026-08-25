@@ -381,6 +381,52 @@ run_mutation "escalate: record recovery silently instead of announcing it" \
   "('        if row is None and ok:', '        if ok:')" \
   "test_escalate"
 
+# ---------------------------------------------------------------------------
+# ENH-1 — rate-limit back-off keyed (instance, method), honouring Retry-After.
+# Slack scopes a 429 to one method on one workspace; each of these mutations, if it
+# survived, would either silence sends because reads were too fast, invent limits the
+# platform never stated, or turn a 429 into a dropped customer reply.
+# ---------------------------------------------------------------------------
+
+# ENH-1 — a read 429 must not pause sends: key collapsed to the instance alone.
+run_mutation "ratelimit: back-off keyed per instance only (a read 429 pauses sends)" \
+  "core/ratelimit.py" \
+  "('        return (instance, method)', '        return (instance,)')" \
+  "test_ratelimit"
+
+# ENH-1 — one workspace's 429 must not pause another's: key collapsed to the method.
+run_mutation "ratelimit: back-off keyed per method only (crosses instances)" \
+  "core/ratelimit.py" \
+  "('        return (instance, method)', '        return (method,)')" \
+  "test_ratelimit"
+
+# ENH-1 — Retry-After is the platform's number EXACTLY, never a padded guess.
+run_mutation "ratelimit: Retry-After padded instead of honoured exactly" \
+  "core/ratelimit.py" \
+  "('            self._clock() + _seconds(retry_after))', '            self._clock() + _seconds(retry_after) + 1.0)')" \
+  "test_ratelimit"
+
+# ENH-1 — honouring means actually waiting: a call that skips the hold hammers the
+# platform and escalates the very 429 it just received.
+run_mutation "ratelimit: guarded call skips the wait and hammers the platform" \
+  "core/ratelimit.py" \
+  "('                self._sleep(delay)', '                pass')" \
+  "test_ratelimit"
+
+# ENH-1 — THE drop: exhausted retries must SURFACE the 429, never return None. A None
+# here is a customer reply that silently ceased to exist.
+run_mutation "ratelimit: exhausted retries return None instead of surfacing the 429" \
+  "core/ratelimit.py" \
+  "('        raise last', '        return None')" \
+  "test_ratelimit"
+
+# ENH-1 — junk Retry-After must fail at the boundary; a NaN admitted into the clock
+# arithmetic compares false against everything and the hold never engages.
+run_mutation "ratelimit: junk Retry-After admitted into the clock arithmetic" \
+  "core/ratelimit.py" \
+  "('    if not math.isfinite(s) or s < 0:', '    if False:')" \
+  "test_ratelimit"
+
 # R21 — the acceptance is that the limits section NAMES what the engine does not do.
 # Deleting it must go red, or "honest limits" is a heading, not a property.
 run_mutation "docs: honest-limits section deleted from the quickstart" \

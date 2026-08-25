@@ -61,7 +61,11 @@ channel and a direct-reply DM without branching.
 
 1. No secrets in code or defaults — auth arrives as `env:NAME` references from config.
 2. No listening ports. Outbound-only, or loopback-bound bridges when a local HTTP surface is needed.
-3. Rate-limit friendliness is the adapter's job: back off on platform 429s, expose the backoff in `health().detail`.
+3. On a platform 429, raise `core.ratelimit.RateLimited(retry_after)` with the platform's
+   Retry-After value — do not sleep inside the adapter. The engine holds back-off state per
+   (instance, method) in `core/ratelimit.py`, because a 429 is scoped to one method on one
+   workspace and limits are discovered from Retry-After, never assumed. Expose any active
+   backoff in `health().detail`.
 4. Every send primitive logs to the instance's audit trail before returning.
 5. A health check must be able to FAIL. A check that can only pass or no-op is a defect (this
    repo exists partly because of one — see `docs/PROVENANCE.md`).
