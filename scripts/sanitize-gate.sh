@@ -45,7 +45,12 @@ IPV4_ALLOW='127\.0\.0\.1|0\.0\.0\.0'
 
 list_files() {
   local root="$1"
-  if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  # An explicit directory argument means "scan exactly this tree" — walk the
+  # filesystem. Consulting git there would honor a PARENT repo's ignore rules
+  # and silently skip the very files the caller asked about.
+  if [ "${EXPLICIT_TARGET:-0}" = "1" ]; then
+    find "$root" -type f -not -path '*/.git/*' 2>/dev/null
+  elif git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     # tracked AND untracked-but-not-ignored: a secret in a not-yet-added file
     # must be caught before it can ever be staged
     git -C "$root" ls-files -z --cached --others --exclude-standard \
@@ -158,7 +163,8 @@ case "${1:-}" in
   --self-test) self_test; exit $? ;;
   -h|--help)   sed -n '2,22p' "$0"; exit 0 ;;
   "")          ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)" ;;
-  *)           ROOT="$1"; [ -d "$ROOT" ] || { echo "sanitize-gate: no such dir: $ROOT" >&2; exit 2; } ;;
+  *)           ROOT="$1"; EXPLICIT_TARGET=1; export EXPLICIT_TARGET
+               [ -d "$ROOT" ] || { echo "sanitize-gate: no such dir: $ROOT" >&2; exit 2; } ;;
 esac
 
 scan "$ROOT"
