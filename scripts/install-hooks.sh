@@ -13,18 +13,21 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 
 cat > "$ROOT/.git/hooks/pre-commit" <<'EOF'
-#!/usr/bin/env sh
+#!/usr/bin/env bash
 R="$(git rev-parse --show-toplevel)"
-exec "$R/scripts/sanitize-gate.sh"
+exec bash "$R/scripts/sanitize-gate.sh"
 EOF
 
+# NOTE: invoke the gates with BASH explicitly. /bin/sh is dash here, which lacks
+# `set -o pipefail` — running mutation_check.sh under sh fails on line 11 and blocks the
+# push for a shell-incompatibility reason rather than a real finding.
 cat > "$ROOT/.git/hooks/pre-push" <<'EOF'
-#!/usr/bin/env sh
+#!/usr/bin/env bash
 R="$(git rev-parse --show-toplevel)"
 set -e
-"$R/scripts/sanitize-gate.sh"
+bash "$R/scripts/sanitize-gate.sh"
 python3 -m unittest discover -s "$R/tests" -q
-sh "$R/tests/mutation_check.sh"
+bash "$R/tests/mutation_check.sh"
 EOF
 
 chmod +x "$ROOT/.git/hooks/pre-commit" "$ROOT/.git/hooks/pre-push"
