@@ -13,6 +13,20 @@ produced. Symptom first, because that is what you have at 2am.
 | `no instances configured` | empty `instances` list | the engine would poll nothing, so it refuses |
 | `config file not found` / `not valid JSON` | path or syntax | check you copied `settings.example.json` |
 
+## "My first poll returned 0 messages"
+
+`FIRST POLL OK — 0 polled` is a *successful* poll of a quiet source, not a failure.
+
+| Situation | Why | What to do |
+|---|---|---|
+| fake adapter, no `--seed-demo` | its memory starts empty | re-run with `--seed-demo` |
+| second run after `--seed-demo` | the cursor was persisted; nothing is new | working as designed — that is the replay-safety you want |
+| messages exist but are filtered out | a polled message's `channel_id` did not match any configured channel | check `instances[].channels[].id` against what the platform actually reports |
+| you expected old history | a first cursor starts from the adapter's default window, not from the beginning of time | backfill is an adapter capability (`history`), not a first-poll feature |
+
+To start over from a clean slate, point `engine.state_dir` somewhere new (or delete the
+state directory you configured) — cursors live there, nowhere else.
+
 ## "It is not sending anything"
 
 **Check the reply policy first.** Deny-by-default means silence is the *designed* behaviour for

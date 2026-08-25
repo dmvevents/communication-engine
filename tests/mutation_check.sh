@@ -15,8 +15,9 @@ PASS=0; FAIL=0
 run_mutation() {   # $1=label  $2=file  $3=python-replace-expr  $4=test-module
   local label="$1" file="$2" expr="$3" mod="$4"
   local tmp; tmp="$(mktemp -d)"
-  # channels/ ships code too (the fake adapter is contract-tested), so mutate against it.
-  cp -r "$ROOT"/core "$ROOT"/tests "$ROOT"/channels "$tmp"/ 2>/dev/null
+  # channels/ ships code too (the fake adapter is contract-tested), and docs/ + scripts/
+  # are tested like code (R21: the docs are shipped interface), so mutate against them all.
+  cp -r "$ROOT"/core "$ROOT"/tests "$ROOT"/channels "$ROOT"/docs "$ROOT"/scripts "$tmp"/ 2>/dev/null
 
   if ! python3 - "$tmp/$file" <<PY
 import sys, pathlib
@@ -334,6 +335,34 @@ run_mutation "escalate: record recovery silently instead of announcing it" \
   "core/escalate.py" \
   "('        if row is None and ok:', '        if ok:')" \
   "test_escalate"
+
+# R21 — the acceptance is that the limits section NAMES what the engine does not do.
+# Deleting it must go red, or "honest limits" is a heading, not a property.
+run_mutation "docs: honest-limits section deleted from the quickstart" \
+  "docs/QUICKSTART.md" \
+  "('## Honest limits', '## Notes')" \
+  "test_docs"
+
+# R21 — the quickstart's own stated target is a first successful poll; a quickstart that
+# no longer walks the adopter to one has lost its purpose without losing its title.
+run_mutation "docs: quickstart first-poll step deleted" \
+  "docs/QUICKSTART.md" \
+  "('python3 scripts/first-poll.py --config settings.json --seed-demo', 'python3 -m unittest discover -s tests -q')" \
+  "test_docs"
+
+# R21 — a runbook that cites a method that no longer exists teaches an adopter a lie at
+# 2am. The citation extractor must catch API drift.
+run_mutation "docs: runbook cites a recovery API that does not exist" \
+  "docs/RUNBOOK.md" \
+  "('outbox.recover()', 'outbox.recover_all()')" \
+  "test_docs"
+
+# R21 — the journal row is the proof the first poll happened; a first-poll that prints
+# OK without journaling is the incumbent's inert health check wearing a new name.
+run_mutation "first-poll: a polled message is no longer journaled" \
+  "scripts/first-poll.py" \
+  "('    return journal.record(', '    return object() or journal.record(')" \
+  "test_docs"
 
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"

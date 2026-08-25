@@ -66,16 +66,33 @@ This is the one decision that can embarrass you, so it is deny-by-default:
 omission. Start every channel at `never`, watch what the engine *would* have done, and only
 then promote a channel you are confident about.
 
-## 5. Dry run with the fake adapter
+## 5. First poll — the fake adapter, but YOUR config
 
-Set `"adapter": "fake"` and exercise the pipeline with no network at all:
+Prove the target of this document against the file you just edited, with no network at all.
+Two edits to `settings.json` first:
+
+- set `"adapter": "fake"` on the instance you kept;
+- **delete the instances you are not using.** Every instance's `env:` references must
+  resolve at load time, so a leftover example stub blocks startup (by design — see
+  `docs/RUNBOOK.md`, "The engine refuses to start").
+
+```sh
+python3 scripts/first-poll.py --config settings.json --seed-demo
+```
+
+Expect one line per channel and then `FIRST POLL OK`. That was the real pipeline — poll →
+store → classify → journal → cursor — run against your config; look in `state/journal.db`
+for the demo message and its classification. `--seed-demo` plants one message per channel
+inside the fake adapter's memory; without it a first poll legitimately returns 0 messages.
+Run the command a second time *without* `--seed-demo`: the cursor was persisted, nothing is
+re-read, and the journal count does not move. Polling is read-only — this script cannot
+send (there is a test asserting it never even imports the send layer).
+
+The same pipeline shape is pinned by the suite you ran in step 1:
 
 ```sh
 python3 -m unittest tests.test_portability -k EndToEnd -v
 ```
-
-That test builds the whole pipeline — store, journal, classifier, outbox — from a config in a
-temp directory, proving your understanding of the shape before real credentials are involved.
 
 ## 6. Tune the classifier to your team's vocabulary
 
@@ -107,7 +124,8 @@ minutes. See `docs/RUNBOOK.md` for how to check its behaviour on your own messag
   with zero `core/` changes (`tests/test_extensibility.py`) — not as shipped platform adapters.
 - **Read parity against an existing system has not been demonstrated** over a long window
   (gate G1). If you are replacing an incumbent, run both and diff before trusting this one.
-- There is **no scheduler in this repo**. The engine gives you poll/classify/journal/outbox
-  primitives; you invoke them from cron, a loop, or your own supervisor.
+- There is **no scheduler in this repo**. `scripts/first-poll.py` runs exactly one cycle;
+  the engine gives you poll/classify/journal/outbox primitives and you invoke them from
+  cron, a loop, or your own supervisor.
 - CI on the origin repo is currently disabled by account billing, so the gates run via local
   git hooks. Verify they are installed on your clone (`scripts/install-hooks.sh`).
