@@ -103,6 +103,92 @@ run_mutation "parity: swallow query errors and return an empty set" \
   "('        raise ParityError(f\"query failed on {db_path} ({table}.{ts_col}): {ex}\") from ex', '        rows = []')" \
   "test_parity"
 
+# ---------------------------------------------------------------------------
+# G2 — the send path. Every one of these mutations, if it survived, would either
+# double-message a customer in Anton's name or silently drop a reply.
+# ---------------------------------------------------------------------------
+
+# R2 — dedupe. Without it, a retry re-sends an already-delivered message.
+run_mutation "outbox: drop the already-delivered dedupe" \
+  "core/outbox.py" \
+  "('        if row and row[\"state\"] in (VERIFIED, COMMITTED):', '        if False:')" \
+  "test_outbox_faults"
+
+# R1 — recovery must PROVE prior delivery by read-back before re-sending. This is the
+# exact 24-auto-reconcile bug: crash after send, then blindly re-send.
+run_mutation "outbox: recovery re-sends without proving prior delivery" \
+  "core/outbox.py" \
+  "('            if self.adapter.read_back(target, key):', '            if False:')" \
+  "test_outbox_faults"
+
+# R1 — read-back verification before claiming success.
+run_mutation "outbox: skip read-back verification" \
+  "core/outbox.py" \
+  "('        if not self.adapter.read_back(target, key):', '        if False:')" \
+  "test_outbox_faults"
+
+# R10 — default DENY. A target absent from the policy map must not be sendable.
+run_mutation "outbox: default policy becomes direct instead of never" \
+  "core/outbox.py" \
+  "('        return self.policies.get(target, \"never\")', '        return self.policies.get(target, \"direct\")')" \
+  "test_outbox_faults"
+
+# R10 — a staged target must never reach the adapter (the operator gate).
+run_mutation "outbox: staged target falls through to the adapter" \
+  "core/outbox.py" \
+  "('            return {\"key\": key, \"receipt\": None, \"state\": STAGED, \"staged\": True}', '            pass')" \
+  "test_outbox_faults"
+
+# ---------------------------------------------------------------------------
+# G4 — checks that cannot silently no-op.
+# ---------------------------------------------------------------------------
+
+# R7 — a PASS with zero evidence is the vacuous pass.
+run_mutation "checks: allow PASS having inspected nothing" \
+  "core/checks.py" \
+  "('        if inspected <= 0:', '        if False:')" \
+  "test_checks"
+
+# R5 — a check returning None must become a FAIL, not silence.
+run_mutation "checks: stop converting a None verdict into a failure" \
+  "core/checks.py" \
+  "('            if v is None:', '            if False:')" \
+  "test_checks"
+
+# R5 — a check returning junk must become a FAIL.
+run_mutation "checks: stop rejecting non-Verdict returns" \
+  "core/checks.py" \
+  "('            if not isinstance(v, Verdict):', '            if False:')" \
+  "test_checks"
+
+# R6 — a watcher whose source vanished is unhealthy (the F-1 zombie class).
+run_mutation "checks: treat a missing watcher source as healthy" \
+  "core/checks.py" \
+  "('    if not exists:', '    if False:')" \
+  "test_checks"
+
+# The action-only-log trap: silence must read as health for action-only sources.
+run_mutation "checks: judge an action-only log by its age" \
+  "core/checks.py" \
+  "('    if action_only_log:', '    if False:')" \
+  "test_checks"
+
+# ---------------------------------------------------------------------------
+# G3 — the owed-work edge.
+# ---------------------------------------------------------------------------
+
+# R3 — backoff must never suppress owed work (the 8h17m idle).
+run_mutation "owed: let backoff suppress unattended owed work" \
+  "core/owed.py" \
+  "('        if self.unattended():', '        if False:')" \
+  "test_owed"
+
+# R4 — a driver STRING is not evidence; liveness is.
+run_mutation "owed: trust the driver field without checking liveness" \
+  "core/owed.py" \
+  "('            if not row[\"driver\"] or not self.driver_alive(row[\"driver\"]):', '            if not row[\"driver\"]:')" \
+  "test_owed"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }
