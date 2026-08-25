@@ -350,6 +350,13 @@ run_mutation "docs: quickstart first-poll step deleted" \
   "('python3 scripts/first-poll.py --config settings.json --seed-demo', 'python3 -m unittest discover -s tests -q')" \
   "test_docs"
 
+# R21 — the taxonomy-placement sentence exists because a real adopter put "taxonomy" at
+# the top level and the loader silently ignored it. Reintroducing the vagueness must go red.
+run_mutation "docs: taxonomy placement guidance made vague again" \
+  "docs/QUICKSTART.md" \
+  "('**per-instance**', 'flexible')" \
+  "test_docs"
+
 # R21 — a runbook that cites a method that no longer exists teaches an adopter a lie at
 # 2am. The citation extractor must catch API drift.
 run_mutation "docs: runbook cites a recovery API that does not exist" \

@@ -119,6 +119,20 @@ class DocCitationsTest(unittest.TestCase):
         self.assertEqual(offenders, [],
                          "docs cite core APIs that do not exist:\n" + "\n".join(offenders))
 
+    def test_taxonomy_guidance_names_its_placement(self):
+        """The first non-author adoption run (2026-08-25) put "taxonomy" at the TOP level
+        of settings.json, where the loader silently ignores it — the adopter believed the
+        classifier was retuned when nothing had changed. The doc must state the placement,
+        and the per-instance field it points at must still exist."""
+        import dataclasses
+        from core.config import InstanceConfig
+        self.assertIn("per-instance", self.docs[QUICKSTART],
+                      "the quickstart no longer says WHERE the taxonomy lives — the one "
+                      "placement mistake a real adopter actually made")
+        self.assertIn("taxonomy", {f.name for f in dataclasses.fields(InstanceConfig)},
+                      "taxonomy is no longer a per-instance config field — rewrite the "
+                      "quickstart's step 6, then this test")
+
     def test_runbook_helpers_exist_as_documented(self):
         runbook = self.docs[RUNBOOK]
         for name in ("freshness_check", "Verdict.passed", "Taxonomy.from_config",

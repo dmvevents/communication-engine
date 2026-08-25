@@ -72,9 +72,10 @@ Prove the target of this document against the file you just edited, with no netw
 Two edits to `settings.json` first:
 
 - set `"adapter": "fake"` on the instance you kept;
-- **delete the instances you are not using.** Every instance's `env:` references must
-  resolve at load time, so a leftover example stub blocks startup (by design — see
-  `docs/RUNBOOK.md`, "The engine refuses to start").
+- **delete the instances you are not using.** A leftover example stub blocks startup:
+  first as an unknown adapter (only types discovered under `channels/` are accepted), and
+  — once an instance names a real adapter — because its `auth` env references must resolve
+  at load time (by design — see `docs/RUNBOOK.md`, "The engine refuses to start").
 
 ```sh
 python3 scripts/first-poll.py --config settings.json --seed-demo
@@ -96,24 +97,35 @@ python3 -m unittest tests.test_portability -k EndToEnd -v
 
 ## 6. Tune the classifier to your team's vocabulary
 
-Your team's words are not ours. Override them in config, never in code:
+Your team's words are not ours. Override them in config, never in code. The taxonomy is
+**per-instance** — it lives *inside* the instance object, next to that instance's `adapter`
+and `channels`. A `"taxonomy"` at the top level of the file is not read (the first
+non-author adoption run made exactly that mistake and the classifier silently kept our
+vocabulary):
 
 ```json
-"taxonomy": {
-  "exec_verbs": ["provision", "deploy", "roll back"],
-  "commitment_phrases": ["sign off", "by when", "eta"]
-}
+"instances": [{
+  "name": "my-team-slack",
+  "adapter": "fake",
+  "taxonomy": {
+    "exec_verbs": ["provision", "deploy", "roll back"],
+    "commitment_phrases": ["sign off", "by when", "eta"]
+  }
+}]
 ```
 
-Classification decides whether a message is treated as work to execute, so it is worth ten
-minutes. See `docs/RUNBOOK.md` for how to check its behaviour on your own message samples.
+Re-run the first poll after editing and confirm the `kind` on a fresh demo message moved
+the way you expected. Classification decides whether a message is treated as work to
+execute, so it is worth ten minutes. See `docs/RUNBOOK.md` for how to check its behaviour
+on your own message samples.
 
 ## What to expect next
 
 - `state/journal.db` — one row per distinct inbound message, with its classification. Replay
   is safe: re-reading a window never duplicates a row.
 - `state/outbox.db` — every send attempt with its state (`INTENT` → `SENT` → `VERIFIED` →
-  `COMMITTED`) and any staged drafts awaiting a human.
+  `COMMITTED`) and any staged drafts awaiting a human. Created on the first staged or sent
+  draft — a read-only first poll leaves no outbox, correctly.
 - `state/messages.db` — the message store.
 
 ## Honest limits
