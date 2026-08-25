@@ -1,4 +1,4 @@
-"""core/journal.py — the idempotent audit journal (gate G10; requirement R16).
+"""core/journal.py — the idempotent audit journal (gate G10; requirements R16, R23).
 
 Measured problem this replaces
 ------------------------------
@@ -10,39 +10,83 @@ An audit trail that inflates is not an audit trail: you cannot count how many as
 measure time-to-first-response, or reconstruct what happened, because you cannot tell a
 repeated ask from a repeated *log write*.
 
-Design
-------
-* one row per (channel, message ts) — recording is idempotent, so replaying a window is free
-* the row is UPDATED, never duplicated, when a message is re-seen (last_seen_at advances and
-  seen_count increments, so re-processing is observable without inflating the ask count)
-* `distinct_count() == row_count()` is an invariant a test defends
-* the append path records the classification and the routing decision, because the audit
-  question is never just "what arrived" but "what did we decide, and did we act"
+R23 — message REVISIONS (found by probing this module, not by reading it)
+------------------------------------------------------------------------
+Chat messages get edited, and every platform we care about supports it. The first version of
+this journal treated any re-sighting as a duplicate, so an edit was silently discarded:
+
+    "Notes from the meeting are in the doc."   -> recorded STATEMENT
+    edited to "Please deploy the patched image now."
+    -> journal still said STATEMENT, and still held the ORIGINAL text
+
+Two harms. The audit **misquoted the channel**, and an edit that turns a remark into an
+instruction was never acted on. Idempotence must therefore be keyed on *content*, not merely
+on identity:
+
+* same (channel, ts) and same text  -> a re-sighting: bump seen_count, change nothing else
+* same (channel, ts), text CHANGED  -> a revision: keep full history, update the live row,
+  re-classify, and make it visible that any earlier answer predates the edit
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS journal (
-    channel       TEXT NOT NULL,
-    ts            TEXT NOT NULL,
-    sender_id     TEXT,
-    text          TEXT,
-    kind          TEXT,
-    reason        TEXT,
-    routed        TEXT,
-    first_seen_at REAL NOT NULL,
-    last_seen_at  REAL NOT NULL,
-    seen_count    INTEGER NOT NULL DEFAULT 1,
-    responded_at  REAL,
-    response_key  TEXT,
+    channel        TEXT NOT NULL,
+    ts             TEXT NOT NULL,
+    sender_id      TEXT,
+    text           TEXT,
+    text_hash      TEXT,
+    kind           TEXT,
+    reason         TEXT,
+    routed         TEXT,
+    first_seen_at  REAL NOT NULL,
+    last_seen_at   REAL NOT NULL,
+    seen_count     INTEGER NOT NULL DEFAULT 1,
+    revision       INTEGER NOT NULL DEFAULT 1,
+    responded_at   REAL,
+    response_key   TEXT,
     PRIMARY KEY (channel, ts)
 );
+CREATE TABLE IF NOT EXISTS revisions (
+    channel     TEXT NOT NULL,
+    ts          TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    text        TEXT,
+    kind        TEXT,
+    reason      TEXT,
+    recorded_at REAL NOT NULL,
+    PRIMARY KEY (channel, ts, seq)
+);
 """
+
+
+def _hash(text: str | None) -> str:
+    return hashlib.sha256((text or "").encode()).hexdigest()
+
+
+@dataclass
+class RecordResult:
+    """Truthy only for a first sighting, so `if journal.record(...)` still reads naturally."""
+    status: str        # "new" | "reseen" | "revised"
+    revision: int = 1
+
+    @property
+    def is_new(self) -> bool:
+        return self.status == "new"
+
+    @property
+    def is_revision(self) -> bool:
+        return self.status == "revised"
+
+    def __bool__(self) -> bool:
+        return self.is_new
 
 
 class Journal:
@@ -54,36 +98,75 @@ class Journal:
 
     def record(self, channel: str, ts: str, sender_id: str | None = None,
                text: str = "", kind: str | None = None, reason: str | None = None,
-               routed: str | None = None) -> bool:
-        """Record an inbound message. Returns True if this is the FIRST sighting.
+               routed: str | None = None) -> RecordResult:
+        """Record an inbound message. Idempotent on IDENTITY and sensitive to CONTENT.
 
-        Re-recording the same (channel, ts) updates last_seen_at and increments seen_count.
-        It never appends a second row, which is the whole point.
+        Returns a RecordResult whose truthiness is "this is the first sighting", so callers
+        can still write `if journal.record(...)`. Check `.is_revision` to re-route an edit.
         """
         now = time.time()
+        h = _hash(text)
         existing = self.get(channel, ts)
+
         if existing is None:
             self.conn.execute(
-                "INSERT INTO journal (channel, ts, sender_id, text, kind, reason, routed, "
-                "first_seen_at, last_seen_at, seen_count) VALUES (?,?,?,?,?,?,?,?,?,1)",
-                (channel, str(ts), sender_id, text, kind, reason, routed, now, now))
+                "INSERT INTO journal (channel, ts, sender_id, text, text_hash, kind, reason, "
+                "routed, first_seen_at, last_seen_at, seen_count, revision) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,1,1)",
+                (channel, str(ts), sender_id, text, h, kind, reason, routed, now, now))
+            self._add_revision(channel, ts, 1, text, kind, reason, now)
             self.conn.commit()
-            return True
+            return RecordResult("new", 1)
+
+        # A revision is only claimed when the caller actually supplied text. A bare
+        # re-sighting (text="") must not be mistaken for an edit-to-empty.
+        edited = bool(text) and existing["text_hash"] not in (None, h)
+        if edited:
+            rev = int(existing["revision"]) + 1
+            self.conn.execute(
+                "UPDATE journal SET text=?, text_hash=?, kind=COALESCE(?, kind), "
+                "reason=COALESCE(?, reason), routed=COALESCE(?, routed), "
+                "last_seen_at=?, seen_count=seen_count+1, revision=? "
+                "WHERE channel=? AND ts=?",
+                (text, h, kind, reason, routed, now, rev, channel, str(ts)))
+            self._add_revision(channel, ts, rev, text, kind, reason, now)
+            self.conn.commit()
+            return RecordResult("revised", rev)
+
         self.conn.execute(
             "UPDATE journal SET last_seen_at=?, seen_count=seen_count+1, "
-            # a later pass may refine the classification/routing; keep the newest non-null
+            # a later pass may refine the classification; keep the newest non-null
             "kind=COALESCE(?, kind), reason=COALESCE(?, reason), routed=COALESCE(?, routed) "
             "WHERE channel=? AND ts=?",
             (now, kind, reason, routed, channel, str(ts)))
         self.conn.commit()
-        return False
+        return RecordResult("reseen", int(existing["revision"]))
+
+    def _add_revision(self, channel, ts, seq, text, kind, reason, when):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO revisions (channel, ts, seq, text, kind, reason, "
+            "recorded_at) VALUES (?,?,?,?,?,?,?)",
+            (channel, str(ts), seq, text, kind, reason, when))
+
+    def revisions(self, channel: str, ts: str) -> list:
+        return self.conn.execute(
+            "SELECT * FROM revisions WHERE channel=? AND ts=? ORDER BY seq",
+            (channel, str(ts))).fetchall()
+
+    def edited_after_response(self) -> list:
+        """Messages edited AFTER we answered them — any earlier reply may now be wrong.
+
+        This is the audit question an edit creates: we answered version 1, the channel now
+        shows version 2, and nobody has looked at the difference.
+        """
+        return self.conn.execute(
+            "SELECT j.* FROM journal j JOIN revisions r "
+            "ON r.channel=j.channel AND r.ts=j.ts "
+            "WHERE j.responded_at IS NOT NULL AND r.recorded_at > j.responded_at "
+            "GROUP BY j.channel, j.ts").fetchall()
 
     def mark_responded(self, channel: str, ts: str, response_key: str) -> None:
-        """Tie an inbound ask to the outbox key that answered it.
-
-        Without this link the audit cannot answer 'which asks are still unanswered', which
-        is the question the owed-work edge depends on.
-        """
+        """Tie an inbound ask to the outbox key that answered it."""
         self.conn.execute(
             "UPDATE journal SET responded_at=?, response_key=? WHERE channel=? AND ts=?",
             (time.time(), response_key, channel, str(ts)))
@@ -113,11 +196,9 @@ class Journal:
             "SELECT kind, count(*) FROM journal GROUP BY kind")}
 
     def export_jsonl(self) -> str:
-        """Human/tooling-readable dump — one line per DISTINCT message, never per sighting."""
-        out = []
-        for r in self.conn.execute("SELECT * FROM journal ORDER BY ts"):
-            out.append(json.dumps({k: r[k] for k in r.keys()}))
-        return "\n".join(out)
+        """One line per DISTINCT message, never per sighting."""
+        return "\n".join(json.dumps({k: r[k] for k in r.keys()})
+                         for r in self.conn.execute("SELECT * FROM journal ORDER BY ts"))
 
     def close(self) -> None:
         self.conn.close()

@@ -125,5 +125,123 @@ class JournalTest(unittest.TestCase):
                          "a restarted journal re-appended an existing message")
 
 
+class RevisionTest(unittest.TestCase):
+    """R23 — edits. Found by probing, not by reading: the first version of this journal
+    silently discarded an edit, keeping the ORIGINAL text and classification."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.j = Journal(Path(self.tmp.name) / "j.db")
+
+    def tearDown(self):
+        self.j.close()
+        self.tmp.cleanup()
+
+    def test_an_edit_updates_the_recorded_text(self):
+        self.j.record(CH, "1.1", text="Notes from the meeting are in the doc.",
+                      kind="STATEMENT")
+        self.j.record(CH, "1.1", text="Please deploy the patched image now.",
+                      kind="EXEC-REQUEST")
+        row = self.j.get(CH, "1.1")
+        self.assertIn("deploy", row["text"],
+                      "the audit still quotes the ORIGINAL text — it misquotes the channel")
+        self.assertEqual(row["kind"], "EXEC-REQUEST",
+                         "an edit that turns a remark into an instruction kept the old class")
+
+    def test_an_edit_is_reported_as_a_revision_not_a_duplicate(self):
+        self.j.record(CH, "1.1", text="first")
+        res = self.j.record(CH, "1.1", text="second")
+        self.assertTrue(res.is_revision)
+        self.assertFalse(res.is_new)
+        self.assertEqual(res.revision, 2)
+
+    def test_an_edit_does_not_create_a_second_row(self):
+        self.j.record(CH, "1.1", text="first")
+        self.j.record(CH, "1.1", text="second")
+        self.j.record(CH, "1.1", text="third")
+        self.assertEqual(self.j.row_count(), 1)
+        self.assertEqual(self.j.row_count(), self.j.distinct_count())
+
+    def test_full_revision_history_is_retained_for_audit(self):
+        self.j.record(CH, "1.1", text="v1", kind="STATEMENT")
+        self.j.record(CH, "1.1", text="v2", kind="QUESTION")
+        self.j.record(CH, "1.1", text="v3", kind="EXEC-REQUEST")
+        revs = self.j.revisions(CH, "1.1")
+        self.assertEqual([r["text"] for r in revs], ["v1", "v2", "v3"])
+        self.assertEqual([r["kind"] for r in revs],
+                         ["STATEMENT", "QUESTION", "EXEC-REQUEST"])
+
+    def test_identical_text_is_a_resighting_not_a_revision(self):
+        self.j.record(CH, "1.1", text="same")
+        res = self.j.record(CH, "1.1", text="same")
+        self.assertEqual(res.status, "reseen")
+        self.assertEqual(self.j.get(CH, "1.1")["revision"], 1)
+        self.assertEqual(len(self.j.revisions(CH, "1.1")), 1)
+
+    def test_a_bare_resighting_with_no_text_is_not_an_edit_to_empty(self):
+        """A poller that re-sights without re-sending the body must not wipe the record."""
+        self.j.record(CH, "1.1", text="real content", kind="QUESTION")
+        res = self.j.record(CH, "1.1")
+        self.assertEqual(res.status, "reseen")
+        self.assertEqual(self.j.get(CH, "1.1")["text"], "real content")
+
+    def test_an_edit_after_we_answered_is_surfaced(self):
+        """We answered version 1; the channel now shows version 2. Somebody must look."""
+        self.j.record(CH, "1.1", text="original ask")
+        self.j.mark_responded(CH, "1.1", response_key="k1")
+        self.assertEqual(self.j.edited_after_response(), [])
+        self.j.record(CH, "1.1", text="actually, do something else entirely")
+        flagged = self.j.edited_after_response()
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged[0]["ts"], "1.1")
+
+    def test_seen_count_still_counts_every_sighting_including_edits(self):
+        self.j.record(CH, "1.1", text="a")
+        self.j.record(CH, "1.1", text="a")
+        self.j.record(CH, "1.1", text="b")
+        self.assertEqual(self.j.get(CH, "1.1")["seen_count"], 3)
+
+
+class ConcurrencyTest(unittest.TestCase):
+    """The outbox held under 6 concurrent senders when probed. A property that holds by
+    accident is one refactor from breaking, so it is pinned here."""
+
+    def test_concurrent_senders_deliver_exactly_once(self):
+        import threading
+        from core.outbox import Outbox
+
+        class A:
+            def __init__(self):
+                self.delivered = []
+                self.lock = threading.Lock()
+
+            def send(self, target, text, key=None):
+                with self.lock:
+                    self.delivered.append((target, text, key))
+                return {"ts": "r", "key": key}
+
+            def read_back(self, target, key):
+                with self.lock:
+                    return any(k == key for _, _, k in self.delivered)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "o.db"
+            ad = A()
+            errs = []
+
+            def worker():
+                try:
+                    Outbox(db, ad, {"C": "direct"}).send("C", "1.1", "same text")
+                except BaseException as e:      # noqa: BLE001
+                    errs.append(type(e).__name__)
+
+            threads = [threading.Thread(target=worker) for _ in range(6)]
+            [t.start() for t in threads]
+            [t.join() for t in threads]
+            self.assertEqual(len(ad.delivered), 1,
+                             f"{len(ad.delivered)} deliveries from 6 concurrent senders")
+            self.assertEqual(errs, [], f"concurrent senders raised: {errs}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

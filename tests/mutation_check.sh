@@ -263,6 +263,18 @@ run_mutation "config: ignore the base dir when resolving paths" \
   "('    return p if p.is_absolute() else (base / p)', '    return p')" \
   "test_portability"
 
+# R23 — an EDIT must be detected by content, not swallowed as a duplicate.
+run_mutation "journal: treat an edited message as a plain re-sighting" \
+  "core/journal.py" \
+  "('        edited = bool(text) and existing[\"text_hash\"] not in (None, h)', '        edited = False')" \
+  "test_journal"
+
+# R23 — a bare re-sighting must not be mistaken for an edit-to-empty.
+run_mutation "journal: treat a bodyless re-sighting as an edit" \
+  "core/journal.py" \
+  "('        edited = bool(text) and existing[\"text_hash\"] not in (None, h)', '        edited = existing[\"text_hash\"] != h')" \
+  "test_journal"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }
