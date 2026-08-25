@@ -1,0 +1,130 @@
+"""core/store.py — the channel-agnostic message store.
+
+Generalises the live schema (origin: slack/db.py) so any adapter's messages land in one
+place. Deliberately boring: sqlite, explicit schema, no ORM.
+
+Two properties are load-bearing and each is pinned by a test that fails if the property
+is removed (see tests/test_store.py):
+
+R9  idempotent re-ingest — the live poller depends on gap-free re-polling, so upserting
+    the same batch twice must not change the row count or duplicate a message.
+R5  the schema is PINNED — the origin system shipped a health check that read a field
+    name (`.timestamp`) the events never carried (`.ts`), so the check silently emitted
+    neither PASS nor FAIL for weeks. A renamed or missing field must raise here, loudly,
+    at ingest time.
+"""
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+# The normalized message contract (see channels/CONTRACT.md). Renaming or dropping any
+# of these is a breaking change and MUST fail loudly rather than silently store nothing.
+REQUIRED_FIELDS = ("channel_type", "channel_id", "sender_id", "ts", "text")
+OPTIONAL_FIELDS = ("sender_name", "thread_id", "raw")
+MESSAGE_FIELDS = REQUIRED_FIELDS + OPTIONAL_FIELDS
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS messages (
+    channel_type TEXT NOT NULL,
+    channel_id   TEXT NOT NULL,
+    ts           TEXT NOT NULL,
+    sender_id    TEXT NOT NULL,
+    sender_name  TEXT,
+    text         TEXT,
+    thread_id    TEXT,
+    raw          TEXT,
+    PRIMARY KEY (channel_type, channel_id, ts)
+);
+CREATE TABLE IF NOT EXISTS cursors (
+    instance     TEXT NOT NULL,
+    channel_id   TEXT NOT NULL,
+    cursor       TEXT NOT NULL,
+    updated_at   TEXT,
+    PRIMARY KEY (instance, channel_id)
+);
+"""
+
+
+class SchemaError(ValueError):
+    """A message did not match the pinned contract. Never swallow this."""
+
+
+class Store:
+    def __init__(self, path: str | Path):
+        self.path = str(path)
+        self.conn = sqlite3.connect(self.path)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript(SCHEMA)
+        self.conn.commit()
+
+    # ---- messages ---------------------------------------------------------
+    @staticmethod
+    def validate(msg: dict) -> None:
+        """Raise SchemaError unless msg carries exactly the pinned contract.
+
+        Both directions matter. A MISSING required field is the `.timestamp` bug. An
+        UNKNOWN field is a silent drift the other way: the producer thinks it is storing
+        something that never lands.
+        """
+        if not isinstance(msg, dict):
+            raise SchemaError(f"message must be a dict, got {type(msg).__name__}")
+        missing = [f for f in REQUIRED_FIELDS if f not in msg or msg[f] is None]
+        if missing:
+            raise SchemaError(f"missing required field(s): {missing}")
+        unknown = [k for k in msg if k not in MESSAGE_FIELDS]
+        if unknown:
+            raise SchemaError(f"unknown field(s) not in the pinned contract: {unknown}")
+
+    def upsert_messages(self, messages) -> int:
+        """Idempotent ingest. Returns the number of rows accepted (not necessarily new).
+
+        Every message is validated BEFORE any write, so a bad batch cannot half-land.
+        """
+        batch = list(messages)
+        for m in batch:
+            self.validate(m)
+        rows = [
+            (m["channel_type"], m["channel_id"], str(m["ts"]), m["sender_id"],
+             m.get("sender_name"), m.get("text"), m.get("thread_id"), m.get("raw"))
+            for m in batch
+        ]
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO messages "
+            "(channel_type, channel_id, ts, sender_id, sender_name, text, thread_id, raw) "
+            "VALUES (?,?,?,?,?,?,?,?)", rows)
+        self.conn.commit()
+        return len(rows)
+
+    def count(self, channel_id: str | None = None) -> int:
+        if channel_id is None:
+            return self.conn.execute("SELECT count(*) FROM messages").fetchone()[0]
+        return self.conn.execute(
+            "SELECT count(*) FROM messages WHERE channel_id=?", (channel_id,)).fetchone()[0]
+
+    def timestamps(self, channel_id: str) -> set[str]:
+        return {r[0] for r in self.conn.execute(
+            "SELECT ts FROM messages WHERE channel_id=?", (channel_id,))}
+
+    # ---- cursors ----------------------------------------------------------
+    def cursor_get(self, instance: str, channel_id: str) -> str | None:
+        row = self.conn.execute(
+            "SELECT cursor FROM cursors WHERE instance=? AND channel_id=?",
+            (instance, channel_id)).fetchone()
+        return row[0] if row else None
+
+    def cursor_set(self, instance: str, channel_id: str, cursor: str,
+                   updated_at: str | None = None) -> None:
+        """Cursors are OPAQUE strings owned by the adapter — never parsed here.
+
+        NOTE for G2: persisting a cursor is the second half of a dual-write with the
+        send. The origin system reconciled that race 24 times. Nothing in this module
+        may be treated as making a send+commit atomic; the outbox owns that.
+        """
+        self.conn.execute(
+            "INSERT OR REPLACE INTO cursors (instance, channel_id, cursor, updated_at) "
+            "VALUES (?,?,?,?)", (instance, channel_id, cursor, updated_at))
+        self.conn.commit()
+
+    def close(self) -> None:
+        self.conn.close()
