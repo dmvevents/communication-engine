@@ -189,6 +189,45 @@ run_mutation "owed: trust the driver field without checking liveness" \
   "('            if not row[\"driver\"] or not self.driver_alive(row[\"driver\"]):', '            if not row[\"driver\"]:')" \
   "test_owed"
 
+# ---------------------------------------------------------------------------
+# G9 — classification. A false EXEC-REQUEST can make the fleet start a cluster run
+# because a colleague used the word "testing" in passing.
+# ---------------------------------------------------------------------------
+
+# R15 — word boundaries. This is the mutation that reintroduces the measured 34% rate.
+run_mutation "classify: match keywords as substrings again" \
+  "core/classify.py" \
+  "('        pattern = r\"\\\\b\" + r\"\\\\s+\".join(re.escape(w) for w in n.split()) + r\"\\\\b\"', '        pattern = re.escape(n)')" \
+  "test_classify"
+
+# R15 — an exec verb alone must not be an instruction.
+run_mutation "classify: treat a bare exec verb as an order" \
+  "core/classify.py" \
+  "('    if exec_hits and (directive or _starts_imperative(t, tax.exec_verbs)):', '    if exec_hits:')" \
+  "test_classify"
+
+# R15 — a commitment ask must always reach a human, even alongside a work request.
+run_mutation "classify: let exec outrank a commitment ask" \
+  "core/classify.py" \
+  "('    if commit_hits:', '    if False:')" \
+  "test_classify"
+
+# ---------------------------------------------------------------------------
+# G10 — audit integrity. The incumbent log inflates by 45%.
+# ---------------------------------------------------------------------------
+
+# R16 — one row per distinct message, however many times it is seen.
+run_mutation "journal: append a new row on every sighting" \
+  "core/journal.py" \
+  "('        if existing is None:', '        if True:')" \
+  "test_journal"
+
+# R16 — a bare re-sighting must not erase a recorded classification.
+run_mutation "journal: let a later null overwrite the classification" \
+  "core/journal.py" \
+  "('            \"kind=COALESCE(?, kind), reason=COALESCE(?, reason), routed=COALESCE(?, routed) \"', '            \"kind=?, reason=?, routed=? \"')" \
+  "test_journal"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }
