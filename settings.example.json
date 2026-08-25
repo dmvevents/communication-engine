@@ -2,6 +2,7 @@
   "_note": "Copy to settings.json (gitignored) and fill in. Values of the form 'env:NAME' are read from the environment at runtime — never put literal credentials in any settings file.",
   "engine": {
     "state_dir": "state",
+    "channels_dir": "channels",
     "store": "state/messages.db",
     "heartbeat_file": "state/heartbeat",
     "dashboard_out": "state/COMMS-DASHBOARD.md"

@@ -15,7 +15,8 @@ PASS=0; FAIL=0
 run_mutation() {   # $1=label  $2=file  $3=python-replace-expr  $4=test-module
   local label="$1" file="$2" expr="$3" mod="$4"
   local tmp; tmp="$(mktemp -d)"
-  cp -r "$ROOT"/core "$ROOT"/tests "$tmp"/ 2>/dev/null
+  # channels/ ships code too (the fake adapter is contract-tested), so mutate against it.
+  cp -r "$ROOT"/core "$ROOT"/tests "$ROOT"/channels "$tmp"/ 2>/dev/null
 
   if ! python3 - "$tmp/$file" <<PY
 import sys, pathlib
@@ -254,8 +255,36 @@ run_mutation "config: accept a literal credential" \
 # R17 — an unknown adapter must fail loudly, not leave an inert instance.
 run_mutation "config: silently accept an unknown adapter" \
   "core/config.py" \
-  "('        if adapter not in KNOWN_ADAPTERS:', '        if False:')" \
+  "('        if adapter not in discovered:', '        if False:')" \
   "test_portability"
+
+# ---------------------------------------------------------------------------
+# G5 — extensibility. R11's measured evidence: the incumbent's second channel type was a
+# hand-mirrored COPY of its first. Each of these, if it survived, would mean a new channel
+# type once again requires editing core/.
+# ---------------------------------------------------------------------------
+
+# R11 — THE defect reintroduced: a hardcoded whitelist in core refuses any type it has not
+# heard of. Note the tuple includes 'fake', so only the invented-name landing test has
+# teeth against this — the shipped-adapter tests alone would stay green.
+run_mutation "config: hardcode an adapter whitelist back into core" \
+  "core/config.py" \
+  "('        if adapter not in discovered:', '        if adapter not in (\"slack\", \"telegram\", \"email\", \"fake\"):')" \
+  "test_extensibility"
+
+# R11 — discovery must demand the adapter.py entry point; a docs-only directory offered as
+# a channel type is the silently-inert-instance class again.
+run_mutation "config: discover any directory as a channel type" \
+  "core/config.py" \
+  "('        entry = d / \"adapter.py\"\n        if entry.is_file():', '        entry = d / \"adapter.py\"\n        if d.is_dir():')" \
+  "test_extensibility"
+
+# R11 — an adapter module without the pinned entry class must fail at load, not return
+# None and explode at first send.
+run_mutation "config: return None for an adapter with no entry class" \
+  "core/config.py" \
+  "('    if cls is None:', '    if False:')" \
+  "test_extensibility"
 
 # R18 — relative paths must resolve against the config dir so one file works anywhere.
 run_mutation "config: ignore the base dir when resolving paths" \

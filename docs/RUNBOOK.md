@@ -9,7 +9,7 @@ produced. Symptom first, because that is what you have at 2am.
 |---|---|---|
 | `environment variable X is not set` | config references `env:X`, your shell does not have it | export it; do not paste the value into the config |
 | `a literal credential was found in configuration` | a real token was pasted into `settings.json` | move it to the environment. Also rotate it — assume anything in a file has leaked |
-| `unknown adapter 'slakc'` | typo in `adapter` | fix the spelling. This fails loudly on purpose: a silently inert instance looks like a quiet channel |
+| `unknown adapter 'slakc'` | typo in `adapter`, or the channel type has no `adapter.py` yet | the error lists what WAS discovered under `channels_dir`; fix the spelling or land the adapter. This fails loudly on purpose: a silently inert instance looks like a quiet channel |
 | `no instances configured` | empty `instances` list | the engine would poll nothing, so it refuses |
 | `config file not found` / `not valid JSON` | path or syntax | check you copied `settings.example.json` |
 

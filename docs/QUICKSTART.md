@@ -33,7 +33,7 @@ Edit it. The only things you must change:
 | Field | What to put |
 |---|---|
 | `instances[].name` | any label you like, e.g. `my-team-slack` |
-| `instances[].adapter` | `slack`, `telegram`, `email`, or `fake` to try it dry |
+| `instances[].adapter` | any directory under `channels/` containing an `adapter.py` — discovered, never hardcoded. `fake` ships; use it to try the engine dry |
 | `instances[].auth.token` | **`env:YOUR_VAR_NAME`** — an environment-variable *reference* |
 | `instances[].channels[].id` | the channel/chat IDs you want watched |
 | `instances[].channels[].reply_policy` | `never` (default), `staged`, or `direct` |
@@ -101,8 +101,10 @@ minutes. See `docs/RUNBOOK.md` for how to check its behaviour on your own messag
 
 ## Honest limits
 
-- The **Slack adapter is the only one implemented**; `telegram` and `email` are contract stubs.
-  Until those land, "multi-channel" is a design property, not a shipped feature.
+- The **`fake` adapter is the only one implemented**; `slack` and `telegram` are contract
+  stubs (design READMEs, no `adapter.py` — the engine refuses them by name until one lands).
+  "Multi-channel" is so far proven as a *mechanism* — a new channel type is a directory drop
+  with zero `core/` changes (`tests/test_extensibility.py`) — not as shipped platform adapters.
 - **Read parity against an existing system has not been demonstrated** over a long window
   (gate G1). If you are replacing an incumbent, run both and diff before trusting this one.
 - There is **no scheduler in this repo**. The engine gives you poll/classify/journal/outbox

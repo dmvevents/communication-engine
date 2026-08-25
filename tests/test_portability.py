@@ -28,6 +28,17 @@ from core.outbox import Outbox, PolicyError  # noqa: E402
 from core.store import Store  # noqa: E402
 
 SHIPPED = ("core", "channels", "scripts", "watchers", "docs")
+
+
+def seed_fake_adapter(base):
+    """Adapter types are DISCOVERED on disk (R11), so a hermetic temp base that names
+    'fake' in its config must contain it — exactly what a real adopter's tree looks like."""
+    d = Path(base) / "channels" / "fake"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "adapter.py").write_text(
+        "class Adapter:\n"
+        "    def __init__(self, auth=None):\n"
+        "        self.auth = auth or {}\n")
 # An absolute path into somebody's home directory is the signature of a non-portable tool.
 HOME_PATH = re.compile(r"(/home/[a-z0-9_-]+/|/Users/[A-Za-z0-9_-]+/|C:\\Users\\)")
 HOST_TOOLS = re.compile(r"\b(tmux|systemctl|journalctl)\b")
@@ -102,6 +113,7 @@ class ConfigTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.base = Path(self.tmp.name)
+        seed_fake_adapter(self.base)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -204,6 +216,7 @@ class EndToEndFromConfigTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.base = Path(self.tmp.name)
+        seed_fake_adapter(self.base)
         self.cfg = from_dict({
             "engine": {"state_dir": "state"},
             "instances": [{

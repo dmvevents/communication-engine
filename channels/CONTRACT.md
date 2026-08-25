@@ -4,6 +4,20 @@ Every channel type (Slack, Telegram, Outlook, Teams, email, …) is a directory 
 implementing this interface. The core engine imports **only** this contract — a new channel type
 must never require a change to `core/`.
 
+## Discovery — how a channel type lands (R11, enforced by `tests/test_extensibility.py`)
+
+A channel type **is** a directory containing `adapter.py` that defines a class named
+`Adapter`. Core discovers types by scanning the configured `engine.channels_dir` (default:
+`channels/` next to the config) at load time — it never enumerates platform names. So
+landing a new type is exactly two actions, neither of which touches `core/`:
+
+1. `mkdir channels/<type>` and write `channels/<type>/adapter.py` with `class Adapter`.
+2. Reference `"adapter": "<type>"` from an instance in `settings.json`.
+
+A directory **without** `adapter.py` (like a design-stub README) is not offered as a type;
+naming it in config fails loudly, listing what was discovered. `channels/fake/adapter.py`
+is the reference implementation to copy.
+
 ## Interface (phase 1 will pin this as an abstract base class + conformance test)
 
 | Method | Semantics |
