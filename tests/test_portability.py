@@ -104,7 +104,7 @@ class NoHostDependencyTest(unittest.TestCase):
         r = subprocess.run(
             [sys.executable, "-c",
              "import core.store, core.journal, core.outbox, core.classify, core.checks, "
-             "core.owed, core.config, core.parity; print('ok')"],
+             "core.owed, core.config, core.parity, core.escalate; print('ok')"],
             cwd=ROOT, capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
         self.assertEqual(r.returncode, 0, f"import failed: {r.stderr[-400:]}")
 

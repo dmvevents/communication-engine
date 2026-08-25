@@ -304,6 +304,37 @@ run_mutation "journal: treat a bodyless re-sighting as an edit" \
   "('        edited = bool(text) and existing[\"text_hash\"] not in (None, h)', '        edited = existing[\"text_hash\"] != h')" \
   "test_journal"
 
+# ---------------------------------------------------------------------------
+# G11 — edge-triggered escalation. Each of these, if it survived, is a way for the
+# once-a-minute probe to become 1,440 identical alerts/day (or to lose an alert outright).
+# ---------------------------------------------------------------------------
+
+# R20 — THE requirement: a repeated level must not re-notify.
+run_mutation "escalate: notify on every level, not just edges" \
+  "core/escalate.py" \
+  "('        if row is not None and row[\"state\"] == state:', '        if False:')" \
+  "test_escalate"
+
+# R20 — the cron shape: every poll is a fresh process, so in-memory state dedupes nothing.
+run_mutation "escalate: keep edge state in memory instead of on disk" \
+  "core/escalate.py" \
+  "('        self.conn = sqlite3.connect(str(db_path))', '        self.conn = sqlite3.connect(\":memory:\")')" \
+  "test_escalate"
+
+# R20 — commit-before-notify: a notify that crashes would mark the edge reported and the
+# alert is lost forever (the inverse of the outbox dual-write, same disease).
+run_mutation "escalate: commit the edge before the notification is delivered" \
+  "core/escalate.py" \
+  "('        self.notify(msg)', '        self._commit(name, state, detail, now)\n        self.notify(msg)')" \
+  "test_escalate"
+
+# R20 — the recovery edge is half the acceptance: silence on recovery leaves the operator
+# investigating an outage that already ended.
+run_mutation "escalate: record recovery silently instead of announcing it" \
+  "core/escalate.py" \
+  "('        if row is None and ok:', '        if ok:')" \
+  "test_escalate"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }
