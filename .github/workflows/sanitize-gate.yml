@@ -1,0 +1,13 @@
+name: sanitize-gate
+on:
+  push:
+  pull_request:
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: gate proves itself
+        run: bash scripts/sanitize-gate.sh --self-test
+      - name: scan the repo
+        run: bash scripts/sanitize-gate.sh

@@ -1,0 +1,21 @@
+# real config — only settings.example.json is ever committed
+settings.json
+.env
+.env.*
+
+# host-local secret literals for the sanitize gate
+.sanitize-denylist.local
+
+# runtime state (message stores, cursors, outbox, logs)
+state/*
+!state/.gitkeep
+outbox/
+*.db
+*.sqlite3
+*.jsonl
+*.log
+
+# python
+__pycache__/
+*.pyc
+.venv/

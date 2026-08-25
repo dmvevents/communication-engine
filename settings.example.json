@@ -1,0 +1,57 @@
+{
+  "_note": "Copy to settings.json (gitignored) and fill in. Values of the form 'env:NAME' are read from the environment at runtime — never put literal credentials in any settings file.",
+  "engine": {
+    "state_dir": "state",
+    "store": "state/messages.db",
+    "heartbeat_file": "state/heartbeat",
+    "dashboard_out": "state/COMMS-DASHBOARD.md"
+  },
+  "instances": [
+    {
+      "name": "example-slack-workspace",
+      "adapter": "slack",
+      "auth": { "token": "env:SLACK_API_ENV_REF" },
+      "self_user_id": "U_EXAMPLE_SELF",
+      "channels": [
+        {
+          "id": "C_EXAMPLE_CHANNEL",
+          "label": "primary-watch",
+          "poll_interval_s": 15,
+          "backfill_h": 168,
+          "reply_policy": "staged",
+          "triggers": ["mention", "principal", "keyword:agent"]
+        },
+        {
+          "id": "D_EXAMPLE_DM",
+          "label": "colleague-dm",
+          "poll_interval_s": 60,
+          "reply_policy": "direct",
+          "triggers": ["any_message"]
+        }
+      ],
+      "principals": [
+        { "id": "U_EXAMPLE_PRINCIPAL", "label": "watched-colleague" }
+      ],
+      "bridge": { "bind": "loopback-only", "port": 0, "hmac_secret": "env:BRIDGE_ENV_REF" }
+    },
+    {
+      "name": "example-telegram",
+      "adapter": "telegram",
+      "auth": { "bot_token": "env:TG_BOT_ENV_REF" },
+      "chats": [
+        { "id": "env:TG_CHAT_ENV_REF", "label": "operator", "reply_policy": "direct" }
+      ]
+    }
+  ],
+  "reply_policies_doc": {
+    "never": "read-only; core/outbox refuses send() for this target",
+    "staged": "drafts written to state/outbox/, explicit operator gate required before send",
+    "direct": "adapter may send after outbox audit logging (only for precedented targets)"
+  },
+  "watchdog": {
+    "cadence_s": 300,
+    "fail_threshold": 3,
+    "alert_cooldown_s": 1800,
+    "maintenance_flag": "state/.maintenance"
+  }
+}
