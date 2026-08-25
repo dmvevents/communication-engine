@@ -227,8 +227,53 @@ run_mutation "journal: append a new row on every sighting" \
 # R16 — a bare re-sighting must not erase a recorded classification.
 run_mutation "journal: let a later null overwrite the classification" \
   "core/journal.py" \
-  "('            \"kind=COALESCE(?, kind), reason=COALESCE(?, reason), routed=COALESCE(?, routed) \"', '            \"kind=?, reason=?, routed=? \"')" \
+  "('            \"kind=COALESCE(?, kind), reason=COALESCE(?, reason), routed=COALESCE(?, routed), \"', '            \"kind=?, reason=?, routed=?, \"')" \
   "test_journal"
+
+# ---------------------------------------------------------------------------
+# R22 — the audit link. A classification that cannot be traced from its journal row back
+# to the cues that produced it can be neither audited nor disputed; the taxonomy may have
+# changed by the time anyone asks.
+# ---------------------------------------------------------------------------
+
+# R22 — the decision must NAME its cues (kind and behaviour unchanged; only evidence lost).
+run_mutation "classify: an exec decision stops naming the cues behind it" \
+  "core/classify.py" \
+  "('                              exec_hits + directive)', '                              [])')" \
+  "test_classify"
+
+# R22 — the cues must reach the journal row at all.
+run_mutation "journal: the cues never reach the journal row" \
+  "core/journal.py" \
+  "('        mjson = None if matched is None else json.dumps(list(matched))', '        mjson = None')" \
+  "test_journal"
+
+# R22 — a bare re-sighting must not erase the recorded cues (same disease as R16).
+run_mutation "journal: let a later null erase the recorded cues" \
+  "core/journal.py" \
+  "('            \"matched=COALESCE(?, matched) \"', '            \"matched=? \"')" \
+  "test_journal"
+
+# R22 — each revision keeps the cues of ITS decision; the dispute over an answered v1
+# needs v1's evidence, not the live row's.
+run_mutation "journal: a revision loses its own decision's cues" \
+  "core/journal.py" \
+  "('            self._add_revision(channel, ts, rev, text, kind, reason, mjson, now)', '            self._add_revision(channel, ts, rev, text, kind, reason, None, now)')" \
+  "test_journal"
+
+# R22 — a pre-audit journal.db must be migrated, not refused (an audit trail destroyed to
+# improve auditability) and not silently written past.
+run_mutation "journal: skip the migration for pre-audit databases" \
+  "core/journal.py" \
+  "('            if \\\"matched\\\" not in cols:', '            if False:')" \
+  "test_journal"
+
+# R22 — the caller boundary where the cues actually died: first-poll journaled kind and
+# reason but dropped matched, so every adopter's audit trail started broken.
+run_mutation "first-poll: the classification's cues are dropped at the journal call" \
+  "scripts/first-poll.py" \
+  "('                          matched=c.matched)', '                          )')" \
+  "test_docs"
 
 # ---------------------------------------------------------------------------
 # G8 — adoptability. Each of these, if it survived, would let a newcomer either

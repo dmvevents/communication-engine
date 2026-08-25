@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS journal (
     text_hash      TEXT,
     kind           TEXT,
     reason         TEXT,
+    matched        TEXT,
     routed         TEXT,
     first_seen_at  REAL NOT NULL,
     last_seen_at   REAL NOT NULL,
@@ -61,6 +62,7 @@ CREATE TABLE IF NOT EXISTS revisions (
     text        TEXT,
     kind        TEXT,
     reason      TEXT,
+    matched     TEXT,
     recorded_at REAL NOT NULL,
     PRIMARY KEY (channel, ts, seq)
 );
@@ -94,27 +96,44 @@ class Journal:
         self.conn = sqlite3.connect(str(db_path))
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self):
+        """Adopters hold journal.db files created before the cues column existed (R22),
+        and CREATE TABLE IF NOT EXISTS never alters an existing table. Refusing such a
+        file would destroy an audit trail in order to improve it — add the column in
+        place instead; legacy rows read back as None, never as a fabricated decision."""
+        for table in ("journal", "revisions"):
+            cols = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            if "matched" not in cols:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN matched TEXT")
 
     def record(self, channel: str, ts: str, sender_id: str | None = None,
                text: str = "", kind: str | None = None, reason: str | None = None,
-               routed: str | None = None) -> RecordResult:
+               matched: list | None = None, routed: str | None = None) -> RecordResult:
         """Record an inbound message. Idempotent on IDENTITY and sensitive to CONTENT.
 
         Returns a RecordResult whose truthiness is "this is the first sighting", so callers
         can still write `if journal.record(...)`. Check `.is_revision` to re-route an edit.
+
+        `matched` is the classification's cue list (R22): the evidence that makes the
+        recorded decision disputable. [] means "the classifier matched nothing"; None
+        means "no decision supplied" — the two must stay distinct on disk.
         """
         now = time.time()
         h = _hash(text)
+        mjson = None if matched is None else json.dumps(list(matched))
         existing = self.get(channel, ts)
 
         if existing is None:
             self.conn.execute(
                 "INSERT INTO journal (channel, ts, sender_id, text, text_hash, kind, reason, "
-                "routed, first_seen_at, last_seen_at, seen_count, revision) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,1,1)",
-                (channel, str(ts), sender_id, text, h, kind, reason, routed, now, now))
-            self._add_revision(channel, ts, 1, text, kind, reason, now)
+                "matched, routed, first_seen_at, last_seen_at, seen_count, revision) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,1,1)",
+                (channel, str(ts), sender_id, text, h, kind, reason, mjson, routed,
+                 now, now))
+            self._add_revision(channel, ts, 1, text, kind, reason, mjson, now)
             self.conn.commit()
             return RecordResult("new", 1)
 
@@ -125,28 +144,42 @@ class Journal:
             rev = int(existing["revision"]) + 1
             self.conn.execute(
                 "UPDATE journal SET text=?, text_hash=?, kind=COALESCE(?, kind), "
-                "reason=COALESCE(?, reason), routed=COALESCE(?, routed), "
+                "reason=COALESCE(?, reason), matched=COALESCE(?, matched), "
+                "routed=COALESCE(?, routed), "
                 "last_seen_at=?, seen_count=seen_count+1, revision=? "
                 "WHERE channel=? AND ts=?",
-                (text, h, kind, reason, routed, now, rev, channel, str(ts)))
-            self._add_revision(channel, ts, rev, text, kind, reason, now)
+                (text, h, kind, reason, mjson, routed, now, rev, channel, str(ts)))
+            self._add_revision(channel, ts, rev, text, kind, reason, mjson, now)
             self.conn.commit()
             return RecordResult("revised", rev)
 
         self.conn.execute(
             "UPDATE journal SET last_seen_at=?, seen_count=seen_count+1, "
             # a later pass may refine the classification; keep the newest non-null
-            "kind=COALESCE(?, kind), reason=COALESCE(?, reason), routed=COALESCE(?, routed) "
+            "kind=COALESCE(?, kind), reason=COALESCE(?, reason), routed=COALESCE(?, routed), "
+            "matched=COALESCE(?, matched) "
             "WHERE channel=? AND ts=?",
-            (now, kind, reason, routed, channel, str(ts)))
+            (now, kind, reason, routed, mjson, channel, str(ts)))
         self.conn.commit()
         return RecordResult("reseen", int(existing["revision"]))
 
-    def _add_revision(self, channel, ts, seq, text, kind, reason, when):
+    def _add_revision(self, channel, ts, seq, text, kind, reason, mjson, when):
         self.conn.execute(
             "INSERT OR REPLACE INTO revisions (channel, ts, seq, text, kind, reason, "
-            "recorded_at) VALUES (?,?,?,?,?,?,?)",
-            (channel, str(ts), seq, text, kind, reason, when))
+            "matched, recorded_at) VALUES (?,?,?,?,?,?,?,?)",
+            (channel, str(ts), seq, text, kind, reason, mjson, when))
+
+    def audit(self, channel: str, ts: str) -> dict | None:
+        """The audit link (R22): from a journal row back to the decision that classified
+        it — kind, reason, and the cues that matched, decoded for the caller. `matched`
+        is None for rows journaled before cue recording existed; an absent record must
+        never masquerade as "the classifier matched nothing"."""
+        row = self.get(channel, ts)
+        if row is None:
+            return None
+        return {"kind": row["kind"], "reason": row["reason"],
+                "matched": None if row["matched"] is None else json.loads(row["matched"]),
+                "revision": row["revision"]}
 
     def revisions(self, channel: str, ts: str) -> list:
         return self.conn.execute(

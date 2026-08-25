@@ -209,6 +209,21 @@ class FirstPollTest(unittest.TestCase):
         finally:
             s.close()
 
+    def test_the_journaled_row_carries_the_audit_link(self):
+        """R22: first-poll is the one caller that stands between the classifier and the
+        journal; if it drops the cues there, every adopter's audit trail starts broken."""
+        self.run_first_poll("--seed-demo")
+        j = Journal(self.base / "state" / "journal.db")
+        try:
+            a = j.audit(self.CHANNEL, "1.0")
+            self.assertIsNotNone(a, "the demo message was never journaled")
+            self.assertTrue(a["reason"])
+            self.assertTrue(a["matched"],
+                            "the decision cues never reached the journal — the "
+                            "classification cannot be disputed from the audit trail")
+        finally:
+            j.close()
+
     def test_a_second_poll_is_idempotent(self):
         self.run_first_poll("--seed-demo")
         before = self.journal_rows()

@@ -110,6 +110,20 @@ Every classification carries a **reason** and the **matched cues**, so it can be
 is deliberate: an exec verb with no directive is downgraded to `STATEMENT`, because a missed
 order costs a follow-up while a false order can start a cluster run.
 
+To dispute a decision that was already journaled, do NOT re-run the classifier — your taxonomy
+may have changed since. Ask the journal for the decision as recorded:
+
+```python
+journal.audit(channel_id, ts)
+# {'kind': 'EXEC-REQUEST', 'reason': 'imperative or directed request to perform work',
+#  'matched': ['deploy', 'please'], 'revision': 1}
+```
+
+`matched` names the cues that fired; each one occurs verbatim in the message, so the row is
+checkable evidence, not narration. `matched` of `None` (as opposed to `[]`) means the row was
+journaled before cue recording existed. Per-edit history is in `journal.revisions(channel_id, ts)` —
+each revision keeps the cues of *its* classification.
+
 If you retune, add your samples to a corpus test. Vocabulary changes without a test are how a
 classifier regresses silently.
 

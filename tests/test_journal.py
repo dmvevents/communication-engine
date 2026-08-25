@@ -202,6 +202,112 @@ class RevisionTest(unittest.TestCase):
         self.assertEqual(self.j.get(CH, "1.1")["seen_count"], 3)
 
 
+class AuditLinkTest(unittest.TestCase):
+    """R22: the journal row is where a classification gets DISPUTED — possibly months
+    later, possibly after the taxonomy changed, so re-running the classifier over the
+    text is not evidence of what the engine decided at the time. The row itself must
+    link back to the cues the decision actually matched."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "j.db"
+        self.j = Journal(self.path)
+
+    def tearDown(self):
+        self.j.close()
+        self.tmp.cleanup()
+
+    def test_a_journal_row_links_back_to_the_decision_cues(self):
+        self.j.record(CH, "1.1", text="Please deploy the image.", kind="EXEC-REQUEST",
+                      reason="imperative or directed request to perform work",
+                      matched=["deploy", "please"])
+        a = self.j.audit(CH, "1.1")
+        self.assertEqual(a["kind"], "EXEC-REQUEST")
+        self.assertTrue(a["reason"])
+        self.assertEqual(a["matched"], ["deploy", "please"],
+                         "the cues never reached the journal — the decision cannot be "
+                         "disputed from the audit trail")
+
+    def test_the_audit_link_survives_a_restart(self):
+        self.j.record(CH, "1.1", text="Where is the doc?", kind="QUESTION",
+                      reason="asks for information", matched=["where is"])
+        self.j.close()
+        self.j = Journal(self.path)
+        self.assertEqual(self.j.audit(CH, "1.1")["matched"], ["where is"])
+
+    def test_a_bare_resighting_does_not_erase_the_cues(self):
+        self.j.record(CH, "1.1", text="Please deploy it.", kind="EXEC-REQUEST",
+                      reason="imperative", matched=["deploy", "please"])
+        self.j.record(CH, "1.1")
+        self.assertEqual(self.j.audit(CH, "1.1")["matched"], ["deploy", "please"])
+
+    def test_each_revision_keeps_its_own_decisions_cues(self):
+        """An edit re-classifies; the dispute 'why did you answer version 1 that way?'
+        needs version 1's cues, not the live row's."""
+        import json
+        self.j.record(CH, "1.1", text="Where is the doc?", kind="QUESTION",
+                      reason="asks for information", matched=["where is"])
+        self.j.record(CH, "1.1", text="Please deploy the doc fix.", kind="EXEC-REQUEST",
+                      reason="imperative", matched=["deploy", "please"])
+        revs = self.j.revisions(CH, "1.1")
+        self.assertEqual([json.loads(r["matched"]) for r in revs],
+                         [["where is"], ["deploy", "please"]])
+        self.assertEqual(self.j.audit(CH, "1.1")["matched"], ["deploy", "please"])
+
+    def test_export_carries_the_audit_link(self):
+        """The export is what any rendering surface (dashboard included) reads; cues
+        that die before the export are not auditable, only stored."""
+        import json
+        self.j.record(CH, "1.1", text="Please deploy it.", kind="EXEC-REQUEST",
+                      reason="imperative", matched=["deploy", "please"])
+        line = json.loads(self.j.export_jsonl())
+        self.assertEqual(json.loads(line["matched"]), ["deploy", "please"])
+
+    def test_recorded_empty_cues_stay_distinct_from_never_recorded(self):
+        """[] means 'the classifier matched nothing'; None means 'no decision was ever
+        recorded'. Collapsing them would let an absent record masquerade as evidence."""
+        self.j.record(CH, "1.1", text="plain remark", kind="STATEMENT",
+                      reason="no directive, question or commitment cue", matched=[])
+        self.j.record(CH, "2.2", text="unclassified sighting")
+        self.assertEqual(self.j.audit(CH, "1.1")["matched"], [])
+        self.assertIsNone(self.j.audit(CH, "2.2")["matched"])
+
+    def test_a_pre_audit_database_is_migrated_on_open(self):
+        """Adopters already hold journal.db files created before the cues column
+        existed. Refusing to open one would destroy an audit trail in order to improve
+        it — the column must be added in place, with legacy rows reading as None."""
+        import sqlite3
+        old = Path(self.tmp.name) / "old.db"
+        conn = sqlite3.connect(old)
+        conn.executescript("""
+            CREATE TABLE journal (
+                channel TEXT NOT NULL, ts TEXT NOT NULL, sender_id TEXT, text TEXT,
+                text_hash TEXT, kind TEXT, reason TEXT, routed TEXT,
+                first_seen_at REAL NOT NULL, last_seen_at REAL NOT NULL,
+                seen_count INTEGER NOT NULL DEFAULT 1,
+                revision INTEGER NOT NULL DEFAULT 1,
+                responded_at REAL, response_key TEXT,
+                PRIMARY KEY (channel, ts));
+            CREATE TABLE revisions (
+                channel TEXT NOT NULL, ts TEXT NOT NULL, seq INTEGER NOT NULL,
+                text TEXT, kind TEXT, reason TEXT, recorded_at REAL NOT NULL,
+                PRIMARY KEY (channel, ts, seq));
+            INSERT INTO journal VALUES ('C_LEGACY', '0.9', NULL, 'old row', 'h',
+                'STATEMENT', 'legacy reason', NULL, 1.0, 1.0, 1, 1, NULL, NULL);
+        """)
+        conn.commit()
+        conn.close()
+        j2 = Journal(old)
+        try:
+            self.assertIsNone(j2.audit("C_LEGACY", "0.9")["matched"])
+            j2.record("C_LEGACY", "1.0", text="Please deploy it.", kind="EXEC-REQUEST",
+                      reason="imperative", matched=["deploy", "please"])
+            self.assertEqual(j2.audit("C_LEGACY", "1.0")["matched"],
+                             ["deploy", "please"])
+        finally:
+            j2.close()
+
+
 class ConcurrencyTest(unittest.TestCase):
     """The outbox held under 6 concurrent senders when probed. A property that holds by
     accident is one refactor from breaking, so it is pinned here."""

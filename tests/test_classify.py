@@ -7,6 +7,7 @@ system's own log — real colleague/customer text is never copied into this repo
 The headline metric the gate defends: the false-EXEC rate on reporting-style statements.
 Measured on the incumbent: 47 of 138 EXEC-REQUESTs (34%) matched a substring only.
 """
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -167,6 +168,46 @@ class RobustnessTest(unittest.TestCase):
         texts = [t for t, _ in CORPUS[:8]]
         self.assertEqual([c.kind for c in classify_batch(texts)],
                          [classify(t).kind for t in texts])
+
+
+class AuditabilityTest(unittest.TestCase):
+    """R22: a decision is disputable only if it NAMES the cues that produced it. The
+    dispute may come months later, after the taxonomy changed — so the evidence must
+    travel with the decision, not be reconstructed by re-running the classifier."""
+
+    def test_every_decision_names_the_cues_that_matched(self):
+        """Corpus-wide: any classification above the no-cue fall-through must carry at
+        least one matched cue. A bare kind cannot be argued with."""
+        for text, expected in CORPUS:
+            c = classify(text)
+            self.assertTrue(c.reason, f"no reason given for {text[:40]!r}")
+            if expected != "STATEMENT":
+                self.assertTrue(c.matched,
+                                f"{c.kind} decision names no cue for {text[:40]!r} — "
+                                "it cannot be disputed")
+
+    def test_recorded_cues_are_verifiable_against_the_text(self):
+        """Each recorded cue must be checkable in the message itself; that check is what
+        turns 'the engine says so' into evidence."""
+        for text, _ in CORPUS:
+            for cue in classify(text).matched:
+                if cue == "ends with '?'":
+                    self.assertTrue(text.rstrip().endswith("?"),
+                                    f"pseudo-cue recorded but {text[:40]!r} has no '?'")
+                    continue
+                pattern = r"\b" + r"\s+".join(re.escape(w) for w in cue.split()) + r"\b"
+                self.assertTrue(re.search(pattern, text, flags=re.IGNORECASE),
+                                f"recorded cue {cue!r} does not occur in {text[:40]!r} — "
+                                "the audit trail would assert evidence that is not there")
+
+    def test_the_ambiguous_downgrade_names_the_verb_it_refused_to_act_on(self):
+        """The downgrade is the decision most worth disputing ('why was my order
+        ignored?'); its row must show the verb seen and, by the reason, the directive
+        that was missing."""
+        c = classify("The build and test cycle takes an hour.")
+        self.assertEqual(c.kind, "STATEMENT")
+        self.assertTrue(set(c.matched) & {"build", "test"},
+                        "the downgraded decision does not name the verb it saw")
 
 
 if __name__ == "__main__":
