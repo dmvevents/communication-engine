@@ -1,0 +1,179 @@
+"""core/config.py — build the whole engine from configuration (gate G8; R17, R18).
+
+This module is what makes the engine *adoptable*. A colleague must be able to point it at
+their workspace, channels, principals and reply policies **by config alone** — no code edits,
+no fork. The incumbent cannot be adopted precisely because it hardcodes one host: tmux pane
+names, `/home/<user>/slack`, specific systemd units, one workspace's channel IDs.
+
+Rules enforced here:
+
+* **Every path comes from config**, resolved against an explicit base directory. Nothing in
+  this package may reference an absolute home path (a test greps for that and fails).
+* **Every credential is an `env:NAME` reference.** A literal-looking secret is rejected, so a
+  newcomer cannot paste a token into a file that might get committed.
+* **A missing env var fails loudly at load time**, not at first send. Half-configured is the
+  worst state to discover during an incident.
+* **Default DENY.** A channel with no explicit `reply_policy` is `never`, so a fresh adopter
+  cannot accidentally post as anyone.
+* **Unknown adapter types are refused**, rather than silently ignored — an adopter who
+  misspells `slack` must be told, not left with a silently inert instance.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+
+VALID_POLICIES = ("never", "staged", "direct")
+KNOWN_ADAPTERS = ("slack", "telegram", "email", "fake")
+
+# Shapes that indicate a real credential pasted where an env reference belongs.
+_SECRET_SHAPES = (
+    re.compile(r"^xox[abprs]-"),          # Slack tokens
+    re.compile(r"^xapp-"),
+    re.compile(r"^\d{8,10}:AA"),          # Telegram bot tokens
+    re.compile(r"^(AKIA|ASIA)[0-9A-Z]{16}$"),
+)
+
+
+class ConfigError(ValueError):
+    """The configuration is unusable. Never fall back to a default and continue."""
+
+
+@dataclass
+class ChannelConfig:
+    id: str
+    label: str = ""
+    poll_interval_s: int = 60
+    reply_policy: str = "never"          # DEFAULT DENY
+    triggers: tuple = ()
+
+    def __post_init__(self):
+        if self.reply_policy not in VALID_POLICIES:
+            raise ConfigError(
+                f"channel {self.id}: reply_policy {self.reply_policy!r} is not one of "
+                f"{VALID_POLICIES}")
+
+
+@dataclass
+class InstanceConfig:
+    name: str
+    adapter: str
+    channels: tuple = ()
+    principals: tuple = ()
+    auth: dict = field(default_factory=dict)
+    taxonomy: dict = field(default_factory=dict)
+
+    def policies(self) -> dict:
+        """target id -> policy, for core.outbox. Absent targets are denied by default."""
+        return {c.id: c.reply_policy for c in self.channels}
+
+
+@dataclass
+class EngineConfig:
+    base_dir: Path
+    state_dir: Path
+    store_path: Path
+    journal_path: Path
+    outbox_path: Path
+    instances: tuple = ()
+
+    def instance(self, name: str) -> InstanceConfig:
+        for i in self.instances:
+            if i.name == name:
+                return i
+        raise ConfigError(f"no instance named {name!r}")
+
+
+def resolve_secret(value: str, env: dict | None = None) -> str:
+    """Resolve an `env:NAME` reference. Refuses literal secrets and missing vars."""
+    env = os.environ if env is None else env
+    if not isinstance(value, str):
+        raise ConfigError(f"credential must be a string 'env:NAME' reference, got "
+                          f"{type(value).__name__}")
+    for shape in _SECRET_SHAPES:
+        if shape.match(value):
+            raise ConfigError(
+                "a literal credential was found in configuration. Use 'env:NAME' and keep "
+                "the value in the environment — settings files get committed by accident.")
+    if not value.startswith("env:"):
+        raise ConfigError(f"credential {value[:12]!r}... must be an 'env:NAME' reference")
+    name = value[4:]
+    if not name:
+        raise ConfigError("empty env var name in credential reference")
+    if name not in env:
+        raise ConfigError(
+            f"environment variable {name} is not set — the engine refuses to start "
+            "half-configured rather than fail at first send")
+    return env[name]
+
+
+def load(path: str | Path, base_dir: str | Path | None = None,
+         env: dict | None = None) -> EngineConfig:
+    """Load and VALIDATE a settings file. Raises ConfigError on anything ambiguous."""
+    path = Path(path)
+    if not path.is_file():
+        raise ConfigError(f"config file not found: {path}")
+    try:
+        raw = json.loads(path.read_text())
+    except json.JSONDecodeError as ex:
+        raise ConfigError(f"config is not valid JSON: {ex}") from ex
+    return from_dict(raw, base_dir=base_dir or path.parent, env=env)
+
+
+def from_dict(raw: dict, base_dir: str | Path, env: dict | None = None) -> EngineConfig:
+    base = Path(base_dir)
+    eng = raw.get("engine", {})
+    # Relative paths resolve against base_dir, so the same config works on any machine.
+    state_dir = _resolve(base, eng.get("state_dir", "state"))
+    cfg = EngineConfig(
+        base_dir=base,
+        state_dir=state_dir,
+        store_path=_resolve(base, eng.get("store", state_dir / "messages.db")),
+        journal_path=_resolve(base, eng.get("journal", state_dir / "journal.db")),
+        outbox_path=_resolve(base, eng.get("outbox", state_dir / "outbox.db")),
+    )
+
+    instances = []
+    for spec in raw.get("instances", []):
+        name = spec.get("name")
+        adapter = spec.get("adapter")
+        if not name:
+            raise ConfigError("every instance needs a 'name'")
+        if adapter not in KNOWN_ADAPTERS:
+            raise ConfigError(
+                f"instance {name!r}: unknown adapter {adapter!r}. Known: {KNOWN_ADAPTERS}. "
+                "A misspelled adapter must fail loudly, not leave an inert instance.")
+        channels = []
+        for ch in spec.get("channels", []):
+            if not ch.get("id"):
+                raise ConfigError(f"instance {name!r}: a channel is missing 'id'")
+            channels.append(ChannelConfig(
+                id=ch["id"], label=ch.get("label", ""),
+                poll_interval_s=int(ch.get("poll_interval_s", 60)),
+                reply_policy=ch.get("reply_policy", "never"),   # DEFAULT DENY
+                triggers=tuple(ch.get("triggers", ()))))
+        auth = {k: resolve_secret(v, env) for k, v in (spec.get("auth") or {}).items()}
+        instances.append(InstanceConfig(
+            name=name, adapter=adapter, channels=tuple(channels),
+            principals=tuple(spec.get("principals", ())), auth=auth,
+            taxonomy=spec.get("taxonomy", {}) or {}))
+
+    if not instances:
+        raise ConfigError("no instances configured — the engine would poll nothing")
+    cfg.instances = tuple(instances)
+    return cfg
+
+
+def _resolve(base: Path, p) -> Path:
+    p = Path(p)
+    return p if p.is_absolute() else (base / p)
+
+
+def ensure_dirs(cfg: EngineConfig) -> None:
+    """Create only the directories the config names, under its own base."""
+    for d in {cfg.state_dir, cfg.store_path.parent, cfg.journal_path.parent,
+              cfg.outbox_path.parent}:
+        d.mkdir(parents=True, exist_ok=True)

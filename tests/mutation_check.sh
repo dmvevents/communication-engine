@@ -228,6 +228,41 @@ run_mutation "journal: let a later null overwrite the classification" \
   "('            \"kind=COALESCE(?, kind), reason=COALESCE(?, reason), routed=COALESCE(?, routed) \"', '            \"kind=?, reason=?, routed=? \"')" \
   "test_journal"
 
+# ---------------------------------------------------------------------------
+# G8 — adoptability. Each of these, if it survived, would let a newcomer either
+# post as someone by accident or start half-configured.
+# ---------------------------------------------------------------------------
+
+# R19 — deny by default. A channel with no policy must be read-only.
+run_mutation "config: default a channel with no policy to direct" \
+  "core/config.py" \
+  "('                reply_policy=ch.get(\"reply_policy\", \"never\"),   # DEFAULT DENY', '                reply_policy=ch.get(\"reply_policy\", \"direct\"),')" \
+  "test_portability"
+
+# R17 — a missing env var must fail at LOAD, not at first send.
+run_mutation "config: tolerate a missing environment variable" \
+  "core/config.py" \
+  "('    if name not in env:', '    if False:')" \
+  "test_portability"
+
+# R17 — a literal credential in config must be refused.
+run_mutation "config: accept a literal credential" \
+  "core/config.py" \
+  "('        if shape.match(value):', '        if False:')" \
+  "test_portability"
+
+# R17 — an unknown adapter must fail loudly, not leave an inert instance.
+run_mutation "config: silently accept an unknown adapter" \
+  "core/config.py" \
+  "('        if adapter not in KNOWN_ADAPTERS:', '        if False:')" \
+  "test_portability"
+
+# R18 — relative paths must resolve against the config dir so one file works anywhere.
+run_mutation "config: ignore the base dir when resolving paths" \
+  "core/config.py" \
+  "('    return p if p.is_absolute() else (base / p)', '    return p')" \
+  "test_portability"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }
