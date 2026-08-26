@@ -52,13 +52,32 @@ class ChannelConfig:
     label: str = ""
     poll_interval_s: int = 60
     reply_policy: str = "never"          # DEFAULT DENY
+    # ENH-3: None means "same policy in a thread as in the channel". Set it to express
+    # a placement policy such as "answer in thread, never the main channel", which is
+    # a visible behavioural difference an adopter could not previously configure.
+    thread_reply_policy: str | None = None
     triggers: tuple = ()
 
     def __post_init__(self):
-        if self.reply_policy not in VALID_POLICIES:
-            raise ConfigError(
-                f"channel {self.id}: reply_policy {self.reply_policy!r} is not one of "
-                f"{VALID_POLICIES}")
+        declared = [("reply_policy", self.reply_policy)]
+        if self.thread_reply_policy is not None:      # absent means "as the channel"
+            declared.append(("thread_reply_policy", self.thread_reply_policy))
+        for key, value in declared:
+            if value not in VALID_POLICIES:
+                raise ConfigError(
+                    f"channel {self.id}: {key} {value!r} is not one of "
+                    f"{VALID_POLICIES}")
+
+    def policy(self):
+        """The policy value core.outbox indexes by target.
+
+        A plain string when both placements share a policy — so every config written
+        before thread awareness produces the byte-identical policy map — and a
+        per-scope dict only once the two differ.
+        """
+        if self.thread_reply_policy is None:
+            return self.reply_policy
+        return {"channel": self.reply_policy, "thread": self.thread_reply_policy}
 
 
 @dataclass
@@ -72,7 +91,7 @@ class InstanceConfig:
 
     def policies(self) -> dict:
         """target id -> policy, for core.outbox. Absent targets are denied by default."""
-        return {c.id: c.reply_policy for c in self.channels}
+        return {c.id: c.policy() for c in self.channels}
 
 
 @dataclass
@@ -239,6 +258,7 @@ def from_dict(raw: dict, base_dir: str | Path, env: dict | None = None) -> Engin
                 id=ch["id"], label=ch.get("label", ""),
                 poll_interval_s=int(ch.get("poll_interval_s", 60)),
                 reply_policy=ch.get("reply_policy", "never"),   # DEFAULT DENY
+                thread_reply_policy=ch.get("thread_reply_policy"),
                 triggers=tuple(ch.get("triggers", ()))))
         auth = {k: resolve_secret(v, env) for k, v in (spec.get("auth") or {}).items()}
         instances.append(InstanceConfig(

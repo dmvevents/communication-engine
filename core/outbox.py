@@ -21,10 +21,16 @@ That yields at-most-once delivery with at-least-once *attempt*, i.e. exactly one
 Reply policy is CONFIG, not code: `never` (default) / `staged` / `direct`. A `never` target
 raises; a `staged` target writes a draft for an operator to gate and never calls the adapter.
 No caller may reach `adapter.send()` except through `Outbox.send()`.
+
+Policy is resolvable PER SCOPE (ENH-3): a target's policy may be a plain string (both
+scopes) or `{"channel": ..., "thread": ...}`, because "answer in thread, never the main
+channel" is a real placement policy — and placement must survive a crash, so the row
+records `scope` and `thread_id` and recovery re-sends into the recorded thread.
 """
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import sqlite3
 import time
@@ -42,10 +48,39 @@ CREATE TABLE IF NOT EXISTS outbox (
     state       TEXT NOT NULL,
     receipt     TEXT,
     policy      TEXT NOT NULL,
+    scope       TEXT NOT NULL DEFAULT 'channel',
+    thread_id   TEXT,
     created_at  REAL NOT NULL,
     updated_at  REAL NOT NULL
 );
 """
+
+# CREATE TABLE IF NOT EXISTS cannot add columns to an outbox.db that predates thread
+# awareness, and an adopter's existing state must keep loading. The 'channel' backfill
+# is truthful, not a guess: v1 had no way to express a thread, so every old row IS a
+# channel-scope send.
+_MIGRATIONS = (
+    ("scope", "ALTER TABLE outbox ADD COLUMN scope TEXT NOT NULL DEFAULT 'channel'"),
+    ("thread_id", "ALTER TABLE outbox ADD COLUMN thread_id TEXT"),
+)
+
+
+def _accepts_thread_id(send) -> bool:
+    """Can this adapter's send() be given a placement at all?
+
+    Asked of the SIGNATURE, before the call: the alternative — call and interpret a
+    TypeError — cannot tell "no such parameter" from a TypeError thrown inside a working
+    adapter. **kwargs counts, since that is a conforming signature too.
+    """
+    try:
+        params = inspect.signature(send).parameters
+    except (TypeError, ValueError):
+        # A builtin or C-implemented callable exposes no signature. Assume capable and
+        # let the adapter itself refuse — guessing "incapable" would block a send the
+        # policy allows.
+        return True
+    return ("thread_id" in params
+            or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()))
 
 
 class PolicyError(PermissionError):
@@ -56,17 +91,23 @@ class SendBlocked(RuntimeError):
     """The adapter refused or the read-back could not prove delivery."""
 
 
-def idempotency_key(target: str, trigger_ts: str, text: str) -> str:
-    """Stable identity of a reply: who, what triggered it, exact content.
+def idempotency_key(target: str, trigger_ts: str, text: str,
+                    thread_id: str | None = None) -> str:
+    """Stable identity of a reply: who, what triggered it, exact content, placement.
 
     Deliberately content-inclusive — the live system's 41 byte-identical outcome
     signatures came from re-emitting the SAME text for the same trigger, which this key
-    collapses into one delivery.
+    collapses into one delivery. Placement (thread vs channel) is part of the identity
+    too: the same text in-thread and top-level are two different visible messages.
+    The thread component is hashed only when present so channel-scope keys stay
+    byte-identical to v1 keys — recovery must still match rows written before this.
     """
     h = hashlib.sha256()
     h.update(target.encode()); h.update(b"\x00")
     h.update(str(trigger_ts).encode()); h.update(b"\x00")
     h.update(text.encode())
+    if thread_id is not None:
+        h.update(b"\x00"); h.update(str(thread_id).encode())
     return h.hexdigest()
 
 
@@ -77,6 +118,10 @@ class Outbox:
         self.conn = sqlite3.connect(str(db_path))
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        have = {r["name"] for r in self.conn.execute("PRAGMA table_info(outbox)")}
+        for col, ddl in _MIGRATIONS:
+            if col not in have:
+                self.conn.execute(ddl)
         self.conn.commit()
         self.adapter = adapter
         # Default DENY. A target absent from the policy map cannot be sent to.
@@ -125,23 +170,62 @@ class Outbox:
     def get(self, key):
         return self.conn.execute("SELECT * FROM outbox WHERE key=?", (key,)).fetchone()
 
-    def policy_for(self, target: str) -> str:
-        return self.policies.get(target, "never")
+    def _deliver(self, target, text, key, thread_id):
+        """The one place adapter.send() is called, from both the live path and recovery.
+
+        `thread_id` is passed ONLY for a thread send: an adapter written before thread
+        awareness (contract's `send(channel_id, text, thread_id?)`) has no such
+        parameter, and a top-level reply through it must keep working untouched. A
+        thread send through such an adapter must fail loudly rather than silently
+        flatten into the main channel — that flattening is the exact behavioural
+        difference this scope exists to control.
+        """
+        if thread_id is None:
+            return self.adapter.send(target, text, key=key)
+        if not _accepts_thread_id(self.adapter.send):
+            raise SendBlocked(
+                f"adapter {type(self.adapter).__name__} cannot place a reply in thread "
+                f"{thread_id}: its send() takes no thread_id (channels/CONTRACT.md), "
+                "and posting top-level instead is the one outcome a thread-scoped "
+                "policy forbids")
+        # Deliberately NOT wrapped in `except TypeError`: a TypeError raised inside a
+        # thread-capable adapter is that adapter's bug, and relabelling it "cannot
+        # thread" would send an operator to fix a capability that was never missing.
+        return self.adapter.send(target, text, key=key, thread_id=thread_id)
+
+    def policy_for(self, target: str, scope: str = "channel") -> str:
+        """Resolve the policy for a target AND placement.
+
+        A plain string covers both scopes (every config written before ENH-3 keeps
+        meaning what it meant). A dict scopes it, and a scope missing from that dict is
+        DENIED — default-deny has to hold per scope, or "answer in thread, never the
+        main channel" would silently become "answer anywhere".
+        """
+        policy = self.policies.get(target, "never")
+        if isinstance(policy, dict):
+            return policy.get(scope, "never")
+        return policy
 
     # ---- the send ladder --------------------------------------------------
-    def send(self, target: str, trigger_ts: str, text: str, _crash_at: str | None = None):
+    def send(self, target: str, trigger_ts: str, text: str,
+             thread_id: str | None = None, _crash_at: str | None = None):
         """Deliver exactly once, or stage, or refuse. Returns a receipt dict.
+
+        `thread_id` places the reply IN a thread; None means the main channel. The
+        placement is policed (per-scope policy), keyed (two distinct messages) and
+        recorded, so a crash cannot resume a thread reply as a top-level post.
 
         `_crash_at` is used ONLY by the fault-injection harness to simulate the process
         dying at a named seam; production callers never pass it.
         """
-        policy = self.policy_for(target)
+        scope = "thread" if thread_id is not None else "channel"
+        policy = self.policy_for(target, scope)
         if policy == "never":
             raise PolicyError(
-                f"reply policy for {target} is 'never' — refusing to send. "
-                "Sending requires an explicit policy of 'staged' or 'direct'.")
+                f"reply policy for {target} ({scope} scope) is 'never' — refusing to "
+                "send. Sending requires an explicit policy of 'staged' or 'direct'.")
 
-        key = idempotency_key(target, trigger_ts, text)
+        key = idempotency_key(target, trigger_ts, text, thread_id)
         row = self.get(key)
 
         if row is None:
@@ -152,10 +236,11 @@ class Outbox:
             # this, fire=13).
             cur = self.conn.execute(
                 "INSERT OR IGNORE INTO outbox (key, target, trigger_ts, text, state, "
-                "policy, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                "policy, scope, thread_id, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (key, target, str(trigger_ts), text,
                  STAGED if policy == "staged" else INTENT,
-                 policy, time.time(), time.time()))
+                 policy, scope, thread_id, time.time(), time.time()))
             self.conn.commit()      # R1: INTENT is durable BEFORE the adapter is touched
             if cur.rowcount == 0:   # lost the SELECT→INSERT race; read what the winner wrote
                 row = self.get(key)
@@ -182,7 +267,7 @@ class Outbox:
             raise _Crash("crash after INTENT, before adapter.send")
 
         self._pace(target)
-        receipt = self.adapter.send(target, text, key=key)
+        receipt = self._deliver(target, text, key, thread_id)
 
         if _crash_at == "after_send":
             # The nastiest seam: the message IS on the target but we never recorded it.
@@ -224,7 +309,10 @@ class Outbox:
                 # recovery is a burst source too: N undelivered rows for one channel
                 # re-sent back-to-back would 429 exactly like the live path
                 self._pace(target)
-                receipt = self.adapter.send(target, row["text"], key=key)
+                # Placement comes from the ROW, never from a caller: resuming a thread
+                # reply as a top-level post would break the thread-only policy after
+                # the fact, in public, with no second chance.
+                receipt = self._deliver(target, row["text"], key, row["thread_id"])
                 self._write(key, receipt=json.dumps(receipt))
                 counts["resent"] += 1
                 if not self.adapter.read_back(target, key):

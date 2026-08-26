@@ -36,12 +36,19 @@ step 6 hit exactly this).
 any channel you have not explicitly promoted.
 
 ```python
-outbox.policy_for("C_YOUR_CHANNEL")   # 'never' | 'staged' | 'direct'
+outbox.policy_for("C_YOUR_CHANNEL")             # 'never' | 'staged' | 'direct'
+outbox.policy_for("C_YOUR_CHANNEL", "thread")   # the SAME channel, inside a thread
 ```
 
 - `never` → `PolicyError` on send, adapter never called. Working as intended.
 - `staged` → look in the outbox for drafts: `outbox.staged()`. A human is meant to gate these.
 - `direct` → if it still is not sending, see the next section.
+
+**Ask about the placement that was actually refused.** The one-argument call answers for the
+main channel, so a channel configured with `thread_reply_policy` will look read-only while
+its threads are perfectly sendable, and vice versa. The `PolicyError` names the scope it
+refused; `outbox.staged()` rows carry `scope` and `thread_id`, which is also how you see
+where a draft would land before you approve it.
 
 ## "A send failed or the process died mid-send"
 

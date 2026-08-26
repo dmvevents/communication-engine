@@ -479,5 +479,98 @@ class TaxonomyTuningStepTest(unittest.TestCase):
                       "reclassified message")
 
 
+class ThreadPolicyDocTest(unittest.TestCase):
+    """ENH-3: the placement policy is only expressible if an adopter can find it.
+
+    The quickstart's example channel is LOADED through the real config loader and its
+    resolved policy driven through the real per-scope resolution, so a renamed key or a
+    changed default goes red here — a documented setting that silently does nothing is
+    worse than an undocumented one, because the adopter believes the main channel is
+    protected.
+    """
+
+    def setUp(self):
+        self.text = QUICKSTART.read_text()
+        # Numbered headings ("## 4. Understand the reply policy ...") do not match
+        # _section's exact-heading form, and the steps get renumbered as steps land.
+        self.section = self._step("reply policy")
+        self.edit_step = self._step("Copy the example config")
+
+    def _step(self, phrase):
+        # [^\n]* for the heading line, not .* — under DOTALL a greedy .* swallows the
+        # rest of the file, and a section that is secretly the whole document passes
+        # every assertion about it (this exact bug made a doc mutation survive once).
+        m = re.search(rf"^## [^\n]*{re.escape(phrase)}[^\n]*$(.*?)(?=^## |\Z)", self.text,
+                      re.MULTILINE | re.DOTALL | re.IGNORECASE)
+        return m.group(0) if m else ""
+
+    def documented_channel(self):
+        """The one-line JSON channel object the quickstart shows for this policy."""
+        for block in re.findall(r"```json\s*(.*?)```", self.section, re.DOTALL):
+            if "thread_reply_policy" in block:
+                return json.loads(block)
+        self.fail("the reply-policy step shows no json channel example carrying "
+                  "thread_reply_policy — an adopter cannot express 'answer in thread, "
+                  "never the main channel' from prose alone")
+
+    def test_the_documented_example_loads_and_scopes_the_policy(self):
+        from core.config import from_dict
+        cfg = from_dict({"engine": {}, "instances": [
+            {"name": "t", "adapter": "fake",
+             "channels": [self.documented_channel()]}]}, base_dir=ROOT)
+        ch = cfg.instance("t").channels[0]
+        policies = cfg.instance("t").policies()
+        with tempfile.TemporaryDirectory() as tmp:
+            box = Outbox(Path(tmp) / "outbox.db", None, policies)
+            self.assertEqual(box.policy_for(ch.id, "thread"), ch.thread_reply_policy)
+            self.assertEqual(box.policy_for(ch.id, "channel"), ch.reply_policy)
+            box.close()
+
+    def test_the_documented_example_leaves_the_main_channel_refusing(self):
+        """The whole point of the example: the channel scope must still be 'never'."""
+        self.assertEqual(self.documented_channel().get("reply_policy"), "never",
+                         "the 'answer in thread, never the main channel' example no "
+                         "longer shows the main channel as never — copied as-is it "
+                         "would post top-level in a channel the adopter thought was "
+                         "read-only")
+
+    def test_the_step_says_each_scope_is_deny_by_default(self):
+        self.assertIn("deny-by-default", self.section.lower())
+        # \s+ between words: the doc is hard-wrapped, so any of these phrases can be
+        # split across a line break at any time without changing what it says.
+        self.assertRegex(
+            self.section,
+            r"(?is)naming\s+one\s+placement\s+does\s+not\s+promote\s+the\s+other|"
+            r"each\s+scope\s+is\s+deny-by-default\s+on\s+its\s+own",
+            "the step no longer states that naming one placement leaves the other "
+            "denied — an adopter who sets only thread_reply_policy would reasonably "
+            "assume the main channel inherited it")
+
+    def test_the_runbook_diagnostic_asks_about_the_refused_placement(self):
+        """The "it is not sending anything" section is where an operator lands when a
+        thread reply was refused. A one-argument policy_for() answers for the main
+        channel, so on a thread-scoped channel it reports the opposite of the truth —
+        and this doc is the incumbent's own debugging habit written down."""
+        runbook = RUNBOOK.read_text()
+        m = re.search(r'outbox\.policy_for\("[^"]+",\s*"thread"\)', runbook)
+        self.assertTrue(m, "the runbook's policy diagnostic never asks about a thread, "
+                           "so an operator debugging a refused thread reply reads the "
+                           "channel's policy and concludes the wrong thing")
+        with tempfile.TemporaryDirectory() as tmp:
+            box = Outbox(Path(tmp) / "outbox.db", None,
+                         {"C": {"channel": "never", "thread": "direct"}})
+            # The documented call must genuinely distinguish the two placements.
+            self.assertEqual(box.policy_for("C"), "never")
+            self.assertEqual(box.policy_for("C", "thread"), "direct")
+            box.close()
+
+    def test_the_config_key_is_listed_where_the_adopter_edits_the_file(self):
+        """Step 2's table is the checklist an adopter edits against; a policy that only
+        appears in later prose is a policy most adopters never see."""
+        self.assertIn("thread_reply_policy", self.edit_step,
+                      "the placement policy is missing from the step-2 field table an "
+                      "adopter edits against, so most adopters never learn it exists")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

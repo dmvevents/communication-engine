@@ -37,6 +37,7 @@ Edit it. The only things you must change:
 | `instances[].auth.token` | **`env:YOUR_VAR_NAME`** — an environment-variable *reference* |
 | `instances[].channels[].id` | the channel/chat IDs you want watched |
 | `instances[].channels[].reply_policy` | `never` (default), `staged`, or `direct` |
+| `instances[].channels[].thread_reply_policy` | optional; same three values, applied only to replies **inside a thread**. Omit it and a thread is governed by `reply_policy` like anything else |
 | `instances[].principals` | the user IDs whose messages matter |
 
 Paths in `engine` are resolved **relative to the config file**, so the same file works on any
@@ -65,6 +66,21 @@ This is the one decision that can embarrass you, so it is deny-by-default:
 **A channel you forget to configure is `never`.** You cannot accidentally post as anyone by
 omission. Start every channel at `never`, watch what the engine *would* have done, and only
 then promote a channel you are confident about.
+
+### Answering in a thread but never in the main channel
+
+A top-level post in a busy channel is seen by everyone; a thread reply is seen by the people
+already in that thread. So placement is policed separately, with `thread_reply_policy`:
+
+```json
+{ "id": "C_YOUR_CHANNEL", "reply_policy": "never", "thread_reply_policy": "direct" }
+```
+
+That channel now answers **only** inside a thread — `outbox.send(...)` with no `thread_id`
+raises, exactly as a `never` channel does. Each scope is deny-by-default on its own: naming
+one placement does not promote the other. The outbox records which placement each reply used
+(`scope` and `thread_id` columns), so a staged draft tells the approving human where it would
+land, and a crashed thread reply resumes **in its thread** instead of resurfacing top-level.
 
 ## 5. First poll — the fake adapter, but YOUR config
 

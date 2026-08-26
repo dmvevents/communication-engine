@@ -137,7 +137,7 @@ run_mutation "outbox: skip read-back verification" \
 # R10 — default DENY. A target absent from the policy map must not be sendable.
 run_mutation "outbox: default policy becomes direct instead of never" \
   "core/outbox.py" \
-  "('        return self.policies.get(target, \"never\")', '        return self.policies.get(target, \"direct\")')" \
+  "('        policy = self.policies.get(target, \"never\")', '        policy = self.policies.get(target, \"direct\")')" \
   "test_outbox_faults"
 
 # R10 — a staged target must never reach the adapter (the operator gate).
@@ -590,14 +590,14 @@ run_mutation "outbox: default send interval below the platform floor" \
 # ENH-13 — the live send path must pace, not just the helper existing.
 run_mutation "outbox: the live send path skips the pacer" \
   "core/outbox.py" \
-  "('        self._pace(target)\n        receipt = self.adapter.send(target, text, key=key)', '        receipt = self.adapter.send(target, text, key=key)')" \
+  "('        self._pace(target)\n        receipt = self._deliver(target, text, key, thread_id)', '        receipt = self._deliver(target, text, key, thread_id)')" \
   "test_outbox_pacing"
 
 # ENH-13 — recovery is a burst source too: N undelivered rows for one channel
 # re-sent back-to-back would 429 exactly like the live path.
 run_mutation "outbox: recovery re-sends a burst unpaced" \
   "core/outbox.py" \
-  "('                self._pace(target)\n                receipt = self.adapter.send(target, row[\"text\"], key=key)', '                receipt = self.adapter.send(target, row[\"text\"], key=key)')" \
+  "('                self._pace(target)\n                # Placement comes from the ROW', '                # Placement comes from the ROW')" \
   "test_outbox_pacing"
 
 # ENH-13 — attempts must be recorded or the hold never engages; recording at the
@@ -834,6 +834,130 @@ run_mutation "example: a later instance names an unshipped adapter" \
   "settings.example.json" \
   "('\"adapter\": \"slack\"', '\"adapter\": \"telegram\"')" \
   "test_portability"
+
+# ---------------------------------------------------------------------------
+# ENH-3 — thread awareness. `thread_id` was declared in the store schema, the normalized
+# message and the adapter contract, and read by NOTHING: every reply flattened to the main
+# channel. Each mutation below re-flattens one link in the chain — and a flattened reply is
+# a PUBLIC post in a channel whose policy may say 'never', so a survivor here is a
+# customer-visible defect, not a cosmetic one.
+# ---------------------------------------------------------------------------
+
+# ENH-3 — THE acceptance policy: 'answer in thread, never the main channel'. Ignoring the
+# scope collapses it back to one policy for both placements.
+run_mutation "outbox: policy resolution ignores the placement scope" \
+  "core/outbox.py" \
+  "('        if isinstance(policy, dict):\n            return policy.get(scope, \"never\")', '        if isinstance(policy, dict):\n            return policy.get(\"channel\", policy.get(\"thread\", \"never\"))')" \
+  "test_outbox_threads"
+
+# ENH-3 — default DENY has to hold PER SCOPE too: a scope absent from a scoped policy
+# must be refused, not inherit the permissive sibling.
+run_mutation "outbox: an unlisted scope falls back to a permissive sibling" \
+  "core/outbox.py" \
+  "('            return policy.get(scope, \"never\")', '            return policy.get(scope) or next(iter(policy.values()), \"never\")')" \
+  "test_outbox_threads"
+
+# ENH-3 — the send itself: dropping thread_id on the way to the adapter posts the reply
+# top-level while reporting success.
+run_mutation "outbox: the thread is dropped on the way to the adapter" \
+  "core/outbox.py" \
+  "('        receipt = self._deliver(target, text, key, thread_id)', '        receipt = self._deliver(target, text, key, None)')" \
+  "test_outbox_threads"
+
+# ENH-3 — an adapter that cannot thread must make the send FAIL, not silently become a
+# top-level post in a channel whose policy may be 'never'.
+run_mutation "outbox: a threadless adapter gets the reply posted top-level instead" \
+  "core/outbox.py" \
+  "('        if not _accepts_thread_id(self.adapter.send):', '        if False:')" \
+  "test_outbox_threads"
+
+# ENH-3 — the capability question must be asked of the SIGNATURE. Interpreting a TypeError
+# instead relabels a bug inside a working adapter as \"this adapter cannot thread\".
+run_mutation "outbox: adapter capability inferred from a raised TypeError again" \
+  "core/outbox.py" \
+  "('        return self.adapter.send(target, text, key=key, thread_id=thread_id)', '        try:\n            return self.adapter.send(target, text, key=key, thread_id=thread_id)\n        except TypeError as ex:\n            raise SendBlocked(str(ex)) from ex')" \
+  "test_outbox_threads"
+
+# ENH-3 — recovery must take placement from the ROW. Resuming with None flattens a thread
+# reply into the channel after a crash, breaking the policy retroactively and in public.
+run_mutation "outbox: recovery resumes a thread reply top-level" \
+  "core/outbox.py" \
+  "('                receipt = self._deliver(target, row[\"text\"], key, row[\"thread_id\"])', '                receipt = self._deliver(target, row[\"text\"], key, None)')" \
+  "test_outbox_threads"
+
+# ENH-3 — placement is part of a reply's IDENTITY. Without it the in-thread and the
+# top-level answer to the same trigger share a key, so the second one is deduped away.
+run_mutation "outbox: placement drops out of the idempotency key" \
+  "core/outbox.py" \
+  "('    if thread_id is not None:\n        h.update(b\"\\\\x00\"); h.update(str(thread_id).encode())', '    pass')" \
+  "test_outbox_threads"
+
+# ENH-3 — the record. A staged draft and a recovered row both need to know WHERE they go;
+# not persisting it makes the outbox unable to answer which placement was used.
+run_mutation "outbox: the row stops recording which scope was used" \
+  "core/outbox.py" \
+  "('                 policy, scope, thread_id, time.time(), time.time()))', '                 policy, \"channel\", None, time.time(), time.time()))')" \
+  "test_outbox_threads"
+
+# ENH-3 — an adopter's existing outbox.db predates the thread columns; CREATE TABLE IF NOT
+# EXISTS cannot add them, so without the migration every read of an old row raises.
+run_mutation "outbox: a pre-thread outbox.db is no longer migrated" \
+  "core/outbox.py" \
+  "('        for col, ddl in _MIGRATIONS:\n            if col not in have:\n                self.conn.execute(ddl)', '        pass')" \
+  "test_outbox_threads"
+
+# ENH-3 — config is where an adopter expresses the policy; ignoring the key means the
+# documented setting silently does nothing, the worst possible outcome for a placement rule.
+run_mutation "config: thread_reply_policy is parsed and then ignored" \
+  "core/config.py" \
+  "('        if self.thread_reply_policy is None:\n            return self.reply_policy', '        if True:\n            return self.reply_policy')" \
+  "test_outbox_threads"
+
+# ENH-3 — a typo'd placement policy must fail AT LOAD (ENH-20 discipline), not resolve to
+# a scope that is never permitted and look like a silent read-only channel.
+run_mutation "config: an invalid thread_reply_policy loads clean" \
+  "core/config.py" \
+  "('            if value not in VALID_POLICIES:', '            if value not in VALID_POLICIES and key == \"reply_policy\":')" \
+  "test_outbox_threads"
+
+# ENH-3 — the reference adapter is what adapter authors copy. One that accepts thread_id
+# and drops it posts in the main channel and reports success — the exact silent flattening.
+run_mutation "fake adapter: accepts a thread and posts top-level anyway" \
+  "channels/fake/adapter.py" \
+  "('        self.delivered.append((channel_id, text, key, thread_id))', '        self.delivered.append((channel_id, text, key, None))')" \
+  "test_outbox_threads"
+
+# ENH-3/R21 — a policy an adopter cannot find is a policy they cannot express. The
+# quickstart's own example is loaded through the real loader, so these three re-create
+# each way the doc could stop teaching it.
+
+# ENH-3 — copied as-is, this example would post top-level in a channel the adopter had
+# just been told stays read-only.
+run_mutation "docs: the thread-policy example promotes the main channel too" \
+  "docs/QUICKSTART.md" \
+  "('\"reply_policy\": \"never\", \"thread_reply_policy\": \"direct\"', '\"reply_policy\": \"direct\", \"thread_reply_policy\": \"direct\"')" \
+  "test_docs"
+
+# ENH-3 — the step-2 table is the checklist an adopter edits against; a key that lives
+# only in later prose is a key most adopters never see.
+run_mutation "docs: the placement key vanishes from the field table" \
+  "docs/QUICKSTART.md" \
+  "('| \`instances[].channels[].thread_reply_policy\`', '| \`instances[].channels[].some_other_key\`')" \
+  "test_docs"
+
+# ENH-3 — per-scope deny-by-default is the non-obvious half: an adopter who sets only
+# thread_reply_policy would otherwise assume the main channel inherited it.
+run_mutation "docs: per-scope deny-by-default stops being stated" \
+  "docs/QUICKSTART.md" \
+  "('Each scope is deny-by-default on its own: naming\none placement does not promote the other. ', '')" \
+  "test_docs"
+
+# ENH-3 — the operator's turn: an unscoped policy_for() on a thread-scoped channel reports
+# the opposite of the truth, and this section is where a refused reply gets debugged.
+run_mutation "docs: the runbook diagnostic drops the placement argument" \
+  "docs/RUNBOOK.md" \
+  "('outbox.policy_for(\"C_YOUR_CHANNEL\", \"thread\")', 'outbox.policy_for(\"C_YOUR_CHANNEL\")')" \
+  "test_docs"
 
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"

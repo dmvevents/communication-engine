@@ -57,6 +57,13 @@ instance carries its own auth env-refs, cursor namespace, trigger rules, and **r
 Reply policy is **configuration, not code** — the same adapter serves a stage-only customer
 channel and a direct-reply DM without branching.
 
+An optional `thread_reply_policy` scopes the same three values to replies **inside a thread**,
+so "answer in thread, never the main channel" is expressible; each scope defaults to deny on
+its own. An adapter whose `capabilities()["threads"]` is true must honour the `thread_id`
+argument — accepting it and posting top-level anyway reports success while doing the one
+thing the policy forbade, so `core/outbox` refuses a thread send through an adapter whose
+`send()` has no `thread_id` parameter rather than silently flattening it.
+
 ## Rules for adapter authors
 
 1. No secrets in code or defaults — auth arrives as `env:NAME` references from config.

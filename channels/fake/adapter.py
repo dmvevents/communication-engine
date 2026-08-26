@@ -23,7 +23,7 @@ class Adapter:
 
     def capabilities(self):
         return {"read": True, "history": True, "search": False,
-                "send": True, "react": False, "threads": False}
+                "send": True, "react": False, "threads": True}
 
     def seed(self, messages):
         """Test/dry-run hook: make messages available to the next poll()."""
@@ -41,13 +41,16 @@ class Adapter:
     def resolve(self, ref):
         return ref
 
-    def send(self, channel_id, text, key=None):
-        self.delivered.append((channel_id, text, key))
+    def send(self, channel_id, text, key=None, thread_id=None):
+        """Placement is recorded, not ignored: an adapter that accepts thread_id and
+        drops it posts in the main channel while reporting success, which is the one
+        failure the thread scope exists to prevent (ENH-3)."""
+        self.delivered.append((channel_id, text, key, thread_id))
         return {"ts": str(len(self.delivered)), "key": key}
 
     def read_back(self, target, key):
         """Proof-of-delivery by idempotency key — what outbox recovery relies on (R1)."""
-        return any(t == target and k == key for t, _, k in self.delivered)
+        return any(t == target and k == key for t, _, k, _ in self.delivered)
 
     def health(self):
         if self.fail_health:
