@@ -181,6 +181,17 @@ class RevisionTest(unittest.TestCase):
         self.assertEqual([r["kind"] for r in revs],
                          ["STATEMENT", "QUESTION", "EXEC-REQUEST"])
 
+    def test_revision_history_reads_as_records_not_row_handles(self):
+        """ENH-22: revisions() is the RUNBOOK's per-edit audit walk, read by a human
+        disputing a recorded decision; a list of raw sqlite3.Row objects prints as
+        '[<sqlite3.Row object at 0x...>]' and shows none of the history it holds."""
+        self.j.record(CH, "1.1", text="v1", kind="STATEMENT")
+        self.j.record(CH, "1.1", text="v2", kind="QUESTION")
+        revs = self.j.revisions(CH, "1.1")
+        self.assertIn("v2", repr(revs),
+                      "printing the revision history shows object addresses, not edits")
+        self.assertEqual([r["text"] for r in revs], ["v1", "v2"])
+
     def test_identical_text_is_a_resighting_not_a_revision(self):
         self.j.record(CH, "1.1", text="same")
         res = self.j.record(CH, "1.1", text="same")

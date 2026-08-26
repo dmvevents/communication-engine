@@ -16,6 +16,33 @@ vacuously (`core/checks.py` refuses a PASS that inspected nothing). Exit 0 means
 problem is probably further down this page; exit 2 is a config refusal (first table
 below); exit 1 names the failing check.
 
+**Second move, before any Python snippet below:** every `journal.` / `outbox.` /
+`owed.` / `store.` call on this page assumes objects built from YOUR config. Paste
+this first, from the directory holding your `settings.json`, in the same environment
+your engine runs under — `load()` refuses a missing `env:` reference, by design:
+
+```python
+from core.config import load, load_adapter_class
+from core.journal import Journal
+from core.outbox import Outbox
+from core.owed import OwedRegistry
+from core.store import Store
+
+cfg = load("settings.json")
+inst = cfg.instances[0]                 # or cfg.instance("my-team-slack")
+adapter = load_adapter_class(cfg.channels_dir, inst.adapter)(auth=inst.auth)
+journal = Journal(cfg.journal_path)
+outbox = Outbox(cfg.outbox_path_for(inst.name), adapter, inst.policies())
+owed = OwedRegistry(cfg.state_dir / "owed.db")
+store = Store(cfg.store_path)
+```
+
+One honesty note: with this construction `owed.unattended()` lists **all** open work —
+the default liveness probe counts every driver as dead, which over-reports, the safe
+direction at 2am. To honour live drivers, pass the probe your loop actually uses
+(the reference scheduler's `pid_alive` in `scripts/scheduler.py`) as
+`OwedRegistry(..., driver_alive=...)`.
+
 ## "The engine refuses to start"
 
 | Message | Cause | Fix |
@@ -168,10 +195,16 @@ classifier regresses silently.
 ## "Are the gates actually running?"
 
 ```sh
-bash scripts/sanitize-gate.sh --self-test   # must catch all 10 planted secret classes
-bash tests/mutation_check.sh                # must report every mutation caught
-git config core.hooksPath; ls .git/hooks/pre-push
+bash scripts/sanitize-gate.sh --self-test     # healthy: catches all 10 planted secret classes
+bash tests/mutation_check.sh                  # healthy: "every removed property turned the suite red"
+ls .git/hooks/pre-commit .git/hooks/pre-push  # healthy: both paths print
 ```
+
+A `No such file or directory` from that last line means a gate is not installed — run
+`scripts/install-hooks.sh`. Do **not** judge the hooks with `git config core.hooksPath`:
+on a correctly-installed clone it prints *nothing* and exits 1 (the hooks live in
+`.git/hooks/` itself, no redirection), so the healthy result reads exactly like a
+failure.
 
 **A control that cannot run is not a control.** CI on the origin repo is disabled by account
 billing, which is why the hooks matter. And note: a billing-blocked GitHub Actions run still

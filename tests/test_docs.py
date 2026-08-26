@@ -138,6 +138,15 @@ class HonestLimitsTest(unittest.TestCase):
             "Marketplace approval gets throttled on the poll path and, unwarned, "
             "blames the engine for the platform's limit")
 
+    def test_the_parity_advice_names_the_shipped_differ(self):
+        """ENH-22: the parity limit advises 'run both and diff' — and core/parity.py is
+        a working CLI that does exactly that, yet no doc named it, so every adopter
+        was sent off to write a differ the repo already ships."""
+        self.assertIn("python3 -m core.parity", self.limits,
+                      "the limits section tells the adopter to run both systems and "
+                      "diff but never names the shipped differ — advice pointing at a "
+                      "tool it hides is homework, not advice")
+
 
 class DocCitationsTest(unittest.TestCase):
     """Paths and API names cited by the docs must exist. A doc that points at a file or
@@ -595,6 +604,126 @@ class TaxonomyTuningStepTest(unittest.TestCase):
                       "step 6 no longer says the verification re-run needs --seed-demo "
                       "— an unseeded fresh-state poll shows an empty channel, not a "
                       "reclassified message")
+
+
+class RunbookConstructorTest(unittest.TestCase):
+    """ENH-22: every runbook snippet calls journal./outbox./owed. methods, and until
+    this section existed the only import the whole RUNBOOK showed was core.classify —
+    a 2am operator had to source-dive for every constructor (measured: the adopter
+    re-run at 0447ca4 could instantiate Journal only from remembered knowledge of a
+    prior run). The doc block is EXECUTED here, as pasted, against a real adopter
+    tree, and then the runbook's own snippets are run on the objects it built —
+    prose about construction would drift; a block that must run cannot."""
+
+    INSTANCE, CHANNEL, ENV = "runbook-2am", "C_DEMO", "RUNBOOK_TOKEN"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        shutil.copytree(ROOT / "channels" / "fake", self.base / "channels" / "fake",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        # A 2am operator inspects a running engine's EXISTING state directory.
+        (self.base / "state").mkdir()
+        (self.base / "settings.json").write_text(
+            '{"engine": {"state_dir": "state"},\n'
+            ' "instances": [{"name": "%s", "adapter": "fake",\n'
+            '   "auth": {"token": "env:%s"},\n'
+            '   "channels": [{"id": "%s", "label": "demo",'
+            ' "reply_policy": "staged"}],\n'
+            '   "principals": ["U_DEMO"]}]}\n' % (self.INSTANCE, self.ENV, self.CHANNEL))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def constructor_block(self):
+        for block in re.findall(r"```python\s*(.*?)```", RUNBOOK.read_text(), re.DOTALL):
+            if "cfg = load(" in block:
+                return block
+        self.fail("the RUNBOOK never shows how to construct the objects its snippets "
+                  "call — every diagnostic on the page needs a source dive first")
+
+    # The runbook's own snippets, verbatim method-for-method, appended to the doc's
+    # constructor block. STAGED policy so the adapter is never sent through.
+    SNIPPETS = (
+        '\nout = []\n'
+        'out.append(("policy", outbox.policy_for("C_DEMO"),'
+        ' outbox.policy_for("C_DEMO", "thread")))\n'
+        'outbox.send("C_DEMO", "9.9", "[AGENT] draft for the operator gate")\n'
+        'print("DRAFTS:", outbox.staged())\n'
+        'print("RECOVER:", outbox.recover())\n'
+        'journal.record("C_DEMO", "9.9", text="Please deploy the fix.",'
+        ' kind="EXEC-REQUEST", reason="imperative", matched=["deploy", "please"])\n'
+        'print("AUDIT:", journal.audit("C_DEMO", "9.9"))\n'
+        'print("REVISIONS:", journal.revisions("C_DEMO", "9.9"))\n'
+        'print("UNANSWERED:", len(journal.unanswered("C_DEMO")))\n'
+        'print("COUNTS:", journal.row_count(), journal.distinct_count())\n'
+        'print("UNATTENDED:", len(owed.unattended()))\n'
+        'print("STORE:", store.count("C_DEMO"))\n'
+        'print("RUNBOOK-SNIPPETS-OK")\n'
+    )
+
+    def test_the_documented_construction_runs_as_pasted(self):
+        r = subprocess.run(
+            [sys.executable, "-c", self.constructor_block() + self.SNIPPETS],
+            cwd=self.base, capture_output=True, text=True,
+            env={"PATH": os.environ["PATH"], "PYTHONPATH": str(ROOT),
+                 self.ENV: "dry-run-value-not-a-real-token"})
+        self.assertEqual(r.returncode, 0,
+                         "the RUNBOOK's constructor block does not run as pasted:\n"
+                         + r.stderr[-800:])
+        self.assertIn("RUNBOOK-SNIPPETS-OK", r.stdout)
+
+    def test_what_the_snippets_print_is_readable(self):
+        """The other half of the ergonomics defect: constructed or not, staged() and
+        revisions() used to PRINT as '<sqlite3.Row object at 0x...>' — the draft text
+        the operator must gate and the edit history under dispute were invisible."""
+        r = subprocess.run(
+            [sys.executable, "-c", self.constructor_block() + self.SNIPPETS],
+            cwd=self.base, capture_output=True, text=True,
+            env={"PATH": os.environ["PATH"], "PYTHONPATH": str(ROOT),
+                 self.ENV: "dry-run-value-not-a-real-token"})
+        self.assertEqual(r.returncode, 0, r.stderr[-800:])
+        self.assertIn("draft for the operator gate", r.stdout,
+                      "outbox.staged() printed no draft text — the operator gate "
+                      "is unreadable exactly where the RUNBOOK points a human at it")
+        self.assertIn("Please deploy the fix.", r.stdout,
+                      "journal.revisions() printed no message text — the audit walk "
+                      "shows object addresses instead of the disputed history")
+
+
+class GatesCheckDocTest(unittest.TestCase):
+    """ENH-22: the runbook's hook health check was `git config core.hooksPath`, which
+    on a correctly-installed clone prints NOTHING and exits 1 — the healthy result
+    read as a failure at exactly the moment someone was doubting the gates."""
+
+    def section(self):
+        s = _section(RUNBOOK.read_text(), '"Are the gates actually running?"')
+        self.assertTrue(s.strip(), "the runbook lost its gates-health section")
+        return s
+
+    def test_the_hook_check_shows_output_on_a_healthy_clone(self):
+        s = self.section()
+        self.assertIn("ls .git/hooks/pre-commit .git/hooks/pre-push", s,
+                      "the gates section lost the hook check that PRINTS on a "
+                      "healthy clone")
+        self.assertNotRegex(s, r"git config core\.hooksPath\s*(;|\n|$)",
+                            "the silent-on-healthy form is back as the check: "
+                            "`git config core.hooksPath` prints nothing and exits 1 "
+                            "on a correctly-installed clone")
+        self.assertRegex(s, r"(?i)healthy:",
+                         "the checks no longer state what their healthy output looks "
+                         "like — output with no stated expectation cannot be judged")
+
+    def test_the_stated_expectation_holds_on_this_clone(self):
+        if not (ROOT / ".git").is_dir():
+            self.skipTest("not a git clone (mutation sandbox); the content "
+                          "assertions above carry the property there")
+        for hook in ("pre-commit", "pre-push"):
+            self.assertTrue(
+                (ROOT / ".git" / "hooks" / hook).is_file(),
+                f"the runbook promises `ls .git/hooks/{hook}` prints on a healthy "
+                "clone, but this clone has no such hook — run "
+                "scripts/install-hooks.sh or fix the doc")
 
 
 class ThreadPolicyDocTest(unittest.TestCase):

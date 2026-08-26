@@ -285,6 +285,11 @@ is *reported* missing — never silently created, never rendered as a healthy ze
   one real platform (two ingestion paths for it), not two platforms.
 - **Read parity against an existing system has not been demonstrated** over a long window
   (gate G1). If you are replacing an incumbent, run both and diff before trusting this one.
+  The diff is shipped, not homework — `core/parity.py` opens the incumbent's own database
+  read-only and compares it to the engine's store:
+  `python3 -m core.parity --oracle <incumbent.db> --candidate state/messages.db --channel C_YOUR_CHANNEL`
+  (exit 0 parity, 1 names every missed/extra message, 2 an unusable comparison — an empty
+  oracle is an ERROR, never a pass).
 - **Slack throttles by distribution model, and the poll path is what it throttles.** Since
   **2025-05-29**, newly-created apps that are commercially distributed without Slack
   Marketplace approval face sharply reduced limits on `conversations.history` and

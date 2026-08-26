@@ -1528,6 +1528,46 @@ run_mutation "compose: render drops the citation from the reply" \
   "('if p.refs else p.text', 'if False else p.text')" \
   "test_compose"
 
+# ---------------------------------------------------------------------------
+# ENH-22 — adopter ergonomics. Each of these, if it survived, re-creates one measured
+# way the docs and their objects were unusable as written: drafts and edit history
+# printing as '<sqlite3.Row object at 0x...>', snippets with no documented constructor,
+# advice pointing at a differ no doc names, and a hook check whose healthy result
+# reads as a failure.
+# ---------------------------------------------------------------------------
+
+# ENH-22 — staged() is read by the human gating the drafts; a raw row hides the text.
+run_mutation "outbox: staged() hands back raw row handles again" \
+  "core/outbox.py" \
+  "('        return [dict(r) for r in rows]', '        return rows')" \
+  "test_outbox_faults"
+
+# ENH-22 — revisions() is the audit walk a human reads while disputing a decision.
+run_mutation "journal: revisions() hands back raw row handles again" \
+  "core/journal.py" \
+  "('        return [dict(r) for r in rows]', '        return rows')" \
+  "test_journal"
+
+# ENH-22 — without the constructor block, every snippet on the page needs a source
+# dive first (the adopter re-run could instantiate Journal only from memory of a
+# prior session).
+run_mutation "docs: the runbook constructor block loses its construction" \
+  "docs/RUNBOOK.md" \
+  "('cfg = load(\"settings.json\")', 'cfg = your_engine_config   # construct however you like')" \
+  "test_docs"
+
+# ENH-22 — 'run both and diff' pointing at no tool is homework, not advice.
+run_mutation "docs: the parity differ loses its name in honest limits" \
+  "docs/QUICKSTART.md" \
+  "('python3 -m core.parity --oracle', 'run a diff of your own against')" \
+  "test_docs"
+
+# ENH-22 — the check that prints nothing on a healthy clone, reintroduced verbatim.
+run_mutation "docs: the hook check reverts to the silent-on-healthy form" \
+  "docs/RUNBOOK.md" \
+  "('ls .git/hooks/pre-commit .git/hooks/pre-push  # healthy: both paths print', 'git config core.hooksPath; ls .git/hooks/pre-push')" \
+  "test_docs"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }

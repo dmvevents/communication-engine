@@ -326,8 +326,13 @@ class Outbox:
             "SELECT * FROM outbox WHERE state IN (?,?)", (INTENT, SENT)).fetchall()
 
     def staged(self) -> list:
-        return self.conn.execute(
+        """Drafts at the operator gate, as plain dicts. This method exists for a HUMAN
+        (the RUNBOOK sends one here to gate the drafts), and a raw sqlite3.Row prints
+        as '<sqlite3.Row object at 0x...>' — the text being gated was reachable only
+        via dict(row)['text'] and a source dive (ENH-22)."""
+        rows = self.conn.execute(
             "SELECT * FROM outbox WHERE state=?", (STAGED,)).fetchall()
+        return [dict(r) for r in rows]
 
     def close(self):
         self.conn.close()

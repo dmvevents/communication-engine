@@ -174,6 +174,23 @@ class Harness(unittest.TestCase):
                          "a 'staged' target reached the adapter — the operator gate was bypassed")
         self.assertEqual(len(b.staged()), 1)
 
+    def test_staged_drafts_read_as_records_not_row_handles(self):
+        """ENH-22: staged() exists for exactly one consumer — the human the RUNBOOK
+        sends to gate these drafts — and a raw sqlite3.Row prints as '<sqlite3.Row
+        object at 0x...>', so that human could reach the draft's text only via
+        dict(row)['text'] and a source dive. Printing a draft must show what would
+        be sent."""
+        b = Outbox(self.db, self.adapter, {TARGET: "staged"})
+        b.send(TARGET, TS, TEXT)
+        (draft,) = b.staged()
+        self.assertIn(TEXT, repr(draft),
+                      "printing a staged draft shows an object address, not the text "
+                      "the operator is supposed to gate")
+        self.assertEqual(draft["text"], TEXT)
+        # The RUNBOOK reads placement off these rows to say where a draft would land.
+        self.assertEqual(draft["scope"], "channel")
+        self.assertIsNone(draft["thread_id"])
+
     def test_staged_rows_are_not_swept_up_by_recovery(self):
         b = Outbox(self.db, self.adapter, {TARGET: "staged"})
         b.send(TARGET, TS, TEXT)

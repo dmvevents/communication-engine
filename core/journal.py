@@ -182,9 +182,14 @@ class Journal:
                 "revision": row["revision"]}
 
     def revisions(self, channel: str, ts: str) -> list:
-        return self.conn.execute(
+        """Per-edit history, oldest first, as plain dicts — this is the RUNBOOK's audit
+        walk, read by a human disputing a decision, and a list of raw sqlite3.Row
+        objects prints as '[<sqlite3.Row object at 0x...>]' showing none of the
+        history it holds (ENH-22)."""
+        rows = self.conn.execute(
             "SELECT * FROM revisions WHERE channel=? AND ts=? ORDER BY seq",
             (channel, str(ts))).fetchall()
+        return [dict(r) for r in rows]
 
     def edited_after_response(self) -> list:
         """Messages edited AFTER we answered them — any earlier reply may now be wrong.
