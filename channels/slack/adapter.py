@@ -230,18 +230,19 @@ class Adapter:
             return ex.code, dict(ex.headers), ex.read().decode("utf-8", "replace")
 
     # ---- polling internals ---------------------------------------------------
-    def _history(self, channel, oldest):
-        """Every message newer than `oldest` (exclusive), oldest-first, ALL pages."""
+    def _history_raw(self, channel, oldest=None, latest=None):
+        """Raw platform messages in the window, ALL pages followed to the end."""
         out, page_cursor = [], None
         while True:
             params = {"channel": channel, "limit": PAGE_LIMIT}
             if oldest is not None:
                 params["oldest"] = oldest
+            if latest is not None:
+                params["latest"] = latest
             if page_cursor:
                 params["cursor"] = page_cursor
             payload = self._api("conversations.history", **params)
-            out.extend(self._normalize(channel, m)
-                       for m in payload.get("messages", []))
+            out.extend(payload.get("messages", []))
             if not payload.get("has_more"):
                 break
             page_cursor = (payload.get("response_metadata") or {}).get("next_cursor")
@@ -249,8 +250,30 @@ class Adapter:
                 raise ApiError("conversations.history",
                                "has_more with no next_cursor — refusing to silently "
                                "drop the rest of the window")
+        return out
+
+    def _history(self, channel, oldest):
+        """Every message newer than `oldest` (exclusive), oldest-first, ALL pages."""
+        out = [self._normalize(channel, m) for m in self._history_raw(channel, oldest)]
         out.sort(key=lambda m: float(m["ts"]))
         return out
+
+    # ---- optional capability: the platform snapshot (channels/CONTRACT.md) ------
+    def retrievable_ts(self, channel, oldest=None, latest=None):
+        """Every ts the platform will serve for this channel RIGHT NOW.
+
+        The parity differ needs a third opinion because the incumbent oracle is an archive,
+        not ground truth: it holds messages that have since been deleted, and the engine —
+        which can only ever fetch what the API serves — is then blamed for "losing" them.
+        Measured 2026-08-26: 342 of 507 oracle rows in one channel were unretrievable (one
+        app's deleted burst), and without this method the differ read that as a read-path
+        defect (core/parity.py's docstring carries the numbers).
+
+        Deliberately a plain ts SET, not messages: it is evidence for a comparison, not
+        content to ingest, and keeping it small means the snapshot can be written to disk
+        and reviewed after the fact.
+        """
+        return {m["ts"] for m in self._history_raw(channel, oldest, latest) if m.get("ts")}
 
     @staticmethod
     def _normalize(channel_id, m):

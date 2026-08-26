@@ -371,5 +371,47 @@ class ResolveTest(SlackAdapterTestCase):
         self.assertIn("nobody-here", str(ctx.exception))
 
 
+class RetrievableSnapshotTest(SlackAdapterTestCase):
+    """The platform snapshot that lets core/parity tell a deletion from a lost message.
+
+    Measured 2026-08-26 (R8's first live window): 342 of 507 oracle rows for one channel
+    were no longer served by the API, and without this the differ read that as a read-path
+    defect. The snapshot has to be as gap-free as polling is — a truncated snapshot would
+    mark still-served messages 'unretrievable', which is exactly the direction that hides
+    a real loss.
+    """
+
+    def test_returns_every_timestamp_the_platform_serves(self):
+        a = self.make([history([slack_msg("3.0"), slack_msg("2.0"), slack_msg("1.0")])])
+        self.assertEqual(a.retrievable_ts("C_ONE"), {"1.0", "2.0", "3.0"})
+
+    def test_follows_pagination_to_the_end(self):
+        a = self.make([
+            history([slack_msg("9.0")], has_more=True, next_cursor="p2"),
+            history([slack_msg("8.0")]),
+        ])
+        self.assertEqual(a.retrievable_ts("C_ONE"), {"8.0", "9.0"})
+
+    def test_a_truncated_snapshot_raises_rather_than_under_reporting(self):
+        """has_more with no cursor: silently returning page one would mark every later
+        message 'deleted upstream' — a differ-blinding lie in the dangerous direction."""
+        a = self.make([history([slack_msg("9.0")], has_more=True)])  # no next_cursor
+        with self.assertRaises(self.mod.ApiError):
+            a.retrievable_ts("C_ONE")
+
+    def test_the_snapshot_bounds_the_window_it_was_asked_for(self):
+        a = self.make([history([slack_msg("5.0")])])
+        a.retrievable_ts("C_ONE", oldest="4.0", latest="6.0")
+        _, form = self.http.requests[0]
+        self.assertEqual((form["oldest"], form["latest"]), ("4.0", "6.0"))
+
+    def test_the_snapshot_uses_a_read_method_only(self):
+        a = self.make([history([slack_msg("1.0")])])
+        a.retrievable_ts("C_ONE")
+        url, _ = self.http.requests[0]
+        self.assertTrue(url.endswith("/conversations.history"))
+        self.assertIn("conversations.history", self.mod.READ_METHODS)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

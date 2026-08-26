@@ -28,6 +28,15 @@ is the reference implementation to copy.
 | `send(channel_id, text, thread_id?) -> receipt` | **Only callable through `core/outbox`.** Adapters expose the primitive; the stage-gate (draft → outbox file → operator gate → send) is enforced in core, never re-implemented per adapter. |
 | `health() -> {reachable, auth_ok, detail}` | Cheap (<2s) liveness used by the probe and watchdog layers. Must not consume rate-limit budget meaningfully. |
 
+## Optional capabilities
+
+Beyond the five required methods, an adapter may expose these. Core **degrades, never
+demands**: a missing optional method changes what the engine can prove, not whether it runs.
+
+| Method | Why, and what is lost without it |
+|---|---|
+| `retrievable_ts(channel, oldest?, latest?) -> set[str]` | Every timestamp the platform will serve **right now** — the third opinion `core/parity.py` needs. The incumbent oracle is an *archive*, not ground truth: it holds messages the platform has since deleted, and the engine, which can only fetch what the API serves, then gets blamed for "losing" them. Measured 2026-08-26 on the first live R8 window: 342 of 507 oracle rows in one channel were no longer served (one app's deleted burst), while the engine held 100% of retrievable history. Without this method the differ is **fail-closed** — every miss counts as a loss — so parity can never go green on a channel with any deleted history. The snapshot must be as gap-free as `poll()`: a truncated snapshot marks still-served messages "deleted upstream", which is the one direction that hides a real defect, so raise rather than under-report. |
+
 An adapter that watches a **fixed, config-derived channel set** (both shipped real adapters
 do — theirs arrives via the `channels` env reference) should expose it as a `channels`
 attribute (iterable of platform ids). `core/doctor.py` cross-checks it against the

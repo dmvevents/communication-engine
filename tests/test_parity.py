@@ -1,8 +1,14 @@
 """Tests for core/parity.py — the G1 differ (requirement R8).
 
-The most important test here is `test_empty_oracle_raises_instead_of_passing`: a differ
-that reports "no misses" because it compared nothing is the same defect class as the
-secret gate that passed on an empty file list while CI stayed green.
+Two properties matter more than the rest:
+
+* `test_empty_oracle_raises_instead_of_passing` — a differ that reports "no misses"
+  because it compared nothing is the same defect class as the secret gate that passed on
+  an empty file list while CI stayed green.
+* `test_engine_lost_can_never_be_accepted` — classification exists so that a divergence
+  the platform explains (a deleted message) stops masquerading as a read-path defect. The
+  moment it can also excuse a REAL loss, the gate is decorative. Acceptance is a
+  reviewable argument, and this one class is outside its reach by construction.
 """
 import sqlite3
 import tempfile
@@ -12,7 +18,10 @@ from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.parity import ParityError, compare, read_timestamps  # noqa: E402
+from core.parity import (  # noqa: E402
+    AHEAD_OF_ORACLE, BEFORE_ENGINE_START, ENGINE_LOST, ENGINE_ONLY, NOT_YET_POLLED,
+    ORACLE_MISSED, PRE_ORACLE_FLOOR, UNCLASSIFIED, UNRETRIEVABLE,
+    ParityError, compare, read_served, read_timestamps)
 
 
 class CompareTest(unittest.TestCase):
@@ -56,6 +65,208 @@ class CompareTest(unittest.TestCase):
         self.assertIn("PARITY FAIL", s)
         self.assertIn("missed", s)
         self.assertIn("1.2", s)
+
+
+class FailClosedTest(unittest.TestCase):
+    """With no platform snapshot, an ambiguous loss must be read as OUR loss."""
+
+    def test_without_a_platform_snapshot_every_miss_is_engine_lost(self):
+        r = compare({"1.1", "1.2"}, {"1.1"}, "C_EXAMPLE")
+        self.assertEqual(r.classified["1.2"], ENGINE_LOST)
+        self.assertFalse(r.served_known)
+        self.assertFalse(r.ok)
+
+    def test_summary_says_out_loud_that_the_snapshot_was_absent(self):
+        """A reader must not mistake a fail-closed verdict for a platform-confirmed one."""
+        self.assertIn("ABSENT", compare({"1.1", "1.2"}, {"1.1"}, "C_EXAMPLE").summary())
+
+    def test_an_empty_platform_snapshot_is_an_error_not_a_blanket_excuse(self):
+        """An empty snapshot would relabel every genuine loss 'deleted upstream' — the
+        vacuous-pass bug wearing a new hat."""
+        with self.assertRaises(ParityError):
+            compare({"1.1", "1.2"}, {"1.1"}, "C_EXAMPLE", served_ts=set())
+
+    def test_unparseable_timestamp_raises_instead_of_sorting_as_zero(self):
+        """A ts that floats to 0.0 would fall below every retention floor and earn a
+        benign class for free."""
+        with self.assertRaises(ParityError):
+            compare({"1.1", "not-a-ts"}, {"1.1"}, "C_EXAMPLE", served_ts={"1.1"})
+
+
+class ClassificationTest(unittest.TestCase):
+    def test_platform_no_longer_serves_it_so_the_miss_is_unretrievable(self):
+        r = compare({"1.1", "1.2"}, {"1.1"}, "C_EXAMPLE", served_ts={"1.1"})
+        self.assertEqual(r.classified["1.2"], UNRETRIEVABLE)
+        self.assertFalse(r.ok, "unaccepted by default — explaining is a deliberate act")
+        self.assertTrue(compare({"1.1", "1.2"}, {"1.1"}, "C_EXAMPLE",
+                                served_ts={"1.1"}, accept=[UNRETRIEVABLE]).ok)
+
+    def test_platform_still_serves_it_so_the_miss_is_engine_lost(self):
+        r = compare({"1.1", "1.2"}, {"1.1"}, "C_EXAMPLE", served_ts={"1.1", "1.2"},
+                    accept=[UNRETRIEVABLE, PRE_ORACLE_FLOOR])
+        self.assertEqual(r.classified["1.2"], ENGINE_LOST)
+        self.assertFalse(r.ok, "accepting other classes must not excuse a real loss")
+
+    def test_a_row_the_platform_serves_and_neither_store_has_is_still_a_loss(self):
+        """The universe of misses is served|oracle. A message the platform will hand over
+        and the engine lacks is lost whether or not the incumbent caught it."""
+        r = compare({"1.1"}, {"1.1"}, "C_EXAMPLE", served_ts={"1.1", "2.0"})
+        self.assertEqual(r.classified["2.0"], ENGINE_LOST)
+        self.assertFalse(r.ok)
+
+    def test_misses_newer_than_the_cursor_are_not_yet_polled(self):
+        r = compare({"1.1", "3.0"}, {"1.1"}, "C_EXAMPLE", served_ts={"1.1", "3.0"},
+                    covered_through="2.0", accept=[NOT_YET_POLLED])
+        self.assertEqual(r.classified["3.0"], NOT_YET_POLLED)
+        self.assertTrue(r.ok)
+
+    def test_the_window_comes_from_the_cursor_not_the_newest_stored_row(self):
+        """THE laundering hole: if the window were inferred from the candidate's own
+        maximum, a lost newest message would define itself out of the window and be
+        waved through as 'not yet polled'."""
+        r = compare({"1.1", "3.0"}, {"1.1"}, "C_EXAMPLE", served_ts={"1.1", "3.0"},
+                    covered_through="3.0", accept=[NOT_YET_POLLED])
+        self.assertEqual(r.classified["3.0"], ENGINE_LOST)
+        self.assertFalse(r.ok)
+
+    def test_misses_older_than_the_engines_first_poll_are_before_engine_start(self):
+        r = compare({"0.5", "1.1"}, {"1.1"}, "C_EXAMPLE", served_ts={"0.5", "1.1"},
+                    covered_from="1.0", accept=[BEFORE_ENGINE_START])
+        self.assertEqual(r.classified["0.5"], BEFORE_ENGINE_START)
+        self.assertTrue(r.ok)
+
+    def test_extra_below_the_oracle_floor_is_pre_oracle_floor(self):
+        r = compare({"5.0", "6.0"}, {"1.0", "5.0", "6.0"}, "C_EXAMPLE",
+                    served_ts={"5.0", "6.0"}, accept=[PRE_ORACLE_FLOOR])
+        self.assertEqual(r.classified["1.0"], PRE_ORACLE_FLOOR)
+        self.assertTrue(r.ok, "a deeper backfill than the incumbent's retention is not a bug")
+
+    def test_extra_above_the_oracle_high_water_mark_is_ahead_of_oracle(self):
+        r = compare({"5.0"}, {"5.0", "9.0"}, "C_EXAMPLE", served_ts={"5.0", "9.0"},
+                    accept=[AHEAD_OF_ORACLE])
+        self.assertEqual(r.classified["9.0"], AHEAD_OF_ORACLE)
+        self.assertTrue(r.ok, "the engine polling sooner than the incumbent is a race, not a defect")
+
+    def test_extra_inside_the_window_that_the_platform_serves_means_the_oracle_missed_it(self):
+        r = compare({"5.0", "7.0"}, {"5.0", "6.0", "7.0"}, "C_EXAMPLE",
+                    served_ts={"5.0", "6.0", "7.0"})
+        self.assertEqual(r.classified["6.0"], ORACLE_MISSED)
+
+    def test_extra_inside_the_window_that_nobody_else_has_is_engine_only(self):
+        """Sole-witness rows are where a foreign-channel ingest bug lands (ENH-14), so
+        this class must exist separately and must not be accepted by default."""
+        r = compare({"5.0", "7.0"}, {"5.0", "6.0", "7.0"}, "C_EXAMPLE",
+                    served_ts={"5.0", "7.0"})
+        self.assertEqual(r.classified["6.0"], ENGINE_ONLY)
+        self.assertFalse(r.ok)
+
+    def test_every_divergent_row_gets_a_class(self):
+        """No silent hole: a row that reached no rule would be invisible to the verdict."""
+        r = compare({"1.0", "2.0", "3.0"}, {"2.0", "4.0", "0.1"}, "C_EXAMPLE",
+                    served_ts={"1.0", "2.0"})
+        for ts in (r.missed | r.extra):
+            self.assertIn(ts, r.classified, f"{ts} was classified into nothing")
+            self.assertNotEqual(r.classified[ts], UNCLASSIFIED)
+
+
+class AcceptanceTest(unittest.TestCase):
+    def test_engine_lost_can_never_be_accepted(self):
+        """The whole taxonomy is safe only because this one class is out of reach."""
+        with self.assertRaises(ParityError):
+            compare({"1.1"}, {"1.1"}, "C_EXAMPLE", accept=[ENGINE_LOST])
+
+    def test_unclassified_can_never_be_accepted(self):
+        with self.assertRaises(ParityError):
+            compare({"1.1"}, {"1.1"}, "C_EXAMPLE", accept=[UNCLASSIFIED])
+
+    def test_accepting_nothing_reproduces_the_strict_two_way_differ(self):
+        """The default must be the old, strict behaviour — opting into tolerance is the
+        change, not opting out of it."""
+        r = compare({"1.1", "1.2"}, {"1.1", "9.9"}, "C_EXAMPLE", served_ts={"1.1", "1.2"})
+        self.assertFalse(r.ok)
+        self.assertEqual(r.accepted, frozenset())
+
+    def test_unexplained_names_only_the_classes_that_were_not_accepted(self):
+        r = compare({"1.1", "1.2"}, {"1.1", "9.9"}, "C_EXAMPLE",
+                    served_ts={"1.1", "1.2"}, accept=[AHEAD_OF_ORACLE])
+        self.assertEqual(set(r.unexplained), {ENGINE_LOST})
+        self.assertIn(AHEAD_OF_ORACLE, r.counts())
+
+    def test_summary_marks_each_class_accepted_or_unexplained(self):
+        s = compare({"1.1", "1.2"}, {"1.1"}, "C_EXAMPLE",
+                    served_ts={"1.1"}, accept=[UNRETRIEVABLE]).summary()
+        self.assertIn("UNRETRIEVABLE=1 [accepted]", s)
+        self.assertIn("PARITY OK", s)
+
+
+class LiveIncidentRegressionTest(unittest.TestCase):
+    """The measured 2026-08-26 R8 window, reduced to its shape.
+
+    Oracle 507 / engine 189 on one channel: 342 rows the platform will not serve
+    (one app's deleted burst) and 24 rows below the oracle's retention floor. The old
+    differ called this FAIL and pointed at the read path; the platform's own answer was
+    that the engine held 100% of retrievable history. This test pins that verdict so a
+    future change cannot quietly re-break either direction.
+    """
+
+    def setUp(self):
+        self.common = {f"{1000 + i}.0" for i in range(165)}
+        self.deleted = {f"{2000 + i}.0" for i in range(342)}   # oracle-only, unserved
+        self.deep = {f"{100 + i}.0" for i in range(24)}        # engine-only, pre-floor
+        self.oracle = self.common | self.deleted
+        self.candidate = self.common | self.deep
+        self.served = self.common                              # what Slack returns today
+
+    def test_the_measured_divergence_is_fully_explained(self):
+        r = compare(self.oracle, self.candidate, "C_EXAMPLE", served_ts=self.served,
+                    accept=[UNRETRIEVABLE, PRE_ORACLE_FLOOR])
+        self.assertEqual(r.counts(), {UNRETRIEVABLE: 342, PRE_ORACLE_FLOOR: 24})
+        self.assertEqual(r.by_class(ENGINE_LOST), set())
+        self.assertTrue(r.ok, "every divergence has a named, accepted cause")
+
+    def test_one_genuinely_lost_message_still_fails_the_same_window(self):
+        """The acceptance list must not be a blanket amnesty: drop a single row that the
+        platform WOULD serve and the run must go red."""
+        lost = sorted(self.common)[0]
+        r = compare(self.oracle, self.candidate - {lost}, "C_EXAMPLE",
+                    served_ts=self.served,
+                    accept=[UNRETRIEVABLE, PRE_ORACLE_FLOOR])
+        self.assertEqual(r.by_class(ENGINE_LOST), {lost})
+        self.assertFalse(r.ok)
+
+
+class ReadServedTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write(self, body):
+        p = Path(self.tmp.name) / "served.json"
+        p.write_text(body)
+        return str(p)
+
+    def test_reads_a_json_list_of_timestamps(self):
+        self.assertEqual(read_served(self._write('["1.1", "1.2"]')), {"1.1", "1.2"})
+
+    def test_reads_a_channel_keyed_object_too(self):
+        self.assertEqual(read_served(self._write('{"C_A": ["1.1"], "C_B": ["2.2"]}')),
+                         {"1.1", "2.2"})
+
+    def test_missing_file_raises_parity_error(self):
+        with self.assertRaises(ParityError):
+            read_served(str(Path(self.tmp.name) / "nope.json"))
+
+    def test_malformed_json_raises_instead_of_reading_as_no_snapshot(self):
+        """Silently degrading to 'no snapshot' would flip the run to fail-closed and hide
+        that the snapshot step is broken."""
+        with self.assertRaises(ParityError):
+            read_served(self._write("{not json"))
+
+    def test_wrong_shape_raises(self):
+        with self.assertRaises(ParityError):
+            read_served(self._write('"1.1"'))
 
 
 class ReadTimestampsTest(unittest.TestCase):

@@ -101,7 +101,70 @@ run_mutation "parity: stop reporting extra messages" \
 # R8 — cursor divergence must fail parity.
 run_mutation "parity: ignore cursor divergence in the verdict" \
   "core/parity.py" \
-  "('return not self.missed and not self.extra and not self.cursor_divergent', 'return not self.missed and not self.extra')" \
+  "('        return not self.unexplained and not self.cursor_divergent', '        return not self.unexplained')" \
+  "test_parity"
+
+# R8 — the verdict IS the unexplained set. Ignoring it passes every divergence.
+run_mutation "parity: verdict ignores unexplained divergence classes" \
+  "core/parity.py" \
+  "('        return not self.unexplained and not self.cursor_divergent', '        return not self.cursor_divergent')" \
+  "test_parity"
+
+# R8/R25 — THE safety property of classification. If a caller can accept ENGINE_LOST,
+# the entire taxonomy becomes a way to configure a real message loss into a green run.
+run_mutation "parity: ENGINE_LOST becomes waivable by configuration" \
+  "core/parity.py" \
+  "('    forbidden = accepted & NEVER_ACCEPTABLE', '    forbidden = frozenset()')" \
+  "test_parity"
+
+# R25 — fail-closed when the platform is silent. Without a snapshot, a message we lost
+# and a message someone deleted are indistinguishable, and the safe reading is 'ours'.
+run_mutation "parity: fail OPEN when no platform snapshot is supplied" \
+  "core/parity.py" \
+  "('        elif not served_known or ts in served:', '        elif served_known and ts in served:')" \
+  "test_parity"
+
+# R25 — an empty snapshot would relabel every genuine loss as an upstream deletion:
+# the vacuous-pass bug wearing a new hat.
+run_mutation "parity: an empty platform snapshot excuses every loss" \
+  "core/parity.py" \
+  "('    if served_known and not served:', '    if False:')" \
+  "test_parity"
+
+# R25 — the coverage window must come from the CURSOR, not from the engine's own newest
+# row: inferring it from the candidate lets a lost newest message define itself out of
+# the window and be waved through as NOT_YET_POLLED.
+run_mutation "parity: coverage window inferred from the newest stored row" \
+  "core/parity.py" \
+  "('    through = _fl(covered_through) if covered_through is not None else None', '    through = max(map(_fl, candidate_ts)) if candidate_ts else None')" \
+  "test_parity"
+
+# R25 — a message the PLATFORM serves and the engine lacks is lost whether or not the
+# incumbent happened to catch it. Narrowing the universe to the oracle hides that.
+run_mutation "parity: platform rows the oracle never had are not checked for loss" \
+  "core/parity.py" \
+  "('    for ts in (served | oracle_ts) - candidate_ts:', '    for ts in oracle_ts - candidate_ts:')" \
+  "test_parity"
+
+# ENH-14 — sole-witness rows are where a foreign-channel ingest bug lands. Filing them
+# as 'the incumbent missed it' blames the oracle for our own bug.
+run_mutation "parity: sole-witness extras blamed on the oracle" \
+  "core/parity.py" \
+  "('            classified[ts] = ENGINE_ONLY', '            classified[ts] = ORACLE_MISSED')" \
+  "test_parity"
+
+# R25 — an unorderable ts must not float to 0.0, which would place it below every
+# retention floor and earn a benign class for free.
+run_mutation "parity: unparseable timestamp silently sorts as zero" \
+  "core/parity.py" \
+  "('    except (TypeError, ValueError) as ex:', '    except (TypeError, ValueError) as ex:\n        return 0.0\n    except KeyboardInterrupt as ex:')" \
+  "test_parity"
+
+# R25 — a broken snapshot file must not degrade to 'no snapshot': that silently flips the
+# run to fail-closed and hides that the snapshot step itself is broken.
+run_mutation "parity: a malformed platform snapshot degrades to no snapshot" \
+  "core/parity.py" \
+  "('        raise ParityError(f\"platform snapshot {path} is not valid JSON: {ex}\") from ex', '        return set()')" \
   "test_parity"
 
 # R8 — a schema mismatch must not look like an empty channel.
