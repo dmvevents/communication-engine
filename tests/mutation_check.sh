@@ -792,6 +792,34 @@ run_mutation "config: an empty discovery blames the adapter name again" \
   "('            if not discovered:', '            if False:')" \
   "test_portability"
 
+# ---------------------------------------------------------------------------
+# ENH-21 — QUICKSTART step 2 is `cp settings.example.json settings.json`, and the shipped
+# example used to LEAD with an instance whose adapter had no adapter.py, so copy-then-run
+# failed 100% of the time (only step-5 prose stood between the adopter and the failure).
+# Each of these, if it survived, re-ships an example whose documented copy step produces
+# an unloadable config.
+# ---------------------------------------------------------------------------
+
+# ENH-21 — THE defect verbatim: the first instance names a contract stub again.
+run_mutation "example: first instance is an undiscovered stub adapter again" \
+  "settings.example.json" \
+  "('\"adapter\": \"fake\"', '\"adapter\": \"telegram\"')" \
+  "test_portability"
+
+# ENH-21 — slot 0 is what the step-5 dry run keeps, at a point where no credential
+# exists yet; a real adapter there loads clean and then hits the network at first poll.
+run_mutation "example: first instance demands credentials for the no-network dry run" \
+  "settings.example.json" \
+  "('\"adapter\": \"fake\"', '\"adapter\": \"slack\"')" \
+  "test_portability"
+
+# ENH-21 — the whole-file property: EVERY instance must name a shipped adapter, or the
+# copy step is unloadable however many env vars the adopter exports.
+run_mutation "example: a later instance names an unshipped adapter" \
+  "settings.example.json" \
+  "('\"adapter\": \"slack\"', '\"adapter\": \"telegram\"')" \
+  "test_portability"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }

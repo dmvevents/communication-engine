@@ -69,13 +69,13 @@ then promote a channel you are confident about.
 ## 5. First poll — the fake adapter, but YOUR config
 
 Prove the target of this document against the file you just edited, with no network at all.
-Two edits to `settings.json` first:
+The example already **leads** with the fake-adapter instance, which loads and polls with no
+credentials (a test pins both properties, so the copy step cannot ship broken again). One
+edit to `settings.json` first:
 
-- set `"adapter": "fake"` on the instance you kept;
-- **delete the instances you are not using.** A leftover example stub blocks startup:
-  first as an unknown adapter (only types discovered under `channels/` are accepted), and
-  — once an instance names a real adapter — because its `auth` env references must resolve
-  at load time (by design — see `docs/RUNBOOK.md`, "The engine refuses to start").
+- **delete the instances you are not using** — for this dry run, keep only the first. A
+  leftover instance blocks startup, because its `auth` env references must resolve at
+  load time (by design — see `docs/RUNBOOK.md`, "The engine refuses to start").
 
 ```sh
 python3 scripts/first-poll.py --config settings.json --seed-demo

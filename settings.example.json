@@ -1,5 +1,5 @@
 {
-  "_note": "Copy to settings.json (gitignored) and fill in. Values of the form 'env:NAME' under auth are read from the environment at runtime — never put literal credentials in any settings file. Every channel starts at reply_policy 'never' on purpose: watch first, promote later (docs/QUICKSTART.md step 4). Delete any instance you are not using.",
+  "_note": "Copy to settings.json (gitignored) and fill in. The FIRST instance is the in-memory fake adapter: it loads and polls as copied, with no credentials — QUICKSTART step 5 runs against it. Later instances need their env-var references exported first: values of the form 'env:NAME' under auth are read from the environment at runtime — never put literal credentials in any settings file. Delete any instance you are not using; every instance kept must name a shipped adapter and resolve its env references, or the engine refuses to start. Every channel starts at reply_policy 'never' on purpose: watch first, promote later (docs/QUICKSTART.md step 4).",
   "engine": {
     "state_dir": "state",
     "channels_dir": "channels",
@@ -8,6 +8,22 @@
     "dashboard_out": "state/COMMS-DASHBOARD.md"
   },
   "instances": [
+    {
+      "name": "example-dry-run",
+      "adapter": "fake",
+      "channels": [
+        {
+          "id": "C_DEMO",
+          "label": "dry-run",
+          "poll_interval_s": 15,
+          "reply_policy": "never",
+          "triggers": ["mention", "principal", "keyword:agent"]
+        }
+      ],
+      "principals": [
+        { "id": "U_EXAMPLE_PRINCIPAL", "label": "watched-colleague" }
+      ]
+    },
     {
       "name": "example-slack-workspace",
       "adapter": "slack",
@@ -37,14 +53,6 @@
         { "id": "U_EXAMPLE_PRINCIPAL", "label": "watched-colleague" }
       ],
       "bridge": { "bind": "loopback-only", "port": 0, "hmac_secret": "env:BRIDGE_ENV_REF" }
-    },
-    {
-      "name": "example-telegram",
-      "adapter": "telegram",
-      "auth": { "bot_token": "env:TG_BOT_ENV_REF" },
-      "channels": [
-        { "id": "TG_CHAT_ID_HERE", "label": "operator", "reply_policy": "never" }
-      ]
     }
   ],
   "reply_policies_doc": {

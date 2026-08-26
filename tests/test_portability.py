@@ -191,13 +191,51 @@ class ConfigTest(unittest.TestCase):
         with self.assertRaises(ConfigError):
             resolve_secret("just-a-value", env={})
 
-    def test_shipped_example_config_is_loadable(self):
-        """The example an adopter copies must actually parse."""
-        example = ROOT / "settings.example.json"
-        self.assertTrue(example.is_file(), "settings.example.json is missing")
+class ShippedExampleTest(unittest.TestCase):
+    """ENH-21. QUICKSTART step 2 is `cp settings.example.json settings.json`, and the
+    shipped example used to lead with an instance whose adapter had no adapter.py (a
+    contract stub), so the documented copy step produced an unloadable config 100% of
+    the time — only prose ('delete the instances you are not using') stood between the
+    adopter and the failure. Loading the example THROUGH core.config.load is what stops
+    it ever shipping unloadable again; a parse-only check let exactly that happen.
+    """
+
+    EXAMPLE = ROOT / "settings.example.json"
+
+    def raw(self):
+        self.assertTrue(self.EXAMPLE.is_file(), "settings.example.json is missing")
         import json
-        raw = json.loads(example.read_text())
-        self.assertIn("instances", raw, "example config has no instances to copy")
+        return json.loads(self.EXAMPLE.read_text())
+
+    def documented_env(self):
+        """Every env var the example itself references, with dummy values. The adopter's
+        step-3 export list is derived from the file, so this test cannot drift from it —
+        and anything the file demands BEYOND its own env: references is a failure."""
+        names = re.findall(r"env:([A-Za-z_][A-Za-z0-9_]*)", self.EXAMPLE.read_text())
+        self.assertTrue(names, "the example no longer documents any env: reference")
+        return {n: "value-from-the-environment" for n in names}
+
+    def test_the_example_loads_as_copied_with_only_env_vars_supplied(self):
+        """The acceptance: cp + export must yield a loadable config — every instance
+        names a shipped adapter and every credential reference resolves."""
+        cfg = load(self.EXAMPLE, env=self.documented_env())
+        self.assertGreaterEqual(len(cfg.instances), 1)
+
+    def test_the_first_instance_alone_loads_with_no_env_at_all(self):
+        """QUICKSTART step 5 keeps instances[0], deletes the rest, and exports nothing:
+        that derived config must load, or the no-network dry run fails as documented."""
+        raw = self.raw()
+        raw["instances"] = raw["instances"][:1]
+        cfg = from_dict(raw, base_dir=ROOT, env={})
+        self.assertEqual(len(cfg.instances), 1)
+
+    def test_the_first_instance_is_the_zero_credential_fake_adapter(self):
+        """Loading alone cannot pin this: a credential-less real-adapter instance would
+        load clean and then hit the network at first poll. The step-5 dry run needs the
+        in-memory adapter in slot 0, because that is the instance an adopter keeps."""
+        self.assertEqual(self.raw()["instances"][0]["adapter"], "fake",
+                         "the example must LEAD with the fake adapter — the dry run "
+                         "keeps instances[0] at a point where no credential exists yet")
 
 
 class ConfigErrorQualityTest(unittest.TestCase):
