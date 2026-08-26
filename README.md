@@ -49,7 +49,8 @@ copies of the same five ideas. This repo turns the mirroring into a contract:
 
 - `core/` — the engine: cursored gap-free polling into a pinned-schema store, word-boundary
   classification that records its cues, an idempotent audit journal, the **stage-first
-  outbox** (sending is gated, never a default), the owed-work edge, edge-triggered
+  outbox** (sending is gated, never a default), evidence-cited reply composition (a
+  number enters a reply only as a claim citing a banked artifact), the owed-work edge, edge-triggered
   escalation, health checks that cannot silently no-op, a shadow-mode parity differ, and
   keyed rate-limit back-off.
 - `channels/` — one adapter per platform, capability-honest, discovered from configuration.

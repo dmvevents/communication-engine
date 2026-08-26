@@ -1449,6 +1449,57 @@ run_mutation "dashboard-script: reads a hardwired path instead of the adopter's 
   "('snap = snapshot(cfg.journal_path, outbox_paths)', 'snap = snapshot(Path(\"state/journal.db\"), outbox_paths)')" \
   "test_dashboard"
 
+# ---------------------------------------------------------------------------
+# ENH-10 — compose: the citation discipline. The origin rule these encode is "never
+# improvise a number, cite banked artifacts"; each mutation below re-opens one door a
+# figure could walk through uncited, on its way to a customer channel in the
+# operator's name.
+# ---------------------------------------------------------------------------
+
+# The one definition of "a number" both prose() and claim() share. Inert detector =
+# no claim is ever factual = the whole layer waves everything through.
+run_mutation "compose: the factual-claim detector goes inert" \
+  "core/compose.py" \
+  "('return NUMBER.findall(text or \"\")', 'return []')" \
+  "test_compose"
+
+# A number entering as prose is the exact improvisation the layer exists to stop.
+run_mutation "compose: prose stops refusing numbers" \
+  "core/compose.py" \
+  "('        if numbers:', '        if False:')" \
+  "test_compose"
+
+# Needs its own teeth: on a number-free claim no other check fires afterwards.
+run_mutation "compose: a claim no longer requires a citation" \
+  "core/compose.py" \
+  "('        if not any(refs):', '        if False:')" \
+  "test_compose"
+
+# A citation to nothing reads exactly like a citation to evidence.
+run_mutation "compose: citations to unbanked artifacts admitted" \
+  "core/compose.py" \
+  "('        unbanked = [r for r in refs if r not in self.bank]', '        unbanked = []')" \
+  "test_compose"
+
+# Laundering: a REAL ref stapled to an INVENTED figure must still be refused.
+run_mutation "compose: improvised numbers pass with a real citation" \
+  "core/compose.py" \
+  "('        improvised = [n for n in factual_claims(text) if n not in banked]', '        improvised = []')" \
+  "test_compose"
+
+# Coverage must come from the artifact itself, not only from digits in its name —
+# otherwise banking an empty artifact under a numeric ref covers anything.
+run_mutation "compose: artifact content dropped from coverage" \
+  "core/compose.py" \
+  "('            banked.update(factual_claims(self.bank[r]))', '            pass')" \
+  "test_compose"
+
+# The citation must be ON the wire: a receipt the recipient cannot see is not one.
+run_mutation "compose: render drops the citation from the reply" \
+  "core/compose.py" \
+  "('if p.refs else p.text', 'if False else p.text')" \
+  "test_compose"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }
