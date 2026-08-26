@@ -63,6 +63,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from core.config import ConfigError, load_adapter_class
+
 # ---- the divergence classes -------------------------------------------------
 # A miss: present on the platform and/or in the oracle, absent from the engine.
 ENGINE_LOST = "ENGINE_LOST"                  # platform serves it, in window, engine lacks it
@@ -86,6 +88,31 @@ class ParityError(RuntimeError):
     """The comparison itself could not be performed. Never downgrade to 'pass'."""
 
 
+def snapshot_declaration(adapter, adapter_name):
+    """None when `adapter` (class or instance) can answer "what do you still serve?" —
+    otherwise the operator-facing declaration of the missing capability (ENH-27).
+
+    retrievable_ts is optional and core degrades to fail-closed without it — correct,
+    but silent. A push surface can NEVER supply the snapshot (channels/slack_socket
+    receives events and has no history call; a Telegram bot cannot re-read updates it
+    has acknowledged), so every parity run against its store is permanently fail-closed
+    and the resulting ENGINE_LOST rows read as a read-path defect. That misreading is
+    the measured R8 incident wearing a different cause; this declaration exists so the
+    explanation is made once, in writing, instead of once per confused operator.
+
+    Accepts the discovered CLASS as well as an instance, because the parity CLI has no
+    auth to construct with — the capability answer must be the same either way.
+    """
+    if callable(getattr(adapter, "retrievable_ts", None)):
+        return None
+    return (f"adapter {adapter_name!r} cannot supply a platform snapshot: it has no "
+            f"retrievable_ts (a push surface receives events and cannot ask the "
+            f"platform what it still serves), so the verdicts {UNRETRIEVABLE} and "
+            f"{ORACLE_MISSED} are unavailable and every miss reads {ENGINE_LOST} "
+            "(fail-closed) — a capability gap of this adapter, not yet proof of a "
+            "read-path defect")
+
+
 @dataclass
 class ParityReport:
     channel: str
@@ -99,6 +126,9 @@ class ParityReport:
     classified: dict = field(default_factory=dict)
     accepted: frozenset = frozenset()
     served_known: bool = False
+    # snapshot_declaration()'s answer for the adapter feeding the candidate store;
+    # printed only while the snapshot is genuinely absent (see summary()).
+    snapshot_unavailable: str | None = None
 
     @property
     def cursor_divergent(self) -> bool:
@@ -134,9 +164,13 @@ class ParityReport:
             f"  extra(in engine, not in oracle)={len(self.extra)}",
         ]
         if not self.served_known:
-            lines.append("  platform snapshot: ABSENT — every miss counted as ENGINE_LOST "
-                         "(fail-closed: without it, a loss and a deletion are "
-                         "indistinguishable)")
+            if self.snapshot_unavailable:
+                lines.append(f"  platform snapshot: UNAVAILABLE — "
+                             f"{self.snapshot_unavailable}")
+            else:
+                lines.append("  platform snapshot: ABSENT — every miss counted as "
+                             "ENGINE_LOST (fail-closed: without it, a loss and a "
+                             "deletion are indistinguishable)")
         for cls, n in self.counts().items():
             mark = "accepted" if cls in self.accepted else "UNEXPLAINED"
             lines.append(f"  {cls}={n} [{mark}]")
@@ -175,7 +209,8 @@ def compare(oracle_ts, candidate_ts, channel: str,
             served_ts=None,
             covered_from: str | None = None,
             covered_through: str | None = None,
-            accept=()) -> ParityReport:
+            accept=(),
+            snapshot_unavailable: str | None = None) -> ParityReport:
     """Diff the engine's store against the oracle, classified by cause.
 
     `served_ts` is the platform's own answer to "what would you return right now?" —
@@ -190,6 +225,12 @@ def compare(oracle_ts, candidate_ts, channel: str,
 
     `accept` names the classes this deployment has decided are legitimate. ENGINE_LOST and
     UNCLASSIFIED are refused — see NEVER_ACCEPTABLE.
+
+    `snapshot_unavailable` is `snapshot_declaration()`'s answer for the adapter feeding
+    the candidate store (ENH-27). It changes no classification — declared is explained,
+    never excused — and is printed only while no `served_ts` exists: a snapshot supplied
+    from elsewhere (the sibling polling adapter on the same platform) un-degrades the
+    verdicts, and "cannot supply" would then misdescribe the run that happened.
 
     Raises ParityError when the ORACLE side is empty (nothing to compare against), or when
     a `served_ts` set is supplied but empty while the oracle is not (an empty platform
@@ -260,6 +301,7 @@ def compare(oracle_ts, candidate_ts, channel: str,
         classified=classified,
         accepted=accepted,
         served_known=served_known,
+        snapshot_unavailable=snapshot_unavailable,
     )
 
 
@@ -320,17 +362,33 @@ def main(argv=None) -> int:
     ap.add_argument("--accept", default="",
                     help="comma-separated divergence classes this deployment has "
                          "explained. ENGINE_LOST and UNCLASSIFIED are refused.")
+    ap.add_argument("--candidate-adapter", default=None,
+                    help="channel type that FEEDS the candidate store (e.g. "
+                         "slack_socket). If the discovered adapter cannot supply a "
+                         "platform snapshot (no retrievable_ts), the report says so "
+                         "by name, so its fail-closed ENGINE_LOST rows read as a "
+                         "missing capability rather than a read-path defect.")
+    ap.add_argument("--channels-dir", default="channels",
+                    help="adapter discovery dir for --candidate-adapter (default: "
+                         "./channels, the same dir config points core at)")
     a = ap.parse_args(argv)
 
     try:
+        # A typo'd adapter name must not silently degrade to the generic ABSENT
+        # line, so ConfigError shares ParityError's "unusable comparison" exit.
+        declaration = None
+        if a.candidate_adapter:
+            cls = load_adapter_class(a.channels_dir, a.candidate_adapter)
+            declaration = snapshot_declaration(cls, a.candidate_adapter)
         o = read_timestamps(a.oracle, a.channel, a.oracle_table)
         c = read_timestamps(a.candidate, a.channel, a.candidate_table)
         served = read_served(a.served_json) if a.served_json else None
         report = compare(o, c, a.channel, served_ts=served,
                          covered_from=a.covered_from,
                          covered_through=a.covered_through,
-                         accept=[s.strip() for s in a.accept.split(",") if s.strip()])
-    except ParityError as ex:
+                         accept=[s.strip() for s in a.accept.split(",") if s.strip()],
+                         snapshot_unavailable=declaration)
+    except (ConfigError, ParityError) as ex:
         print(f"PARITY ERROR: {ex}", file=sys.stderr)
         return 2
     print(report.summary())

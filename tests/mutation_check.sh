@@ -167,6 +167,33 @@ run_mutation "parity: a malformed platform snapshot degrades to no snapshot" \
   "('        raise ParityError(f\"platform snapshot {path} is not valid JSON: {ex}\") from ex', '        return set()')" \
   "test_parity"
 
+# ENH-27 — an adapter that CANNOT supply a snapshot must be declared, or its permanently
+# fail-closed parity runs read as read-path defects (the R8 misreading, re-armed).
+run_mutation "parity: an adapter without retrievable_ts declares nothing" \
+  "core/parity.py" \
+  "('    if callable(getattr(adapter, \"retrievable_ts\", None)):', '    if True:')" \
+  "test_parity"
+
+# ENH-27 — the declaration must name WHICH adapter owns the gap; anonymous, it cannot
+# route the operator to the capable sibling (or to the fact none exists, on Telegram).
+run_mutation "parity: the declaration stops naming the adapter" \
+  "core/parity.py" \
+  "('adapter {adapter_name!r} cannot supply', 'this adapter cannot supply')" \
+  "test_parity"
+
+# ENH-27 — and WHICH capability is missing: 'cannot supply a snapshot' alone tells an
+# adapter author nothing about what to implement.
+run_mutation "parity: the declaration stops naming the missing capability" \
+  "core/parity.py" \
+  "('retrievable_ts (a push surface', 'a history call (a push surface')" \
+  "test_parity"
+
+# ENH-27 — a declaration the summary never prints declared nothing to anybody.
+run_mutation "parity: the summary swallows the capability declaration" \
+  "core/parity.py" \
+  "('            if self.snapshot_unavailable:', '            if False:')" \
+  "test_parity"
+
 # R26 — the differ ACCEPTS the UNRETRIEVABLE class, so its growth is invisible there.
 # These are the guards that keep the blindness from moving into retention.py.
 run_mutation "retention: an empty previous snapshot reports 'nothing deleted'" \
@@ -1314,6 +1341,21 @@ run_mutation "doctor: a health surface missing the contract keys loses its named
 run_mutation "doctor: an admitted delivery gap reads healthy" \
   "core/doctor.py" \
   "('    if h.get(\"complete\") is False:', '    if False:')" \
+  "test_doctor"
+
+# ENH-27 — the doctor is the preflight where the snapshot-capability gap gets said;
+# a doctor that never registers the check leaves the first parity run to say it as
+# unexplained ENGINE_LOST rows.
+run_mutation "doctor: the snapshot capability check is never registered" \
+  "core/doctor.py" \
+  "('        reg.add(f\"{inst.name}:parity-snapshot\",', '        _ = (f\"{inst.name}:parity-snapshot\",')" \
+  "test_doctor"
+
+# ENH-27 — a doctor that reports every adapter as snapshot-capable un-declares the gap
+# while keeping the check name in the output.
+run_mutation "doctor: every adapter reads as snapshot-capable" \
+  "core/doctor.py" \
+  "('    declaration = snapshot_declaration(probe.adapter(), inst.adapter)', '    declaration = None')" \
   "test_doctor"
 
 # ENH-5 — 'each channel is readable' is proven by the live poll; swallowing the

@@ -29,11 +29,13 @@ HEALTHY = "return {'reachable': True, 'auth_ok': True, 'detail': 'probe ok'}"
 
 
 def write_adapter(base, name="probe", *, init=(), poll="return [], cursor",
-                  health=HEALTHY, read=True):
+                  health=HEALTHY, read=True, retrievable=False):
     """Land a contract-shaped adapter as a dir-drop under the temp channels_dir."""
     d = Path(base) / "channels" / name
     d.mkdir(parents=True, exist_ok=True)
     body = "".join(f"        {line}\n" for line in init)
+    snapshot = ("    def retrievable_ts(self, channel, oldest=None, latest=None):\n"
+                "        return set()\n" if retrievable else "")
     (d / "adapter.py").write_text(
         "class Adapter:\n"
         "    def __init__(self, auth=None):\n"
@@ -44,6 +46,7 @@ def write_adapter(base, name="probe", *, init=(), poll="return [], cursor",
         "                'send': False, 'react': False, 'threads': False}\n"
         "    def poll(self, cursor):\n"
         "        " + poll + "\n"
+        + snapshot +
         "    def resolve(self, ref):\n"
         "        return ref\n"
         "    def health(self):\n"
@@ -304,6 +307,41 @@ class VacuousPassTest(DoctorTestCase):
         self.assertEqual(code, 1)
         self.assertIn("watches no channels", out)
         self.assertNotIn("DOCTOR OK", out)
+
+
+class SnapshotCapabilityTest(DoctorTestCase):
+    """ENH-27: the preflight is where an operator learns their adapter cannot supply
+    a platform snapshot — BEFORE a parity run full of fail-closed ENGINE_LOST rows
+    teaches it to them as a phantom read-path defect. The default probe adapter has
+    no retrievable_ts, which is exactly the slack_socket/Telegram shape."""
+
+    def test_an_adapter_without_retrievable_ts_is_declared_by_name(self):
+        write_adapter(self.base)
+        self.write_config([self.instance([{"id": "C_A"}])])
+        code, out = self.doctor()
+        self.assertEqual(code, 0, out)  # a missing OPTIONAL capability degrades, never fails
+        self.assertRegex(
+            out, r"\[PASS\] probe-inst:parity-snapshot: adapter 'probe' cannot supply",
+            "the declaration must ride the check line and name the adapter itself — "
+            "a name printed by some OTHER check does not tie the gap to its owner")
+        self.assertIn("retrievable_ts", out)
+
+    def test_the_declaration_says_which_verdicts_are_unavailable_and_why(self):
+        write_adapter(self.base)
+        self.write_config([self.instance([{"id": "C_A"}])])
+        _, out = self.doctor()
+        self.assertIn("UNRETRIEVABLE", out)
+        self.assertIn("ORACLE_MISSED", out)
+        self.assertIn("ENGINE_LOST", out)
+
+    def test_a_capable_adapter_reports_the_capability_instead(self):
+        write_adapter(self.base, retrievable=True)
+        self.write_config([self.instance([{"id": "C_A"}])])
+        code, out = self.doctor()
+        self.assertEqual(code, 0, out)
+        self.assertRegex(out, r"\[PASS\] probe-inst:parity-snapshot: "
+                              r"adapter 'probe' can supply")
+        self.assertNotIn("cannot supply", out)
 
 
 class MainWiringTest(DoctorTestCase):

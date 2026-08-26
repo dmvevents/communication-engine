@@ -10,9 +10,11 @@ Two properties matter more than the rest:
   moment it can also excuse a REAL loss, the gate is decorative. Acceptance is a
   reviewable argument, and this one class is outside its reach by construction.
 """
+import io
 import sqlite3
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 import sys
@@ -21,7 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from core.parity import (  # noqa: E402
     AHEAD_OF_ORACLE, BEFORE_ENGINE_START, ENGINE_LOST, ENGINE_ONLY, NOT_YET_POLLED,
     ORACLE_MISSED, PRE_ORACLE_FLOOR, UNCLASSIFIED, UNRETRIEVABLE,
-    ParityError, compare, read_served, read_timestamps)
+    ParityError, compare, main as parity_main, read_served, read_timestamps,
+    snapshot_declaration)
 
 
 class CompareTest(unittest.TestCase):
@@ -233,6 +236,128 @@ class LiveIncidentRegressionTest(unittest.TestCase):
                     accept=[UNRETRIEVABLE, PRE_ORACLE_FLOOR])
         self.assertEqual(r.by_class(ENGINE_LOST), {lost})
         self.assertFalse(r.ok)
+
+
+class _PushShaped:
+    """The slack_socket/Telegram shape: a full read surface, no retrievable_ts —
+    push receives events; it cannot ask the platform what it still serves."""
+
+    def poll(self, cursor):
+        return [], cursor
+
+
+class _PollShaped(_PushShaped):
+    def retrievable_ts(self, channel, oldest=None, latest=None):
+        return set()
+
+
+class SnapshotDeclarationTest(unittest.TestCase):
+    """ENH-27: an adapter that cannot supply a platform snapshot must be declared
+    BY NAME, or its permanently fail-closed parity runs read as read-path defects —
+    the exact misreading that cost a day on R8's first live window."""
+
+    def test_an_adapter_without_retrievable_ts_is_declared_by_name(self):
+        d = snapshot_declaration(_PushShaped(), "slack_socket")
+        self.assertIn("'slack_socket'", d)
+        self.assertIn("retrievable_ts", d, "the missing capability must be named — "
+                      "'cannot supply a snapshot' alone tells nobody what to add")
+
+    def test_the_declaration_names_the_unavailable_verdicts_and_the_consequence(self):
+        d = snapshot_declaration(_PushShaped(), "slack_socket")
+        self.assertIn(UNRETRIEVABLE, d)
+        self.assertIn(ORACLE_MISSED, d)
+        self.assertIn(ENGINE_LOST, d,
+                      "the fail-closed consequence is the whole point: without it an "
+                      "operator cannot connect the missing method to the red rows")
+
+    def test_a_capable_adapter_declares_nothing(self):
+        self.assertIsNone(snapshot_declaration(_PollShaped(), "slack"))
+        # The CLI inspects the discovered CLASS (no auth to construct with) — the
+        # capability answer must be the same before and after construction.
+        self.assertIsNone(snapshot_declaration(_PollShaped, "slack"))
+
+    def test_a_non_callable_attribute_is_not_a_capability(self):
+        shaped = _PushShaped()
+        shaped.retrievable_ts = "present but not callable"
+        self.assertIsNotNone(snapshot_declaration(shaped, "shaped"))
+
+
+class SnapshotDeclarationInSummaryTest(unittest.TestCase):
+    def test_the_declaration_reaches_the_summary_when_no_snapshot_exists(self):
+        d = snapshot_declaration(_PushShaped(), "slack_socket")
+        r = compare({"1.1", "1.2"}, {"1.1"}, "C_EXAMPLE", snapshot_unavailable=d)
+        s = r.summary()
+        self.assertIn("'slack_socket'", s)
+        self.assertIn("retrievable_ts", s)
+
+    def test_the_declaration_explains_fail_closed_but_never_softens_it(self):
+        d = snapshot_declaration(_PushShaped(), "slack_socket")
+        r = compare({"1.1", "1.2"}, {"1.1"}, "C_EXAMPLE", snapshot_unavailable=d)
+        self.assertEqual(r.classified["1.2"], ENGINE_LOST)
+        self.assertFalse(r.ok)
+
+    def test_a_snapshot_supplied_from_elsewhere_silences_the_declaration(self):
+        """A sibling adapter on the same platform (the polling 'slack' adapter, for
+        a slack_socket store) can export the snapshot on the push store's behalf;
+        then no verdict is degraded and printing 'cannot supply' would misdescribe
+        the run that actually happened."""
+        d = snapshot_declaration(_PushShaped(), "slack_socket")
+        r = compare({"1.1", "1.2"}, {"1.1"}, "C_EXAMPLE", served_ts={"1.1"},
+                    snapshot_unavailable=d)
+        self.assertNotIn("slack_socket", r.summary())
+        self.assertEqual(r.classified["1.2"], UNRETRIEVABLE)
+
+
+class SnapshotDeclarationCliTest(unittest.TestCase):
+    """--candidate-adapter names the channel type FEEDING the candidate store, so a
+    parity run pointed at a push store declares the capability gap itself. The class
+    is discovered from channels_dir exactly as config does (R11): core never imports
+    a platform module by name."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        for name, rows in (("oracle.db", [("C_ONE", "1.1"), ("C_ONE", "1.2")]),
+                           ("engine.db", [("C_ONE", "1.1")])):
+            c = sqlite3.connect(self.base / name)
+            c.execute("CREATE TABLE messages (channel_id TEXT, ts TEXT)")
+            c.executemany("INSERT INTO messages VALUES (?,?)", rows)
+            c.commit()
+            c.close()
+        push = self.base / "channels" / "pushonly"
+        push.mkdir(parents=True)
+        (push / "adapter.py").write_text(
+            "class Adapter:\n"
+            "    def __init__(self, auth=None):\n"
+            "        self.auth = auth or {}\n"
+            "    def poll(self, cursor):\n"
+            "        return [], cursor\n")
+
+    def run_cli(self, *extra):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = parity_main(["--oracle", str(self.base / "oracle.db"),
+                                "--candidate", str(self.base / "engine.db"),
+                                "--channel", "C_ONE", *extra])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_the_cli_reports_an_incapable_candidate_adapter_by_name(self):
+        code, out, _ = self.run_cli("--candidate-adapter", "pushonly",
+                                    "--channels-dir", str(self.base / "channels"))
+        self.assertEqual(code, 1, "declared is EXPLAINED, never excused — the miss "
+                                  "still fails the run")
+        self.assertIn("'pushonly'", out)
+        self.assertIn("retrievable_ts", out)
+        self.assertIn(UNRETRIEVABLE, out)
+
+    def test_an_unknown_candidate_adapter_is_an_unusable_comparison(self):
+        """A typo'd type name must not silently degrade to the generic ABSENT line —
+        the operator asked for a capability report on an adapter that was not found."""
+        code, _, err = self.run_cli("--candidate-adapter", "nope",
+                                    "--channels-dir", str(self.base / "channels"))
+        self.assertEqual(code, 2)
+        self.assertIn("nope", err)
 
 
 class ReadServedTest(unittest.TestCase):

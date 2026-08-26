@@ -44,6 +44,7 @@ from types import SimpleNamespace
 from core.checks import Registry, Verdict
 from core.config import ConfigError, load, load_adapter_class
 from core.outbox import Outbox
+from core.parity import snapshot_declaration
 
 
 def _env_ref_names(config_path):
@@ -171,6 +172,23 @@ def _health_verdict(name, probe):
     return Verdict.passed(name, inspected=1, detail=detail or "reachable, auth ok")
 
 
+def _snapshot_verdict(name, probe, inst):
+    # Both outcomes PASS: retrievable_ts is an OPTIONAL capability and core degrades
+    # rather than demands (channels/CONTRACT.md), so a push adapter without it is not
+    # unhealthy. The property this check exists for is the DECLARATION (ENH-27): a
+    # parity run against such an adapter is permanently fail-closed, and an operator
+    # who was never told reads the resulting ENGINE_LOST rows as a read-path defect —
+    # the R8 misreading, re-armed. The doctor is the preflight, so it says so here.
+    declaration = snapshot_declaration(probe.adapter(), inst.adapter)
+    if declaration is not None:
+        return Verdict.passed(name, inspected=1, detail=declaration)
+    return Verdict.passed(
+        name, inspected=1,
+        detail=f"adapter {inst.adapter!r} can supply a platform snapshot "
+               "(retrievable_ts) — parity can tell a real loss from an upstream "
+               "deletion")
+
+
 def _readable_verdict(name, probe, ch):
     count = probe.poll_count()
     watched = probe.watch_set()
@@ -226,6 +244,9 @@ def run(config_path, env=None, echo=print) -> int:
                 _adapter_verdict(n, p, i))
         reg.add(f"{inst.name}:health",
                 lambda n=f"{inst.name}:health", p=probe: _health_verdict(n, p))
+        reg.add(f"{inst.name}:parity-snapshot",
+                lambda n=f"{inst.name}:parity-snapshot", p=probe, i=inst:
+                _snapshot_verdict(n, p, i))
         if not inst.channels:
             reg.add(f"{inst.name}:channels",
                     lambda n=f"{inst.name}:channels", i=inst:
