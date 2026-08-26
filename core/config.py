@@ -127,6 +127,19 @@ class EngineConfig:
                 return i
         raise ConfigError(f"no instance named {name!r}")
 
+    def outbox_path_for(self, name: str) -> Path:
+        """The outbox file for ONE instance (ENH-7). Outbox state must be per instance:
+        recovery re-sends whatever unfinished rows it finds through ITS OWN adapter, so
+        two tenants sharing a file would let tenant A's recovery post tenant B's message
+        with A's credentials — and A's delivery would dedupe B's identical reply away,
+        because the idempotency key is deliberately instance-free (it is the
+        platform-visible identity). `outbox_path` stays as the base the per-instance
+        files derive from. The name is resolved first so a typo refuses loudly instead
+        of minting a fresh empty outbox that hides every pending draft from view."""
+        self.instance(name)
+        p = self.outbox_path
+        return p.with_name(f"{p.stem}-{name}{p.suffix}")
+
 
 def resolve_secret(value: str, env: dict | None = None) -> str:
     """Resolve an `env:NAME` reference. Refuses literal secrets and missing vars."""
@@ -270,6 +283,19 @@ def from_dict(raw: dict, base_dir: str | Path, env: dict | None = None) -> Engin
         adapter = spec.get("adapter")
         if not name:
             raise ConfigError("every instance needs a 'name'")
+        # ENH-7: the name IS the isolation key — it namespaces cursors and derives
+        # per-instance state filenames — so a collision or a path-shaped name breaks
+        # every tenant boundary at once, silently.
+        if any(i.name == name for i in instances):
+            raise ConfigError(
+                f"duplicate instance name {name!r} — the name namespaces cursors and "
+                "per-instance state files, so two instances sharing it would silently "
+                "merge into one tenant")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+            raise ConfigError(
+                f"instance name {name!r} cannot name per-instance state files: it must "
+                "start with a letter or digit and contain only letters, digits, "
+                "'.', '_' or '-'")
         _refuse_unknown(spec, _INSTANCE_KEYS, f"instance {name!r}")
         if adapter not in discovered:
             if not discovered:

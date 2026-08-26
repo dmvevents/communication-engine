@@ -1355,6 +1355,52 @@ run_mutation "docs: the runbook starts teaching the lock-deletion reflex" \
   "('**never delete\nthe lock**', 'delete the lock')" \
   "test_docs"
 
+# ENH-7 — cursors lose their instance namespace: tenant B's watermark write REPLACEs
+# tenant A's row for the same channel id (two workspaces, one channel name).
+run_mutation "store: cursor rows keyed per channel instead of per (instance, channel)" \
+  "core/store.py" \
+  "('    PRIMARY KEY (instance, channel_id)', '    PRIMARY KEY (channel_id)')" \
+  "test_isolation"
+
+# ENH-7 — the loop commits every tenant's cursor under one shared name.
+run_mutation "schedule: cursor committed under a shared key, not the instance" \
+  "core/schedule.py" \
+  "('self._commit_cursor(src.name, ch, cursor, new_cursor)', 'self._commit_cursor(\"engine\", ch, cursor, new_cursor)')" \
+  "test_isolation"
+
+# ENH-7 — the loop reads every tenant's cursor from one shared name (the other half
+# of the same collapse: each tenant re-polls from scratch or from the wrong watermark).
+run_mutation "schedule: cursor read from a shared key, not the instance" \
+  "core/schedule.py" \
+  "('cursor = self.store.cursor_get(src.name, ch)', 'cursor = self.store.cursor_get(\"engine\", ch)')" \
+  "test_isolation"
+
+# ENH-7 — per-instance outbox paths collapse to one shared file: recovery replays the
+# other tenant's INTENT through the wrong adapter, dedup eats the other tenant's reply.
+run_mutation "config: every instance handed one shared outbox file" \
+  "core/config.py" \
+  "('        return p.with_name(f\"{p.stem}-{name}{p.suffix}\")', '        return p')" \
+  "test_isolation"
+
+# ENH-7 — duplicate instance names silently merge two tenants into one.
+run_mutation "config: duplicate instance names accepted" \
+  "core/config.py" \
+  "('        if any(i.name == name for i in instances):', '        if False:')" \
+  "test_isolation"
+
+# ENH-7 — a path-shaped name escapes the state directory via per-instance filenames.
+run_mutation "config: path-shaped instance names accepted" \
+  "core/config.py" \
+  "('        if not re.fullmatch(r\"[A-Za-z0-9][A-Za-z0-9._-]*\", name):', '        if False:')" \
+  "test_isolation"
+
+# ENH-7 — one tenant's resolved credentials leak into the next instance's auth (the
+# shared-accumulator bleed shape).
+run_mutation "config: credentials accumulate across instances" \
+  "core/config.py" \
+  "('        auth = {k: resolve_secret(v, env) for k, v in (spec.get(\"auth\") or {}).items()}', '        auth = dict(instances[-1].auth) if instances else {}\n        auth.update({k: resolve_secret(v, env) for k, v in (spec.get(\"auth\") or {}).items()})')" \
+  "test_isolation"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }
