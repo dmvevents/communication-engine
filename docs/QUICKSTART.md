@@ -212,6 +212,17 @@ the dry run in step 5.
   one real platform (two ingestion paths for it), not two platforms.
 - **Read parity against an existing system has not been demonstrated** over a long window
   (gate G1). If you are replacing an incumbent, run both and diff before trusting this one.
+- **Slack throttles by distribution model, and the poll path is what it throttles.** Since
+  **2025-05-29**, newly-created apps that are commercially distributed without Slack
+  Marketplace approval face sharply reduced limits on `conversations.history` and
+  `conversations.replies` — the two methods every poll cycle here depends on.
+  Internal customer-built apps are **exempt** (as are Marketplace-approved apps and
+  existing installs of older apps), and an internal app is this quickstart's target case —
+  but choose the distribution model knowing this: take the tool commercial without
+  Marketplace approval and the poller is throttled by the platform, not by the engine.
+  Slack does not publish the reduced values, so the engine discovers each method's real
+  limit at runtime from `Retry-After` (`core/ratelimit.py`) — a throttled poller slows
+  down honestly instead of dropping messages.
 - There is **no scheduler in this repo**. `scripts/first-poll.py` runs exactly one cycle;
   the engine gives you poll/classify/journal/outbox primitives and you invoke them from
   cron, a loop, or your own supervisor.

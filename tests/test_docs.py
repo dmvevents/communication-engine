@@ -107,6 +107,37 @@ class HonestLimitsTest(unittest.TestCase):
             "section still claims fake + slack (read-only) + slack_socket — rewrite the "
             "limits section, then update this assertion")
 
+    def test_the_distribution_model_limit_states_the_exemption_and_the_risk(self):
+        """ENH-15: since 2025-05-29 the platform throttles conversations.history and
+        conversations.replies — the two calls every poll cycle depends on — for
+        newly-created, commercially-distributed apps without Marketplace approval.
+        Internal customer-built apps are exempt (the quickstart's target case), so the
+        adopter must learn this BEFORE choosing a distribution model: discovered after,
+        a throttled poller looks exactly like an engine defect and gets blamed as one
+        (state/RESEARCH-INGESTION.md finding 2)."""
+        for method in ("conversations.history", "conversations.replies"):
+            self.assertIn(method, self.limits,
+                          f"the limits section no longer names {method} — the exact "
+                          "method the distribution-model limit throttles")
+        self.assertIn("2025-05-29", self.limits,
+                      "the platform change lost its date — 'recently' rots, the date "
+                      "lets an adopter check the rule that applies to THEIR app")
+        self.assertIn("Marketplace", self.limits,
+                      "the limits section no longer says WHICH distribution model "
+                      "triggers the reduced limits")
+        # \s+ joins because the doc is hard-wrapped (the ThreadPolicyDocTest lesson):
+        # any phrase may split across a line break without changing what it says.
+        self.assertRegex(
+            self.limits, r"(?is)internal\s+customer-built\s+apps[^.]{0,60}exempt",
+            "the exemption vanished: an internal app — the quickstart's target case — "
+            "is exempt, and the doc must say so or every internal adopter reads the "
+            "limit as applying to them")
+        self.assertRegex(
+            self.limits, r"(?is)throttled\s+by\s+the\s+platform,\s+not\s+by\s+the\s+engine",
+            "the risk lost its point: an adopter who goes commercial without "
+            "Marketplace approval gets throttled on the poll path and, unwarned, "
+            "blames the engine for the platform's limit")
+
 
 class DocCitationsTest(unittest.TestCase):
     """Paths and API names cited by the docs must exist. A doc that points at a file or

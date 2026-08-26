@@ -1018,6 +1018,36 @@ run_mutation "first-poll: attachments never reach the classifier" \
   "('    c = classify(msg[\"text\"], taxonomy, attachments=msg.get(\"attachments\"))', '    c = classify(msg[\"text\"], taxonomy)')" \
   "test_docs"
 
+# ---------------------------------------------------------------------------
+# ENH-15 — the May-2025 distribution-model limit. Since 2025-05-29 the platform
+# throttles conversations.history/replies for newly-created, commercially-distributed,
+# non-Marketplace apps; internal customer-built apps are exempt (our target case). The
+# property is purely documentary, so each mutation below re-creates one way the warning
+# could rot: an adopter who learns this AFTER choosing a distribution model finds the
+# poll path throttled and blames the engine (state/RESEARCH-INGESTION.md finding 2).
+# ---------------------------------------------------------------------------
+
+# ENH-15 — the limit must name the exact methods it throttles; "some read methods" gives
+# the adopter nothing to check their own call pattern against.
+run_mutation "docs: the distribution-model limit loses the methods it throttles" \
+  "docs/QUICKSTART.md" \
+  "('sharply reduced limits on \`conversations.history\` and\n  \`conversations.replies\`', 'sharply reduced limits on some read methods')" \
+  "test_docs"
+
+# ENH-15 — the exemption IS the decision input: without it every internal adopter — the
+# quickstart's target case — reads the limit as applying to them.
+run_mutation "docs: the internal-app exemption deleted from honest limits" \
+  "docs/QUICKSTART.md" \
+  "('Internal customer-built apps are **exempt**', 'Most apps are unaffected')" \
+  "test_docs"
+
+# ENH-15 — the risk half of the acceptance: unwarned, a commercially-redistributed
+# poller's throttling reads as an engine defect.
+run_mutation "docs: the distribution-model risk made vague again" \
+  "docs/QUICKSTART.md" \
+  "('the poller is throttled by the platform, not by the engine', 'the poller may run slower')" \
+  "test_docs"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }
