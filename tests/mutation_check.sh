@@ -527,6 +527,53 @@ run_mutation "slack: health reports auth_ok on a failed auth.test" \
   "('            return {\"reachable\": True, \"auth_ok\": False,', '            return {\"reachable\": True, \"auth_ok\": True,')" \
   "test_slack_adapter"
 
+# ---------------------------------------------------------------------------
+# ENH-13 — per-channel send pacing at <=1 message/second. chat.postMessage allows
+# ~1 msg/sec PER CHANNEL (docs.slack.dev/apis/web-api/rate-limits); each of these
+# mutations, if it survived, would let a burst of replies trade the cheap local wait
+# for a platform 429 — the seam the whole exactly-once ladder exists to survive.
+# ---------------------------------------------------------------------------
+
+# ENH-13 — THE property: the pacer must actually wait out the interval.
+run_mutation "outbox: pacer never waits (a burst hits the platform unspaced)" \
+  "core/outbox.py" \
+  "('            if wait > 0:', '            if False:')" \
+  "test_outbox_pacing"
+
+# ENH-13 — the platform scopes the limit per channel; a global hold would let one
+# busy channel silence every other one (the disease ENH-1 killed for methods).
+run_mutation "outbox: pace state read globally instead of per channel" \
+  "core/outbox.py" \
+  "('        last = self._pace_last.get(target)', '        last = max(self._pace_last.values(), default=None)')" \
+  "test_outbox_pacing"
+
+# ENH-13 — the 1/sec default IS the floor; callers do not know to ask for it.
+run_mutation "outbox: default send interval below the platform floor" \
+  "core/outbox.py" \
+  "('send_interval: float = 1.0', 'send_interval: float = 0.0')" \
+  "test_outbox_pacing"
+
+# ENH-13 — the live send path must pace, not just the helper existing.
+run_mutation "outbox: the live send path skips the pacer" \
+  "core/outbox.py" \
+  "('        self._pace(target)\n        receipt = self.adapter.send(target, text, key=key)', '        receipt = self.adapter.send(target, text, key=key)')" \
+  "test_outbox_pacing"
+
+# ENH-13 — recovery is a burst source too: N undelivered rows for one channel
+# re-sent back-to-back would 429 exactly like the live path.
+run_mutation "outbox: recovery re-sends a burst unpaced" \
+  "core/outbox.py" \
+  "('                self._pace(target)\n                receipt = self.adapter.send(target, row[\"text\"], key=key)', '                receipt = self.adapter.send(target, row[\"text\"], key=key)')" \
+  "test_outbox_pacing"
+
+# ENH-13 — attempts must be recorded or the hold never engages; recording at the
+# ATTEMPT (not the success) is what makes a retry after a 429 wait out the budget
+# the failed attempt already consumed.
+run_mutation "outbox: attempts are never recorded (the hold never engages)" \
+  "core/outbox.py" \
+  "('        self._pace_last[target] = self._clock()', '        pass')" \
+  "test_outbox_pacing"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }

@@ -71,7 +71,9 @@ def idempotency_key(target: str, trigger_ts: str, text: str) -> str:
 
 
 class Outbox:
-    def __init__(self, db_path: str | Path, adapter, policies: dict[str, str] | None = None):
+    def __init__(self, db_path: str | Path, adapter, policies: dict[str, str] | None = None,
+                 *, send_interval: float = 1.0,
+                 clock=time.monotonic, sleep=time.sleep):
         self.conn = sqlite3.connect(str(db_path))
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
@@ -79,6 +81,38 @@ class Outbox:
         self.adapter = adapter
         # Default DENY. A target absent from the policy map cannot be sent to.
         self.policies = policies or {}
+        # ENH-13: chat.postMessage allows ~1 message/second PER CHANNEL
+        # (docs.slack.dev/apis/web-api/rate-limits), so 1.0 is the default floor —
+        # a burst of replies would trade this cheap local wait for a platform 429,
+        # the exact seam the INTENT ladder exists to survive. Cheaper to not trip it.
+        # `clock`/`sleep` are injectable like ratelimit.Backoff's, and for the same
+        # reason: the tests must assert spacing to the float.
+        self.send_interval = send_interval
+        self._clock = clock
+        self._sleep = sleep
+        self._pace_last: dict[str, float] = {}
+
+    def _pace(self, target: str) -> None:
+        """Hold this attempt until >= send_interval after the last attempt to `target`.
+
+        Keyed per channel because the platform scopes the limit to the channel — a
+        global hold would let one busy channel silence every other one (the disease
+        ENH-1 killed for methods). The wait is EXACTLY the remainder of the interval,
+        never padded: padding is a locally-invented limit.
+
+        The clock marks the ATTEMPT, not the success: a 429'd attempt consumed the
+        channel's budget too, so an unspaced retry would re-trip the very 429 it is
+        recovering from. In-memory on purpose, like ratelimit.Backoff — the horizon
+        is ~1s, so a restarted process at worst sends one message slightly early per
+        channel, and the platform's own 429 (surfaced, never swallowed) is the
+        backstop.
+        """
+        last = self._pace_last.get(target)
+        if last is not None:
+            wait = last + self.send_interval - self._clock()
+            if wait > 0:
+                self._sleep(wait)
+        self._pace_last[target] = self._clock()
 
     # ---- internals --------------------------------------------------------
     def _write(self, key, **cols):
@@ -133,6 +167,7 @@ class Outbox:
         if _crash_at == "after_intent":
             raise _Crash("crash after INTENT, before adapter.send")
 
+        self._pace(target)
         receipt = self.adapter.send(target, text, key=key)
 
         if _crash_at == "after_send":
@@ -172,6 +207,9 @@ class Outbox:
             if self.adapter.read_back(target, key):
                 counts["already_delivered"] += 1
             else:
+                # recovery is a burst source too: N undelivered rows for one channel
+                # re-sent back-to-back would 429 exactly like the live path
+                self._pace(target)
                 receipt = self.adapter.send(target, row["text"], key=key)
                 self._write(key, receipt=json.dumps(receipt))
                 counts["resent"] += 1
