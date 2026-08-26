@@ -462,6 +462,29 @@ run_mutation "first-poll: a polled message is no longer journaled" \
   "('    return journal.record(', '    return object() or journal.record(')" \
   "test_docs"
 
+# R17 — the quickstart must reach the adopter's REAL workspace, not stop at the fake
+# dry-run: without this step, "adopt by config alone" is a claim the docs never cash.
+run_mutation "docs: real-poll step deleted from the quickstart" \
+  "docs/QUICKSTART.md" \
+  "('## 7. First real poll — your workspace, read-only', '## 7. Notes')" \
+  "test_docs"
+
+# R17 — the auth example must show every key the adapter refuses to start without, in
+# env-reference form; dropping one leaves the adopter with a load-time refusal the doc
+# never prepared them for.
+run_mutation "docs: real-poll auth example loses the channels key" \
+  "docs/QUICKSTART.md" \
+  "('\"token\": \"env:MY_SLACK_TOKEN\", \"channels\": \"env:MY_SLACK_CHANNELS\"', '\"token\": \"env:MY_SLACK_TOKEN\"')" \
+  "test_docs"
+
+# R17 — the two-place channel rule is the one SILENT failure on the real-poll path (an
+# id in one list but not the other polls nothing and looks successful). Vagueness here
+# is how the live bring-up would have read as "engine works, channel is just quiet".
+run_mutation "docs: two-place channel rule made vague again" \
+  "docs/QUICKSTART.md" \
+  "('**two places**', 'the config')" \
+  "test_docs"
+
 # ---------------------------------------------------------------------------
 # ENH-18 — the slack adapter is read-only BY AUTHORIZATION (operator granted the
 # token read-only, 2026-08-26). Each of these mutations, if it survived, would let a

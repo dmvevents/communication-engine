@@ -193,11 +193,14 @@ class FirstPollTest(unittest.TestCase):
             j.close()
 
     def test_quickstart_documents_the_first_poll_step(self):
+        # The FULL seeded command is the property: the real-poll step (R17) also invokes
+        # first-poll.py, so a substring match would let the dry-run step vanish unnoticed.
         text = QUICKSTART.read_text()
-        self.assertIn("python3 scripts/first-poll.py", text,
-                      "the quickstart no longer walks the adopter through a first poll — "
-                      "'first successful poll' is the doc's own stated target")
-        self.assertIn("--seed-demo", text)
+        self.assertIn("python3 scripts/first-poll.py --config settings.json --seed-demo",
+                      text,
+                      "the quickstart no longer walks the adopter through the seeded "
+                      "dry-run poll — 'first successful poll' is the doc's own stated "
+                      "target, and it must work before any real credential exists")
 
     def test_first_poll_polls_classifies_journals_and_persists_the_cursor(self):
         r = self.run_first_poll("--seed-demo")
@@ -260,6 +263,62 @@ class FirstPollTest(unittest.TestCase):
         self.assertFalse([m for m in imported if "outbox" in m],
                          "first-poll.py imports the send layer — first contact must be "
                          "read-only by construction")
+
+
+class RealPollDocTest(unittest.TestCase):
+    """R17: the quickstart must walk the adopter past the fake dry-run to THEIR real
+    workspace — config alone, no code edits. The fake-adapter step proves the pipeline;
+    only a documented real-poll step makes the repo adoptable, and its stated auth
+    contract must match what the adapter actually refuses to start without."""
+
+    def setUp(self):
+        self.text = QUICKSTART.read_text()
+        m = re.search(r"^## .*real poll.*$(.*?)(?=^## |\Z)", self.text,
+                      re.MULTILINE | re.DOTALL | re.IGNORECASE)
+        self.section = m.group(0) if m else ""
+
+    def test_quickstart_walks_the_adopter_to_a_real_poll(self):
+        self.assertTrue(self.section.strip(),
+                        "the quickstart has no real-poll step — it leaves the adopter at "
+                        "the fake adapter, so 'adopt by config alone' stops one step "
+                        "short of their own workspace")
+        self.assertIn("slack", self.section.lower())
+        self.assertIn("read-only", self.section.lower(),
+                      "the real-poll step must restate read-only where the adopter acts, "
+                      "not only in the limits section")
+        self.assertIn("scripts/first-poll.py", self.section,
+                      "the real poll must reuse the same observable first-poll cycle, "
+                      "not a second undocumented entry point")
+
+    def test_documented_auth_contract_matches_the_adapter(self):
+        """Drift-proofing: the section must name every auth key the slack adapter
+        refuses to start without. Probe the adapter itself so a changed requirement
+        goes red here until the doc names it too."""
+        from core.config import load_adapter_class
+        cls = load_adapter_class(ROOT / "channels", "slack")
+        with self.assertRaises(ValueError) as ctx:
+            cls(auth={})
+        self.assertIn("token", str(ctx.exception))
+        with self.assertRaises(ValueError) as ctx:
+            cls(auth={"token": "tok"})
+        self.assertIn("channels", str(ctx.exception))
+        for key in ("token", "channels"):
+            # The env-reference form is part of the assertion: showing the key with a
+            # literal value would teach exactly what the loader refuses.
+            self.assertIn(f'"{key}": "env:', self.section,
+                          f"the slack adapter refuses to start without auth[{key!r}] "
+                          "but the real-poll step's config example never shows it as "
+                          "an env: reference")
+
+    def test_the_two_place_channel_rule_is_stated(self):
+        """The one silent failure on this path: the adapter polls the ids in the auth
+        env list, the engine keeps only ids listed under channels[] — a mismatch is a
+        successful-looking poll of nothing. The live bring-up (state evidence,
+        2026-08-26) needed the id in both places; the doc must say so."""
+        self.assertIn("two places", self.section,
+                      "the channel id lives in TWO places (auth env list + channels[]) "
+                      "and a mismatch polls nothing, silently — the doc no longer warns "
+                      "about the one quiet failure on the real-poll path")
 
 
 if __name__ == "__main__":

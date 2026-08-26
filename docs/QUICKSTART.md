@@ -119,6 +119,43 @@ the way you expected. Classification decides whether a message is treated as wor
 execute, so it is worth ten minutes. See `docs/RUNBOOK.md` for how to check its behaviour
 on your own message samples.
 
+## 7. First real poll — your workspace, read-only
+
+The shipped real adapter is `slack`, and it is read-only at every layer: the class has
+no send method, and its transport refuses any non-read Web API method before a byte
+leaves the process (`tests/test_slack_adapter.py` fails if either property is lost).
+Switch your instance to it — still editing only `settings.json`:
+
+```json
+"instances": [{
+  "name": "my-team-slack",
+  "adapter": "slack",
+  "auth": { "token": "env:MY_SLACK_TOKEN", "channels": "env:MY_SLACK_CHANNELS" },
+  "channels": [{ "id": "C_YOUR_CHANNEL", "label": "team", "reply_policy": "never" }]
+}]
+```
+
+```sh
+export MY_SLACK_TOKEN='<your bot token>'       # needs history-read scope
+export MY_SLACK_CHANNELS='C_YOUR_CHANNEL'      # comma-separated channel ids
+python3 scripts/first-poll.py --config settings.json
+```
+
+Both `auth` values are `env:` references, like every credential: the channel ids are
+workspace-specific literals that should no more live in a committed file than the token.
+
+A channel id appears in **two places**, and the lists must agree: the adapter polls the
+ids in `MY_SLACK_CHANNELS`, but the engine keeps a message only for ids listed under
+`channels[]`. An id present in one list and missing from the other is not an error — it
+is a successful-looking poll that stores nothing, which makes this the one line worth
+double-checking before you trust a quiet channel (see the `0 messages` entry in
+`docs/RUNBOOK.md`).
+
+Expect one line per channel with a real message count, then `FIRST POLL OK`. The first
+poll reads the channel's full visible history (no cursor yet), so give a busy channel a
+minute. Re-run the command and the count drops to 0 — the cursor survived, exactly like
+the dry run in step 5.
+
 ## What to expect next
 
 - `state/journal.db` — one row per distinct inbound message, with its classification. Replay
