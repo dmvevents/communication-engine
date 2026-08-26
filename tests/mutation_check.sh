@@ -161,6 +161,34 @@ run_mutation "outbox: an in-flight row falls through to a second live send" \
   "test_outbox_faults"
 
 # ---------------------------------------------------------------------------
+# ENH-11 — the state-machine property sweep. The first mutation is the proof the
+# sweep earns its keep: recovery marking VERIFIED before it re-sends LOSES the
+# message when recovery itself dies right after that commit — and it passes
+# test_outbox_faults in full, because no hand-enumerated seam ever crashes
+# recovery. Only the nested crash sweep reaches it.
+# ---------------------------------------------------------------------------
+
+# R1 — a recovery crash between a premature VERIFIED and the re-send silently drops
+# the reply (VERIFIED rows are never resumed).
+run_mutation "outbox: recovery marks VERIFIED before it re-sends (loss under a recovery crash)" \
+  "core/outbox.py" \
+  "('            else:\n                # recovery is a burst source too', '            else:\n                self._write(key, state=VERIFIED)\n                # recovery is a burst source too')" \
+  "test_outbox_statemachine"
+
+# R1 — the duplicate direction, under the sweep instead of the named seams.
+run_mutation "outbox: recovery re-sends blind — the property sweep sees the duplicate" \
+  "core/outbox.py" \
+  "('            if self.adapter.read_back(target, key):', '            if False:')" \
+  "test_outbox_statemachine"
+
+# R2 — liveness half of exactly-once: a retry that is never told 'delivered' retries
+# forever; the sweep asserts the dedupe receipt on every terminal check.
+run_mutation "outbox: delivered rows stop reporting dedupe to a retry" \
+  "core/outbox.py" \
+  "('            if row[\"state\"] in (VERIFIED, COMMITTED):', '            if False:')" \
+  "test_outbox_statemachine"
+
+# ---------------------------------------------------------------------------
 # G4 — checks that cannot silently no-op.
 # ---------------------------------------------------------------------------
 
