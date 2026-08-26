@@ -372,5 +372,91 @@ class ConcurrencyTest(unittest.TestCase):
             self.assertEqual(errs, [], f"concurrent senders raised: {errs}")
 
 
+class AmbiguityCountTest(unittest.TestCase):
+    """ENH-9: 'ambiguity silently becomes STATEMENT — safe but lossy and invisible.'
+    The journal is where the loss becomes countable: each row records whether the
+    classifier hedged, and ambiguity_stats() answers 'how often?' over the whole trail.
+    Three states must stay distinct on disk (the matched-column lesson): hedged (1),
+    confident (0), and never-recorded (NULL) — a legacy row must not masquerade as a
+    confident decision, or the hedge rate reads lower than it is."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.j = Journal(Path(self.tmp.name) / "j.db")
+        self.addCleanup(self.j.close)
+
+    def test_the_signal_is_recorded_and_readable(self):
+        self.j.record(CH, "1.1", text="the build and test cycle takes an hour",
+                      kind="STATEMENT", reason="ambiguous", ambiguous=True)
+        self.j.record(CH, "2.2", text="notes are in the doc",
+                      kind="STATEMENT", reason="no cue", ambiguous=False)
+        self.assertIs(self.j.audit(CH, "1.1")["ambiguous"], True)
+        self.assertIs(self.j.audit(CH, "2.2")["ambiguous"], False)
+
+    def test_ambiguity_stats_counts_distinct_messages_not_sightings(self):
+        self.j.record(CH, "1.1", text="hedge one", ambiguous=True)
+        self.j.record(CH, "2.2", text="hedge two", ambiguous=True)
+        self.j.record(CH, "3.3", text="confident", ambiguous=False)
+        self.j.record(CH, "1.1", text="hedge one", ambiguous=True)   # re-sighting
+        self.assertEqual(self.j.ambiguity_stats(),
+                         {"ambiguous": 2, "confident": 1, "unrecorded": 0},
+                         "a re-poll inflated the hedge count — the stats must count "
+                         "messages, or every duplicate sighting moves the rate")
+
+    def test_a_recorded_confident_decision_stays_distinct_from_never_recorded(self):
+        """False means 'the classifier decided, confidently'; None means 'no decision
+        was ever supplied'. Collapsing them would fabricate confidence for rows that
+        were never classified at all."""
+        self.j.record(CH, "1.1", text="classified", kind="STATEMENT", ambiguous=False)
+        self.j.record(CH, "2.2", text="bare sighting, no decision")
+        self.assertIs(self.j.audit(CH, "1.1")["ambiguous"], False)
+        self.assertIsNone(self.j.audit(CH, "2.2")["ambiguous"])
+        self.assertEqual(self.j.ambiguity_stats(),
+                         {"ambiguous": 0, "confident": 1, "unrecorded": 1})
+
+    def test_a_bare_resighting_does_not_erase_the_signal(self):
+        self.j.record(CH, "1.1", text="hedge", ambiguous=True)
+        self.j.record(CH, "1.1", text="hedge")            # decision-less re-sighting
+        self.assertIs(self.j.audit(CH, "1.1")["ambiguous"], True,
+                      "a later null erased the recorded signal — the count decays "
+                      "under re-polling")
+
+    def test_a_pre_signal_database_is_migrated_on_open(self):
+        """Adopters hold journal.db files created before the ambiguous column existed
+        (the matched-column migration precedent verbatim): the column is added in
+        place, and legacy rows read back as unrecorded, never as confident."""
+        import sqlite3
+        old = Path(self.tmp.name) / "old.db"
+        conn = sqlite3.connect(old)
+        conn.executescript("""
+            CREATE TABLE journal (
+                channel TEXT NOT NULL, ts TEXT NOT NULL, sender_id TEXT, text TEXT,
+                text_hash TEXT, kind TEXT, reason TEXT, matched TEXT, routed TEXT,
+                first_seen_at REAL NOT NULL, last_seen_at REAL NOT NULL,
+                seen_count INTEGER NOT NULL DEFAULT 1,
+                revision INTEGER NOT NULL DEFAULT 1,
+                responded_at REAL, response_key TEXT,
+                PRIMARY KEY (channel, ts));
+            CREATE TABLE revisions (
+                channel TEXT NOT NULL, ts TEXT NOT NULL, seq INTEGER NOT NULL,
+                text TEXT, kind TEXT, reason TEXT, matched TEXT, recorded_at REAL NOT NULL,
+                PRIMARY KEY (channel, ts, seq));
+            INSERT INTO journal VALUES ('C_LEGACY', '0.9', NULL, 'old row', 'h',
+                'STATEMENT', 'legacy reason', NULL, NULL, 1.0, 1.0, 1, 1, NULL, NULL);
+        """)
+        conn.commit()
+        conn.close()
+        j2 = Journal(old)
+        try:
+            self.assertIsNone(j2.audit("C_LEGACY", "0.9")["ambiguous"])
+            j2.record("C_LEGACY", "1.0", text="new hedge", kind="STATEMENT",
+                      ambiguous=True)
+            self.assertEqual(j2.ambiguity_stats(),
+                             {"ambiguous": 1, "confident": 0, "unrecorded": 1})
+        finally:
+            j2.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

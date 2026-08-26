@@ -152,6 +152,17 @@ with `review` in your `exec_verbs` it becomes an EXEC-REQUEST, matched `["review
 it is worth ten minutes. See `docs/RUNBOOK.md` for how to check its behaviour on your
 own message samples.
 
+One shape deliberately stays unacted-on however you tune: an action verb with no
+directive ("the build and test cycle takes an hour") classifies *down* to STATEMENT
+rather than risking a false order. That hedge is no longer silent — the decision
+carries an ambiguity flag, the journal records it on every row, and
+`Journal.ambiguity_stats()` counts how often the classifier hedged versus decided, so
+you can see what the safe default is costing you before changing it. If your channel's
+hedges deserve human eyes, set `"escalate_ambiguous": true` on the instance (next to
+`taxonomy`) and the reference scheduler routes each hedged decision to the operator's
+owed-work queue instead of only logging it. The signal comes from the same word-boundary
+rules you just tuned — no LLM sits in the hot path.
+
 ## 7. First real poll — your workspace, read-only
 
 The shipped real adapter is `slack`, and it is read-only at every layer: the class has

@@ -88,9 +88,18 @@ ROUTES = {
 }
 
 
-def route(kind: str) -> str:
+def route(kind: str, *, ambiguous: bool = False,
+          escalate_ambiguous: bool = False) -> str:
     """Destination for a classified kind. A kind this map has never heard of fails
-    toward a human — 'logged' as the default would be the silently-inert class."""
+    toward a human — 'logged' as the default would be the silently-inert class.
+
+    ENH-9: a HEDGED decision (classify's ambiguous downgrade) goes to a human when the
+    source opted in — the hedge used to become 'logged' with nothing anywhere saying
+    so. Opt-in and not default, because on a chatty narrating channel every hedge is a
+    page; the default keeps the old behaviour while the journal's recorded signal
+    (ambiguity_stats) gives the adopter the number they need to decide."""
+    if ambiguous and escalate_ambiguous:
+        return "owed:operator"
     return ROUTES.get(kind, "owed:operator")
 
 
@@ -103,6 +112,10 @@ class Source:
     adapter: object
     channels: tuple = ()
     taxonomy: Taxonomy = field(default_factory=Taxonomy)
+    # ENH-9: route this source's hedged classifications to owed:operator instead of
+    # only logging them. Per source, like the taxonomy: whether hedges deserve human
+    # eyes depends on the channel's vocabulary and traffic, not on the engine.
+    escalate_ambiguous: bool = False
 
 
 class Scheduler:
@@ -171,7 +184,7 @@ class Scheduler:
                 # commits. A crash between the two re-polls this window and the
                 # journal absorbs the duplicates; the swapped order loses the tail
                 # of the batch forever (the incumbent's 24-auto-reconcile seam).
-                fresh += self._journal_and_route(ch, mine, src.taxonomy)
+                fresh += self._journal_and_route(ch, mine, src)
                 self._commit_cursor(src.name, ch, cursor, new_cursor)
                 polled += len(mine)
         self._close_answered()
@@ -183,16 +196,19 @@ class Scheduler:
         return {"polled": polled, "fresh": fresh, "unattended": unattended,
                 "next_interval": self._interval}
 
-    def _journal_and_route(self, channel, messages, taxonomy) -> int:
+    def _journal_and_route(self, channel, messages, src) -> int:
         fresh = 0
         for m in messages:
-            c = classify(m.get("text") or "", taxonomy,
+            c = classify(m.get("text") or "", src.taxonomy,
                          attachments=m.get("attachments"))
-            dest = route(c.kind)
+            dest = route(c.kind, ambiguous=c.ambiguous,
+                         escalate_ambiguous=src.escalate_ambiguous)
+            # ambiguous is recorded UNCONDITIONALLY (ENH-9): the count must accrue for
+            # sources that have not opted in — they are the ones still deciding.
             res = self.journal.record(
                 channel, m["ts"], sender_id=m.get("sender_id"),
                 text=m.get("text") or "", kind=c.kind, reason=c.reason,
-                matched=c.matched, routed=dest)
+                matched=c.matched, routed=dest, ambiguous=c.ambiguous)
             if dest.startswith("owed:") and (res.is_new or res.is_revision):
                 # The routed ask IS owed work (R4). A revision re-owes on purpose:
                 # an edit that turns a remark into an ask is a new ask (R23), and

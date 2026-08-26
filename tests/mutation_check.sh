@@ -319,7 +319,7 @@ run_mutation "journal: skip the migration for pre-audit databases" \
 # reason but dropped matched, so every adopter's audit trail started broken.
 run_mutation "first-poll: the classification's cues are dropped at the journal call" \
   "scripts/first-poll.py" \
-  "('                          matched=c.matched)', '                          )')" \
+  "('                          matched=c.matched, ambiguous=c.ambiguous)', '                          ambiguous=c.ambiguous)')" \
   "test_docs"
 
 # ---------------------------------------------------------------------------
@@ -1307,7 +1307,7 @@ run_mutation "schedule: run() no longer acquires the single-instance guard" \
 # cursor first means a crash silently loses the tail of the batch, with no reconciler.
 run_mutation "schedule: cursor committed before the journal" \
   "core/schedule.py" \
-  "('                fresh += self._journal_and_route(ch, mine, src.taxonomy)\n                self._commit_cursor(src.name, ch, cursor, new_cursor)', '                self._commit_cursor(src.name, ch, cursor, new_cursor)\n                fresh += self._journal_and_route(ch, mine, src.taxonomy)')" \
+  "('                fresh += self._journal_and_route(ch, mine, src)\n                self._commit_cursor(src.name, ch, cursor, new_cursor)', '                self._commit_cursor(src.name, ch, cursor, new_cursor)\n                fresh += self._journal_and_route(ch, mine, src)')" \
   "test_schedule"
 
 # ENH-6/R3 — the 8h17m bug verbatim: backoff self-gates exactly when owed work stalls.
@@ -1566,6 +1566,72 @@ run_mutation "docs: the parity differ loses its name in honest limits" \
 run_mutation "docs: the hook check reverts to the silent-on-healthy form" \
   "docs/RUNBOOK.md" \
   "('ls .git/hooks/pre-commit .git/hooks/pre-push  # healthy: both paths print', 'git config core.hooksPath; ls .git/hooks/pre-push')" \
+  "test_docs"
+
+# ENH-9 — the hedge signal, per boundary. "Ambiguity silently becomes STATEMENT: safe
+# but lossy and invisible" — each mutation below restores one piece of the invisibility.
+
+# The downgrade stops signalling: ambiguity is a reason-string again, unroutable.
+run_mutation "classify: the ambiguous downgrade stops raising its signal" \
+  "core/classify.py" \
+  "('                              exec_hits, ambiguous=True)', '                              exec_hits)')" \
+  "test_classify"
+
+# The signal reaches record() but dies before the row — stats read all-unrecorded.
+run_mutation "journal: the confidence signal is never persisted" \
+  "core/journal.py" \
+  "('        amb = None if ambiguous is None else int(bool(ambiguous))', '        amb = None')" \
+  "test_journal"
+
+# A pre-ENH-9 journal.db keeps its old schema; the first record() with a decision fails.
+run_mutation "journal: legacy databases never gain the ambiguity column" \
+  "core/journal.py" \
+  "('        if \\\"ambiguous\\\" not in cols:', '        if False:')" \
+  "test_journal"
+
+# The opt-in flag becomes decorative: hedges are logged for everyone again.
+run_mutation "schedule: the escalate flag stops routing hedges to a human" \
+  "core/schedule.py" \
+  "('    if ambiguous and escalate_ambiguous:', '    if False:')" \
+  "test_schedule"
+
+# The loop routes on the signal but stops recording it — the count silently dies at
+# the exact caller boundary where the R22 cues once died.
+run_mutation "schedule: the loop stops recording the confidence signal" \
+  "core/schedule.py" \
+  "('                matched=c.matched, routed=dest, ambiguous=c.ambiguous)', '                matched=c.matched, routed=dest)')" \
+  "test_schedule"
+
+# The key loads (no unknown-key refusal) but configures nothing — ENH-17's inert class.
+run_mutation "config: escalate_ambiguous is accepted and read by nothing" \
+  "core/config.py" \
+  "('        esc = spec.get(\"escalate_ambiguous\", False)', '        esc = False')" \
+  "test_portability"
+
+# The JSON footgun returns: a quoted \"false\" silently ENABLES escalation.
+run_mutation "config: a quoted escalate_ambiguous loads clean and counts as true" \
+  "core/config.py" \
+  "('        if not isinstance(esc, bool):', '        if False:')" \
+  "test_portability"
+
+# Parsed but not passed to Source: the flag is silently inert in the shipped wiring
+# (the ENH-7 adapter-wiring lesson).
+run_mutation "scheduler.py: the wiring drops the escalate flag" \
+  "scripts/scheduler.py" \
+  "('                      escalate_ambiguous=inst.escalate_ambiguous)', '                      escalate_ambiguous=False)')" \
+  "test_schedule"
+
+# first-poll journals rows that read as never-classified — the hedge count starts
+# broken for every adopter (the same boundary as the cues/attachments mutations).
+run_mutation "first-poll: the confidence signal is dropped at the journal call" \
+  "scripts/first-poll.py" \
+  "('                          matched=c.matched, ambiguous=c.ambiguous)', '                          matched=c.matched)')" \
+  "test_docs"
+
+# An undocumented opt-in key is inert in practice; the doc must name the exact key.
+run_mutation "docs: step 6 loses the escalation flag's name" \
+  "docs/QUICKSTART.md" \
+  "('\"escalate_ambiguous\": true', '\"escalated_ambiguity\": true')" \
   "test_docs"
 
 echo

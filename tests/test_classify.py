@@ -258,5 +258,46 @@ class AuditabilityTest(unittest.TestCase):
                         "the downgraded decision does not name the verb it saw")
 
 
+class AmbiguitySignalTest(unittest.TestCase):
+    """ENH-9: the downgrade (exec verb, no directive) was safe but INVISIBLE — the only
+    way downstream code could tell a hedge from a confident STATEMENT was string-matching
+    the human-facing reason. The signal must be a FIELD so it can be routed and counted.
+    It is derived from the same deterministic word-boundary rules as the decision itself:
+    no LLM sits in this path."""
+
+    HEDGE = "The build and test cycle takes an hour."
+
+    def test_the_downgrade_raises_the_ambiguity_signal(self):
+        c = classify(self.HEDGE)
+        self.assertEqual(c.kind, "STATEMENT")
+        self.assertIs(c.ambiguous, True,
+                      "the downgrade no longer signals — ambiguity is silently a "
+                      "STATEMENT again, the exact invisibility ENH-9 exists to kill")
+
+    def test_a_confident_statement_does_not_claim_ambiguity(self):
+        """The signal must single out the hedge. Flagging confident decisions too would
+        make the count read as 'the classifier is always unsure' — a signal that always
+        fires carries no information."""
+        for text in ("Notes from today's meeting are in the shared doc.", "", None):
+            self.assertIs(classify(text).ambiguous, False,
+                          f"confident decision flagged ambiguous for {text!r}")
+
+    def test_acted_on_decisions_are_never_ambiguous(self):
+        """A decision the engine ACTS on (owes work for) must be confident by
+        construction — an ambiguous EXEC-REQUEST would mean the classifier started a
+        cluster run on a hunch."""
+        for text, expected in CORPUS:
+            if expected != "STATEMENT":
+                c = classify(text)
+                self.assertIs(c.ambiguous, False,
+                              f"{c.kind} claims ambiguity for {text[:40]!r}")
+
+    def test_attachment_only_is_a_confident_decision(self):
+        """'Content the text pipeline cannot read' is a certainty, not a hedge — and it
+        already routes to human eyes without this flag's help."""
+        c = classify("", attachments=[{"kind": "image", "name": "s.png"}])
+        self.assertIs(c.ambiguous, False)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

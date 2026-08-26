@@ -408,6 +408,23 @@ class FirstPollTest(unittest.TestCase):
         finally:
             j.close()
 
+    def test_the_journaled_row_records_the_classifiers_confidence(self):
+        """ENH-9: first-poll is the other caller between the classifier and the journal
+        (the ENH-4 attachments lesson); if it drops the signal there, every first-poll
+        row reads as never-classified and the adopter's hedge count starts broken. The
+        demo message is a confident QUESTION, so the row must say False — recorded
+        confidence, never the unrecorded NULL."""
+        self.run_first_poll("--seed-demo")
+        j = Journal(self.base / "state" / "journal.db")
+        try:
+            a = j.audit(self.CHANNEL, "1.0")
+            self.assertIsNotNone(a, "the demo message was never journaled")
+            self.assertIs(a["ambiguous"], False,
+                          "the confidence signal never reached the journal row — "
+                          "ambiguity_stats() cannot count what first-poll drops")
+        finally:
+            j.close()
+
     def test_a_second_poll_is_idempotent(self):
         self.run_first_poll("--seed-demo")
         before = self.journal_rows()
@@ -604,6 +621,29 @@ class TaxonomyTuningStepTest(unittest.TestCase):
                       "step 6 no longer says the verification re-run needs --seed-demo "
                       "— an unseeded fresh-state poll shows an empty channel, not a "
                       "reclassified message")
+
+
+    def test_step6_documents_the_hedge_signal_and_its_escalation_flag(self):
+        """ENH-9: the flag and the count live where the adopter is already tuning the
+        classifier — an undocumented config key is inert in practice however loudly
+        the loader would refuse its typo. Both doc claims are held against the code
+        (the placement lesson from test_taxonomy_guidance_names_its_placement): the
+        key must be a real per-instance field and the count a real Journal method."""
+        import dataclasses
+        from core.config import InstanceConfig
+        self.assertIn('"escalate_ambiguous": true', self.section,
+                      "step 6 no longer shows the exact key that routes hedged "
+                      "decisions to a human — nobody can opt in to a flag the docs "
+                      "never name")
+        self.assertIn("escalate_ambiguous",
+                      {f.name for f in dataclasses.fields(InstanceConfig)},
+                      "the documented key is not a per-instance config field — the "
+                      "doc names a phantom")
+        self.assertIn("ambiguity_stats", self.section,
+                      "step 6 no longer says where the hedge count lives — the signal "
+                      "is invisible again for anyone who has not read core/journal.py")
+        self.assertTrue(hasattr(Journal, "ambiguity_stats"),
+                        "the documented count surface does not exist on Journal")
 
 
 class RunbookConstructorTest(unittest.TestCase):

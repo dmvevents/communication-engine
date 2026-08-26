@@ -45,10 +45,12 @@ def journal_message(journal, channel_id, msg, taxonomy):
     # and an image-only message would journal as an empty STATEMENT again.
     c = classify(msg["text"], taxonomy, attachments=msg.get("attachments"))
     # matched travels with the decision (R22): the journal row is where a classification
-    # gets disputed, and the taxonomy may have changed by then.
+    # gets disputed, and the taxonomy may have changed by then. ambiguous travels too
+    # (ENH-9): a dropped signal here reads back as never-classified, and the hedge
+    # count starts broken for every adopter.
     return journal.record(channel_id, msg["ts"], sender_id=msg.get("sender_id"),
                           text=msg.get("text"), kind=c.kind, reason=c.reason,
-                          matched=c.matched)
+                          matched=c.matched, ambiguous=c.ambiguous)
 
 
 def main(argv=None):

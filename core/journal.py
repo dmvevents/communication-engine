@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS journal (
     reason         TEXT,
     matched        TEXT,
     routed         TEXT,
+    ambiguous      INTEGER,
     first_seen_at  REAL NOT NULL,
     last_seen_at   REAL NOT NULL,
     seen_count     INTEGER NOT NULL DEFAULT 1,
@@ -108,10 +109,17 @@ class Journal:
             cols = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
             if "matched" not in cols:
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN matched TEXT")
+        # ENH-9: same rule for the confidence signal. Legacy rows read back as NULL
+        # ("unrecorded"), never as 0 — fabricated confidence would understate the
+        # hedge rate ambiguity_stats() exists to measure.
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(journal)")}
+        if "ambiguous" not in cols:
+            self.conn.execute("ALTER TABLE journal ADD COLUMN ambiguous INTEGER")
 
     def record(self, channel: str, ts: str, sender_id: str | None = None,
                text: str = "", kind: str | None = None, reason: str | None = None,
-               matched: list | None = None, routed: str | None = None) -> RecordResult:
+               matched: list | None = None, routed: str | None = None,
+               ambiguous: bool | None = None) -> RecordResult:
         """Record an inbound message. Idempotent on IDENTITY and sensitive to CONTENT.
 
         Returns a RecordResult whose truthiness is "this is the first sighting", so callers
@@ -120,19 +128,23 @@ class Journal:
         `matched` is the classification's cue list (R22): the evidence that makes the
         recorded decision disputable. [] means "the classifier matched nothing"; None
         means "no decision supplied" — the two must stay distinct on disk.
+
+        `ambiguous` follows the same three-state convention (ENH-9): True = the
+        classifier hedged, False = it decided confidently, None = no decision supplied.
         """
         now = time.time()
         h = _hash(text)
         mjson = None if matched is None else json.dumps(list(matched))
+        amb = None if ambiguous is None else int(bool(ambiguous))
         existing = self.get(channel, ts)
 
         if existing is None:
             self.conn.execute(
                 "INSERT INTO journal (channel, ts, sender_id, text, text_hash, kind, reason, "
-                "matched, routed, first_seen_at, last_seen_at, seen_count, revision) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,1,1)",
+                "matched, routed, ambiguous, first_seen_at, last_seen_at, seen_count, "
+                "revision) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,1)",
                 (channel, str(ts), sender_id, text, h, kind, reason, mjson, routed,
-                 now, now))
+                 amb, now, now))
             self._add_revision(channel, ts, 1, text, kind, reason, mjson, now)
             self.conn.commit()
             return RecordResult("new", 1)
@@ -146,9 +158,10 @@ class Journal:
                 "UPDATE journal SET text=?, text_hash=?, kind=COALESCE(?, kind), "
                 "reason=COALESCE(?, reason), matched=COALESCE(?, matched), "
                 "routed=COALESCE(?, routed), "
+                "ambiguous=COALESCE(?, ambiguous), "
                 "last_seen_at=?, seen_count=seen_count+1, revision=? "
                 "WHERE channel=? AND ts=?",
-                (text, h, kind, reason, mjson, routed, now, rev, channel, str(ts)))
+                (text, h, kind, reason, mjson, routed, amb, now, rev, channel, str(ts)))
             self._add_revision(channel, ts, rev, text, kind, reason, mjson, now)
             self.conn.commit()
             return RecordResult("revised", rev)
@@ -157,9 +170,10 @@ class Journal:
             "UPDATE journal SET last_seen_at=?, seen_count=seen_count+1, "
             # a later pass may refine the classification; keep the newest non-null
             "kind=COALESCE(?, kind), reason=COALESCE(?, reason), routed=COALESCE(?, routed), "
+            "ambiguous=COALESCE(?, ambiguous), "
             "matched=COALESCE(?, matched) "
             "WHERE channel=? AND ts=?",
-            (now, kind, reason, routed, mjson, channel, str(ts)))
+            (now, kind, reason, routed, amb, mjson, channel, str(ts)))
         self.conn.commit()
         return RecordResult("reseen", int(existing["revision"]))
 
@@ -179,6 +193,7 @@ class Journal:
             return None
         return {"kind": row["kind"], "reason": row["reason"],
                 "matched": None if row["matched"] is None else json.loads(row["matched"]),
+                "ambiguous": None if row["ambiguous"] is None else bool(row["ambiguous"]),
                 "revision": row["revision"]}
 
     def revisions(self, channel: str, ts: str) -> list:
@@ -239,6 +254,20 @@ class Journal:
             q += " AND channel=?"
             args = (channel,)
         return self.conn.execute(q + " ORDER BY ts", args).fetchall()
+
+    def ambiguity_stats(self) -> dict:
+        """How often the classifier hedged, over distinct messages (ENH-9). Before this
+        count existed, every hedge became a STATEMENT with nothing anywhere saying so —
+        safe, but lossy and invisible; an adopter could not even tell whether opting in
+        to escalation (core/schedule.py) was worth the pages. `unrecorded` is reported
+        rather than folded into `confident`: rows journaled before the signal existed
+        (or without a decision) are missing data, not confident decisions."""
+        row = self.conn.execute(
+            "SELECT sum(CASE WHEN ambiguous=1 THEN 1 ELSE 0 END), "
+            "sum(CASE WHEN ambiguous=0 THEN 1 ELSE 0 END), "
+            "sum(CASE WHEN ambiguous IS NULL THEN 1 ELSE 0 END) FROM journal").fetchone()
+        return {"ambiguous": row[0] or 0, "confident": row[1] or 0,
+                "unrecorded": row[2] or 0}
 
     def by_kind(self) -> dict:
         return {r[0]: r[1] for r in self.conn.execute(

@@ -76,6 +76,14 @@ class Classification:
     kind: str
     reason: str
     matched: list = field(default_factory=list)
+    # ENH-9: True only where the classifier HEDGED — it saw evidence for a higher-
+    # consequence class but refused to act without corroboration. A field, not a reason
+    # substring: the downgrade used to be detectable only by string-matching the human-
+    # facing prose, so nothing downstream could route or count it. The signal comes from
+    # the same deterministic rules as the decision itself — NO LLM sits in this path by
+    # default; an adopter who wants model-assisted triage hangs it off the escalated
+    # owed:operator queue (core/schedule.py), never inside classify().
+    ambiguous: bool = False
 
     def __str__(self) -> str:
         return f"{self.kind} ({self.reason})"
@@ -170,7 +178,7 @@ def classify(text: str, taxonomy: Taxonomy | None = None,
         return Classification("STATEMENT",
                               "mentions an action verb but carries no directive — "
                               "ambiguous, so classified down to avoid acting on narration",
-                              exec_hits)
+                              exec_hits, ambiguous=True)
 
     return Classification("STATEMENT", "no directive, question or commitment cue")
 

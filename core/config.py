@@ -46,7 +46,7 @@ VALID_POLICIES = ("never", "staged", "direct")
 _TOP_KEYS = frozenset(("engine", "instances"))
 _ENGINE_KEYS = frozenset(("state_dir", "channels_dir", "store", "journal", "outbox"))
 _INSTANCE_KEYS = frozenset(("name", "adapter", "channels", "principals", "auth",
-                            "taxonomy"))
+                            "taxonomy", "escalate_ambiguous"))
 _CHANNEL_KEYS = frozenset(("id", "label", "poll_interval_s", "reply_policy",
                            "thread_reply_policy", "triggers"))
 
@@ -105,6 +105,10 @@ class InstanceConfig:
     principals: tuple = ()
     auth: dict = field(default_factory=dict)
     taxonomy: dict = field(default_factory=dict)
+    # ENH-9: opt-in — route this instance's hedged classifications to a human
+    # (owed:operator) instead of only logging them. Default off: the safe direction is
+    # unchanged behaviour plus the journal's visible hedge count.
+    escalate_ambiguous: bool = False
 
     def policies(self) -> dict:
         """target id -> policy, for core.outbox. Absent targets are denied by default."""
@@ -329,10 +333,18 @@ def from_dict(raw: dict, base_dir: str | Path, env: dict | None = None) -> Engin
                 thread_reply_policy=ch.get("thread_reply_policy"),
                 triggers=tuple(ch.get("triggers", ()))))
         auth = {k: resolve_secret(v, env) for k, v in (spec.get("auth") or {}).items()}
+        esc = spec.get("escalate_ambiguous", False)
+        if not isinstance(esc, bool):
+            # The JSON footgun: a quoted "false" is a non-empty string and would count
+            # as True — enabling escalation for the adopter who typed the word off.
+            raise ConfigError(
+                f"instance {name!r}: escalate_ambiguous must be a JSON boolean "
+                f"(true/false), got {esc!r}")
         instances.append(InstanceConfig(
             name=name, adapter=adapter, channels=tuple(channels),
             principals=tuple(spec.get("principals", ())), auth=auth,
-            taxonomy=spec.get("taxonomy", {}) or {}))
+            taxonomy=spec.get("taxonomy", {}) or {},
+            escalate_ambiguous=esc))
 
     if not instances:
         raise ConfigError("no instances configured — the engine would poll nothing")

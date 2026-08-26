@@ -177,6 +177,29 @@ class ConfigTest(unittest.TestCase):
         with self.assertRaises(ConfigError):
             from_dict({"engine": {}, "instances": []}, base_dir=self.base)
 
+    def test_escalate_ambiguous_defaults_off(self):
+        """ENH-9 routing is opt-in: unchanged behaviour (hedge -> logged) plus a
+        visible count is the safe default; paging a human per hedge is a decision."""
+        c = from_dict(self.cfg_dict(), base_dir=self.base, env={"ADOPTER_TOKEN": "x"})
+        self.assertIs(c.instance("adopter-workspace").escalate_ambiguous, False)
+
+    def test_escalate_ambiguous_is_read_from_the_instance(self):
+        d = self.cfg_dict()
+        d["instances"][0]["escalate_ambiguous"] = True
+        c = from_dict(d, base_dir=self.base, env={"ADOPTER_TOKEN": "x"})
+        self.assertIs(c.instance("adopter-workspace").escalate_ambiguous, True,
+                      "the key loads but configures nothing — the silently inert "
+                      "class ENH-17 exists to kill")
+
+    def test_a_quoted_escalate_ambiguous_is_refused(self):
+        """The JSON footgun: "false" (a string) is truthy in Python, so accepting it
+        would enable escalation for the adopter who typed the word 'false'."""
+        d = self.cfg_dict()
+        d["instances"][0]["escalate_ambiguous"] = "false"
+        with self.assertRaises(ConfigError) as ctx:
+            from_dict(d, base_dir=self.base, env={"ADOPTER_TOKEN": "x"})
+        self.assertIn("escalate_ambiguous", str(ctx.exception))
+
     def test_missing_config_file_raises_clearly(self):
         with self.assertRaises(ConfigError):
             load(self.base / "nope.json")

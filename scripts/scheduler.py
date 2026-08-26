@@ -96,7 +96,8 @@ def main(argv=None):
 
     sources = [Source(name=inst.name, adapter=adapters[inst.name],
                       channels=tuple(ch.id for ch in inst.channels),
-                      taxonomy=Taxonomy.from_config(inst.taxonomy))
+                      taxonomy=Taxonomy.from_config(inst.taxonomy),
+                      escalate_ambiguous=inst.escalate_ambiguous)
                for inst in cfg.instances]
     # Base cadence: the fastest cadence any channel asked for; backoff may widen it
     # (never past 16x), owed work restores it (core/schedule.py, R3).

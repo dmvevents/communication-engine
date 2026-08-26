@@ -106,11 +106,13 @@ class SchedulerHarness(unittest.TestCase):
             part.close_db()
         self.tmp.cleanup()
 
-    def scheduler(self, adapter, channels=("C1",), journal=None, lock_path=None):
+    def scheduler(self, adapter, channels=("C1",), journal=None, lock_path=None,
+                  escalate_ambiguous=False):
         return Scheduler(
             store=self.store, journal=journal or self.journal, owed=self.owed,
             escalator=self.escalator,
-            sources=[Source(name="inst", adapter=adapter, channels=tuple(channels))],
+            sources=[Source(name="inst", adapter=adapter, channels=tuple(channels),
+                            escalate_ambiguous=escalate_ambiguous)],
             base_interval=self.BASE, max_interval=self.MAX, lock_path=lock_path,
             clock=lambda: self.now,
             sleep=self._sleep)
@@ -416,6 +418,68 @@ class RouteTest(SchedulerHarness):
         self.assertEqual(self.open_ids(), {"msg@C1@1.0"})
 
 
+class AmbiguityRoutingTest(SchedulerHarness):
+    """ENH-9: the classifier's hedge (exec verb, no directive -> STATEMENT) used to be
+    routed as 'logged' with nothing downstream able to tell — safe, but lossy and
+    invisible. Now the signal travels: the journal row records it (so the loss is
+    countable whether or not anyone acts), and a source that OPTS IN routes each hedge
+    to a human (owed:operator) instead of only logging it. Opt-in, not default: every
+    hedge paged to the operator is noise for teams whose channels narrate constantly,
+    and the safe direction is unchanged behaviour plus a visible count."""
+
+    HEDGE = "The build and test cycle takes an hour."
+
+    def route_one(self, text, escalate_ambiguous=False, ts="1.0"):
+        self.scheduler(QueueAdapter([([msg("C1", ts, text)], ts)]),
+                       escalate_ambiguous=escalate_ambiguous).cycle()
+        return self.journal.get("C1", ts)
+
+    def open_ids(self):
+        return {r["id"] for r in self.owed.open_items()}
+
+    def test_route_sends_an_ambiguous_decision_to_a_human_when_opted_in(self):
+        self.assertEqual(route("STATEMENT", ambiguous=True, escalate_ambiguous=True),
+                         "owed:operator")
+
+    def test_escalation_is_opt_in_the_default_stays_logged(self):
+        self.assertEqual(route("STATEMENT", ambiguous=True), "logged")
+
+    def test_a_confident_decision_is_never_escalated_by_the_flag(self):
+        self.assertEqual(route("STATEMENT", escalate_ambiguous=True), "logged")
+
+    def test_an_opted_in_loop_owes_the_hedge_to_the_operator(self):
+        row = self.route_one(self.HEDGE, escalate_ambiguous=True)
+        self.assertEqual(row["kind"], "STATEMENT")
+        self.assertEqual(row["routed"], "owed:operator")
+        self.assertEqual(row["ambiguous"], 1)
+        self.assertEqual(self.open_ids(), {"msg@C1@1.0"},
+                         "the opted-in hedge created no owed work — it stays exactly "
+                         "as invisible as before the flag existed")
+
+    def test_the_default_loop_still_counts_what_it_declines_to_escalate(self):
+        """The count is NOT gated by the routing flag: visibility is the point of the
+        signal, and a count that only accrues for opted-in sources hides the loss from
+        precisely the teams that have not decided yet."""
+        row = self.route_one(self.HEDGE)
+        self.assertEqual(row["routed"], "logged")
+        self.assertEqual(self.open_ids(), set())
+        self.assertEqual(row["ambiguous"], 1,
+                         "the hedge was not recorded — with the flag off, ambiguity "
+                         "is silently a STATEMENT again")
+        self.assertEqual(self.journal.ambiguity_stats()["ambiguous"], 1)
+
+    def test_a_confident_statement_is_untouched_by_the_opt_in(self):
+        # No exec verb anywhere — "the deploy finished" would itself be a hedge
+        # (noun-shaped "deploy" still matches the verb list; that IS the ambiguity).
+        row = self.route_one("notes from the meeting are in the shared doc",
+                             escalate_ambiguous=True)
+        self.assertEqual(row["routed"], "logged")
+        self.assertEqual(row["ambiguous"], 0)
+        self.assertEqual(self.open_ids(), set(),
+                         "a confident STATEMENT paged the operator — the flag must "
+                         "escalate hedges, not every remark")
+
+
 class RunLoopTest(SchedulerHarness):
     def test_run_fires_the_requested_number_of_cycles(self):
         sched = self.scheduler(QueueAdapter([([msg("C1", "1.0", "hi")], "1.0")]))
@@ -497,6 +561,34 @@ class ReferenceSchedulerScriptTest(unittest.TestCase):
         self.assertIn("OPERATOR:", r.stdout,
                       "unattended owed work raised no operator escalation")
         self.assertIn("DEGRADED", r.stdout)
+
+    def test_escalate_ambiguous_reaches_the_loop_from_settings(self):
+        """The config key must survive the scripts/scheduler.py wiring (the ENH-7
+        adapter-wiring lesson: a flag parsed but not passed to Source is silently
+        inert). The taxonomy strips every directive/ask cue so the shipped demo text
+        ('Please review ...') becomes the hedge shape: an exec verb with nothing that
+        makes it an instruction."""
+        (self.base / "settings.json").write_text(
+            '{"engine": {"state_dir": "state"},\n'
+            ' "instances": [{"name": "loop-dry-run", "adapter": "fake",\n'
+            '   "escalate_ambiguous": true,\n'
+            '   "taxonomy": {"exec_verbs": ["review"], "ask_phrases": [],\n'
+            '                "directive_markers": [], "commitment_phrases": []},\n'
+            '   "channels": [{"id": "C_DEMO", "label": "demo"}]}]}\n')
+        r = self.run_scheduler("--once", "--seed-demo")
+        self.assertEqual(r.returncode, 0, f"scheduler failed:\n{r.stderr[-600:]}")
+        j = Journal(self.base / "state" / "journal.db")
+        try:
+            row = j.get("C_DEMO", "1.0")
+            self.assertIsNotNone(row, "the demo message never reached the journal")
+            self.assertEqual(row["ambiguous"], 1,
+                             "the stripped-taxonomy demo message did not classify as "
+                             "a hedge — this test is measuring nothing")
+            self.assertEqual(row["routed"], "owed:operator",
+                             "escalate_ambiguous was set in settings.json but the "
+                             "hedge was only logged — the flag died in the wiring")
+        finally:
+            j.close()
 
     def test_a_second_instance_is_refused_with_a_distinct_exit_code(self):
         (self.base / "state").mkdir()
