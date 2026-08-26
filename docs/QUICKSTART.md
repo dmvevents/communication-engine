@@ -171,8 +171,15 @@ Switch your instance to it — still editing only `settings.json`:
 ```sh
 export MY_SLACK_TOKEN='<your bot token>'       # needs history-read scope
 export MY_SLACK_CHANNELS='C_YOUR_CHANNEL'      # comma-separated channel ids
+python3 -m core.doctor --config settings.json  # preflight BEFORE the first poll
 python3 scripts/first-poll.py --config settings.json
 ```
+
+The doctor is the same checks a failed poll would surface, run up front: config
+validated, credentials resolved (named, never printed), one live read-only poll per
+instance confirming each configured channel readable — including the two-place rule
+below — and the effective reply policy printed per channel. `DOCTOR OK` means the
+first poll should work; anything else names what to fix.
 
 Both `auth` values are `env:` references, like every credential: the channel ids are
 workspace-specific literals that should no more live in a committed file than the token.

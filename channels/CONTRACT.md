@@ -28,6 +28,14 @@ is the reference implementation to copy.
 | `send(channel_id, text, thread_id?) -> receipt` | **Only callable through `core/outbox`.** Adapters expose the primitive; the stage-gate (draft → outbox file → operator gate → send) is enforced in core, never re-implemented per adapter. |
 | `health() -> {reachable, auth_ok, detail}` | Cheap (<2s) liveness used by the probe and watchdog layers. Must not consume rate-limit budget meaningfully. |
 
+An adapter that watches a **fixed, config-derived channel set** (both shipped real adapters
+do — theirs arrives via the `channels` env reference) should expose it as a `channels`
+attribute (iterable of platform ids). `core/doctor.py` cross-checks it against the
+configured `channels[]` list: an id present in one list and missing from the other polls
+nothing while looking successful, which is the one silent failure on the real-poll path
+(docs/QUICKSTART.md step 7). Adapters without a fixed set (the fake reads whatever is
+seeded) simply omit the attribute.
+
 ## Normalized message
 
 `poll()` returns messages in one shape regardless of platform:

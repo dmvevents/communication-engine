@@ -3,6 +3,19 @@
 Every entry below is a failure this engine (or the system it generalizes) has actually
 produced. Symptom first, because that is what you have at 2am.
 
+**First move, whatever the symptom:**
+
+```sh
+python3 -m core.doctor --config settings.json
+```
+
+The doctor preflights the whole configuration in one command — config validated,
+credentials resolved, each configured channel confirmed readable by a live read-only
+poll, the effective reply policy printed per channel — and it cannot report healthy
+vacuously (`core/checks.py` refuses a PASS that inspected nothing). Exit 0 means the
+problem is probably further down this page; exit 2 is a config refusal (first table
+below); exit 1 names the failing check.
+
 ## "The engine refuses to start"
 
 | Message | Cause | Fix |

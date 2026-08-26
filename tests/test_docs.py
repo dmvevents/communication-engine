@@ -229,6 +229,21 @@ class DocCitationsTest(unittest.TestCase):
                       "no longer takes it")
 
 
+class DoctorDocTest(unittest.TestCase):
+    """ENH-5: the doctor exists because config failures surfaced as stack traces, but a
+    preflight nobody is told about diagnoses nothing. It must be documented at both
+    moments an adopter needs it: before the first real poll (quickstart) and at 2am
+    when something is misconfigured (runbook)."""
+
+    COMMAND = "python3 -m core.doctor --config settings.json"
+
+    def test_the_preflight_command_is_documented_where_adopters_look(self):
+        for doc in (QUICKSTART, RUNBOOK):
+            self.assertIn(self.COMMAND, doc.read_text(),
+                          f"{doc.name} no longer shows the doctor preflight command — "
+                          "config failures go back to surfacing as stack traces")
+
+
 class FrontDoorTest(unittest.TestCase):
     """ENH-19: the front door must not UNDERSTATE what ships. The adoption run found a
     newcomer reading README.md concluded there was nothing to adopt — phases marked

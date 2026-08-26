@@ -1147,6 +1147,127 @@ run_mutation "config: the wrong-level refusal stops naming the key's real home" 
   "('    hints = \"\".join(f\" ({k!r} is read per-instance: instances[].{k})\"', '    hints = \"\".join(\"\"')" \
   "test_portability"
 
+# ---------------------------------------------------------------------------
+# ENH-5 — the doctor preflight command. Its one job is refusing to look healthy
+# when the configuration is not; each mutation below is a way for it to hand an
+# adopter a clean bill of health over a broken setup — the vacuous-pass disease
+# in a tool that exists specifically to kill the stack-trace-at-first-poll
+# experience.
+# ---------------------------------------------------------------------------
+
+# ENH-5 — a refused config must never exit healthy; the refusal exit code IS the
+# contract scripts build on (same 0/1/2 convention as the SLO judge).
+run_mutation "doctor: a refused config exits as if healthy" \
+  "core/doctor.py" \
+  "('        return 2', '        return 0')" \
+  "test_doctor"
+
+# ENH-5 — health() can FAIL (contract rule 5); a doctor that shrugs it off is the
+# incumbent's inert watchdog handed to every adopter.
+run_mutation "doctor: an unreachable adapter reads healthy" \
+  "core/doctor.py" \
+  "('    if not h[\"reachable\"]:', '    if False:')" \
+  "test_doctor"
+
+run_mutation "doctor: platform-refused credentials read healthy" \
+  "core/doctor.py" \
+  "('    if not h[\"auth_ok\"]:', '    if False:')" \
+  "test_doctor"
+
+# ENH-5 — a junk health dict still fails without this guard, but as a raw KeyError:
+# the exact errno-grade message ENH-5 exists to replace with a fix instruction.
+run_mutation "doctor: a health surface missing the contract keys loses its named refusal" \
+  "core/doctor.py" \
+  "('    if not isinstance(h, dict) or not {\"reachable\", \"auth_ok\"} <= set(h):', '    if False:')" \
+  "test_doctor"
+
+# ENH-5/ENH-16 — an admitted delivery gap is a loss signal, never a detail string.
+run_mutation "doctor: an admitted delivery gap reads healthy" \
+  "core/doctor.py" \
+  "('    if h.get(\"complete\") is False:', '    if False:')" \
+  "test_doctor"
+
+# ENH-5 — 'each channel is readable' is proven by the live poll; swallowing the
+# poll's failure certifies channels nobody read.
+run_mutation "doctor: a failed preflight poll no longer fails the channels" \
+  "core/doctor.py" \
+  "('        if self._poll_err is not None:\n            raise self._poll_err', '        if False:\n            raise self._poll_err')" \
+  "test_doctor"
+
+# ENH-5 — the two-place footgun (measured, fire=11): an id in config but not in the
+# adapter's own watch set polls nothing and looks successful.
+run_mutation "doctor: the watch-set cross-check stops firing (two-place footgun)" \
+  "core/doctor.py" \
+  "('    if watched is not None and ch.id not in watched:', '    if False:')" \
+  "test_doctor"
+
+# ENH-5 — an adapter that cannot read has nothing to preflight; passing it certifies
+# a watcher that will never watch.
+run_mutation "doctor: a read-incapable adapter passes the preflight" \
+  "core/doctor.py" \
+  "('    if not caps.get(\"read\"):', '    if False:')" \
+  "test_doctor"
+
+# ENH-5 — the acceptance says PRINTS: a doctor that resolves the policy and shows
+# nothing leaves the adopter reading the config file again.
+run_mutation "doctor: the per-channel policy lines vanish from the output" \
+  "core/doctor.py" \
+  "('            label = f\" [{ch.label}]\" if ch.label else \"\"', '            continue')" \
+  "test_doctor"
+
+# ENH-5 — each placement printed truthfully (ENH-3): printing the channel policy for
+# the thread column reports 'answer in thread only' as fully read-only.
+run_mutation "doctor: the thread placement prints the channel policy" \
+  "core/doctor.py" \
+  "(\"                 f\\\"thread={_effective_policy(inst, ch.id, 'thread')}\\\")\", \"                 f\\\"thread={_effective_policy(inst, ch.id, 'channel')}\\\")\")" \
+  "test_doctor"
+
+# ENH-5 — THE property: a failing verdict must fail the run. With this gone every
+# other check is decoration.
+run_mutation "doctor: a failing check no longer fails the exit code" \
+  "core/doctor.py" \
+  "('    if bad:', '    if False:')" \
+  "test_doctor"
+
+# ENH-5 — no vacuous pass: an instance watching nothing has zero evidence of health.
+run_mutation "doctor: an instance watching no channels passes" \
+  "core/doctor.py" \
+  "('        if not inst.channels:', '        if False:')" \
+  "test_doctor"
+
+# ENH-5 — the doctor names WHICH references resolved, never their values; echoing a
+# token turns a diagnostic paste into a leak.
+run_mutation "doctor: resolved credential VALUES printed instead of reference names" \
+  "core/doctor.py" \
+  "('    names = _env_ref_names(config_path)', '    names = [f\"{k}={v}\" for i in cfg.instances for k, v in sorted(i.auth.items())]')" \
+  "test_doctor"
+
+# ENH-5 — the defect from this command's first live run, verbatim: a text scan reports
+# the example's _note prose ('env:NAME') as a resolved credential.
+run_mutation "doctor: prose mentions of env: reported as resolved credentials again" \
+  "core/doctor.py" \
+  "('    names = _env_ref_names(config_path)', '    names = sorted(set(__import__(\"re\").findall(r\"env:([A-Za-z_][A-Za-z0-9_]*)\", config_path.read_text())))')" \
+  "test_doctor"
+
+# ENH-5 — the probe reuses the engine's own cursor (bounded work on a live install);
+# ignoring it re-reads full history on every preflight.
+run_mutation "doctor: the probe ignores the engine's persisted cursor" \
+  "core/doctor.py" \
+  "('        probe = _Probe(cfg.channels_dir, inst, _persisted_cursor(cfg, inst))', '        probe = _Probe(cfg.channels_dir, inst, None)')" \
+  "test_doctor"
+
+# ENH-5/R21 — a preflight nobody is told about diagnoses nothing: both docs must keep
+# showing the command at the moment the adopter needs it.
+run_mutation "docs: the runbook's first-move preflight deleted" \
+  "docs/RUNBOOK.md" \
+  "('python3 -m core.doctor --config settings.json', 'python3 -m unittest discover -s tests -q')" \
+  "test_docs"
+
+run_mutation "docs: the quickstart's preflight line deleted" \
+  "docs/QUICKSTART.md" \
+  "('python3 -m core.doctor --config settings.json  # preflight BEFORE the first poll', '# preflight removed')" \
+  "test_docs"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }
