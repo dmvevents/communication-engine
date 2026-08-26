@@ -703,6 +703,68 @@ run_mutation "docs: a shipped adapter vanishes from the front door" \
   "('| \`slack_socket\` |', '| \`socket\` |')" \
   "test_docs"
 
+# ---------------------------------------------------------------------------
+# ENH-2 — the detection-latency SLO (push-vs-poll arrival delta, poll as ground
+# truth). The incumbent's "12.1min -> ~1min" headline measured its own cron cadence;
+# these properties are what make the replacement metric honest.
+# ---------------------------------------------------------------------------
+
+# ENH-2 — no arrival stamps, no latency: ingest silently stops recording and every
+# later SLO judgement is over data that does not exist.
+run_mutation "slo: ingest stops recording first arrivals" \
+  "core/store.py" \
+  "('            [(m[\"channel_type\"], m[\"channel_id\"], str(m[\"ts\"]), now) for m in batch])', '            [])')" \
+  "test_store"
+
+# ENH-2 — first-write-wins is the whole measurement: a re-poll that moves the stamp
+# rewrites history toward zero latency.
+run_mutation "slo: a re-ingest moves the first arrival" \
+  "core/store.py" \
+  "('\"INSERT OR IGNORE INTO arrivals \"', '\"INSERT OR REPLACE INTO arrivals \"')" \
+  "test_store"
+
+# ENH-2 — THE acceptance: a poll-confirmed message push never delivered must fail,
+# not vanish into the percentiles.
+run_mutation "slo: a poll-confirmed miss vanishes from the verdict" \
+  "core/slo.py" \
+  "('    missed = {ts for ts in truth if ts not in push_msgs}', '    missed = set()')" \
+  "test_slo"
+
+# ENH-2 — judging only the median lets a slow tail hide; the tail is where a
+# degraded socket shows first.
+run_mutation "slo: the p90 budget is no longer judged" \
+  "core/slo.py" \
+  "('        return (self.detect_p50_s > self.slo_p50_s\n                or self.detect_p90_s > self.slo_p90_s)', '        return self.detect_p50_s > self.slo_p50_s')" \
+  "test_slo"
+
+# ENH-2/R8 — the vacuous pass again: a judge that measured nothing must not bless
+# the push path.
+run_mutation "slo: an unmeasurable comparison passes" \
+  "core/slo.py" \
+  "('    if not missed and not detect_s:', '    if False:')" \
+  "test_slo"
+
+# ENH-2/R8 — the other empty case: no ground truth at all must name the truth side
+# as broken, not fall through to a generic (or absent) refusal.
+run_mutation "slo: an empty ground truth loses its diagnosis" \
+  "core/slo.py" \
+  "('    if not truth:', '    if False:')" \
+  "test_slo"
+
+# ENH-2 — nearest-rank means rounding the rank UP; a floor drops p90-of-4 from the
+# max to the 3rd value, exactly the drift that flatters a slow tail.
+run_mutation "slo: percentile rank floored instead of ceiled" \
+  "core/slo.py" \
+  "('    k = -(-(len(s) * p) // 100)', '    k = (len(s) * p) // 100')" \
+  "test_slo"
+
+# ENH-2 — the headline metric itself: push's lead over the truth poll must be the
+# real delta, not a flattering constant.
+run_mutation "slo: the push-lead delta is fabricated" \
+  "core/slo.py" \
+  "('        lead_s.append(poll_arr[ts] - push_at)', '        lead_s.append(0.0)')" \
+  "test_slo"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }

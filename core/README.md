@@ -22,7 +22,8 @@ so a new channel type is a directory drop with zero core changes.
 | `owed.py` | the owed-work edge: promised-but-unstarted work stays visible, idle backoff can never suppress it (root cause of a measured 8h17m silent stall), and a recorded driver must be provably alive, not just named |
 | `parity.py` | shadow-mode parity differ against the incumbent oracle: reports missed / extra / cursor divergence, and an empty comparison is an ERROR, never a pass |
 | `ratelimit.py` | per-(instance, method) 429 back-off honouring Retry-After exactly: a read 429 never pauses sends, one workspace's hold never crosses to another, and exhausted retries surface the error instead of dropping the message |
-| `store.py` | sqlite message store: explicit pinned schema (unknown and missing fields refused), idempotent re-ingest, per-(instance, channel) cursor persistence |
+| `slo.py` | detection-latency SLO with the completeness poll as ground truth: p50/p90 of push detection latency and of push's lead over the poll, failing on a budget breach or on any poll-confirmed message push never delivered (the incumbent's "12.1min → ~1min" headline only measured its own cron cadence); an empty or unmeasurable comparison is an error, never a pass |
+| `store.py` | sqlite message store: explicit pinned schema (unknown and missing fields refused), idempotent re-ingest, first-arrival stamping (first-write-wins, so re-polls never move it), per-(instance, channel) cursor persistence |
 
 Each module's docstring carries the measured incident it exists to prevent — read it before
 changing behaviour.

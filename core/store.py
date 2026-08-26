@@ -16,6 +16,7 @@ R5  the schema is PINNED — the origin system shipped a health check that read 
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 
 # The normalized message contract (see channels/CONTRACT.md). Renaming or dropping any
@@ -43,6 +44,13 @@ CREATE TABLE IF NOT EXISTS cursors (
     updated_at   TEXT,
     PRIMARY KEY (instance, channel_id)
 );
+CREATE TABLE IF NOT EXISTS arrivals (
+    channel_type TEXT NOT NULL,
+    channel_id   TEXT NOT NULL,
+    ts           TEXT NOT NULL,
+    arrived_at   REAL NOT NULL,
+    PRIMARY KEY (channel_type, channel_id, ts)
+);
 """
 
 
@@ -51,8 +59,11 @@ class SchemaError(ValueError):
 
 
 class Store:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, clock=time.time):
+        # `clock` stamps first arrivals (ENH-2); injectable so latency tests are
+        # deterministic. Wall clock, same basis as the platform's message ts.
         self.path = str(path)
+        self.clock = clock
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
@@ -93,6 +104,14 @@ class Store:
             "INSERT OR REPLACE INTO messages "
             "(channel_type, channel_id, ts, sender_id, sender_name, text, thread_id, raw) "
             "VALUES (?,?,?,?,?,?,?,?)", rows)
+        # First-arrival stamp (ENH-2): OR IGNORE, never OR REPLACE — the poller re-reads
+        # overlapping windows on every cycle (R9), and a stamp that followed the latest
+        # sighting would erase the push-vs-poll delta the detection-latency SLO measures.
+        now = self.clock()
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO arrivals "
+            "(channel_type, channel_id, ts, arrived_at) VALUES (?,?,?,?)",
+            [(m["channel_type"], m["channel_id"], str(m["ts"]), now) for m in batch])
         self.conn.commit()
         return len(rows)
 
@@ -105,6 +124,11 @@ class Store:
     def timestamps(self, channel_id: str) -> set[str]:
         return {r[0] for r in self.conn.execute(
             "SELECT ts FROM messages WHERE channel_id=?", (channel_id,))}
+
+    def arrivals(self, channel_id: str) -> dict[str, float]:
+        """ts -> first-arrival wall-clock time, for the detection-latency SLO."""
+        return {r[0]: r[1] for r in self.conn.execute(
+            "SELECT ts, arrived_at FROM arrivals WHERE channel_id=?", (channel_id,))}
 
     # ---- cursors ----------------------------------------------------------
     def cursor_get(self, instance: str, channel_id: str) -> str | None:
