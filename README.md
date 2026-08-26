@@ -20,7 +20,9 @@ directions). Adapters live one directory per platform, all implementing
 
 What does NOT ship is listed where an adopter acts: the quickstart's honest-limits section.
 Notably there is no live send path (the outbox ladder is complete, but only the `fake`
-adapter exposes `send()`), no scheduler daemon, and `watchers/` is a stub.
+adapter exposes `send()`) and `watchers/` is a stub. A reference scheduler ships
+(`scripts/scheduler.py`): a guarded, read-only probe → classify → journal → route → owed
+loop you run under your own supervisor.
 
 ## Quickstart
 

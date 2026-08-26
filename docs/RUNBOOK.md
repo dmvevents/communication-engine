@@ -118,6 +118,21 @@ A driver *string* is not evidence — liveness is. A note saying "NEXT STEP: …
 live process makes progress. If `unattended()` returns rows, something needs relaunching, and
 backoff must not be the reason it is waiting.
 
+If you run the reference loop (`scripts/scheduler.py`), this check happens every cycle with
+no inbound message required, and unattended work both restores the base polling cadence and
+pages `OPERATOR: DEGRADED: owed-work-unattended` — once per state change, not per cycle.
+
+## "The scheduler refuses to start"
+
+`REFUSED: another scheduler already holds .../scheduler.lock` (exit 3) means exactly what it
+says: one loop per state directory. Find the running instance and stop it — **never delete
+the lock** to force a second one; two loops on one state directory double-classify, race the
+cursor, and (the day a send path is enabled) double-deliver. The lock is held by the process
+itself, not by a marker file: a crashed holder releases it automatically, so a refusal always
+means a *live* holder exists. Check your supervisor or cron for the overlap — an `--once`
+cron fire overlapping a long-running instance is the usual cause, and the refusal (rather
+than a race) is the designed outcome.
+
 ## "The classifier is wrong on my team's messages"
 
 Expected — you inherited our vocabulary. Check behaviour on your own samples:

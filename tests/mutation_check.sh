@@ -1268,6 +1268,93 @@ run_mutation "docs: the quickstart's preflight line deleted" \
   "('python3 -m core.doctor --config settings.json  # preflight BEFORE the first poll', '# preflight removed')" \
   "test_docs"
 
+# ENH-6 — the single-instance guard is why cron overlap REFUSES instead of racing;
+# unguarded, two loops double-classify and race the cursor on one state directory.
+run_mutation "schedule: run() no longer acquires the single-instance guard" \
+  "core/schedule.py" \
+  "('        guard = (SingleInstanceGuard(self.lock_path).acquire()\n                 if self.lock_path else None)', '        guard = None')" \
+  "test_schedule"
+
+# ENH-6 — THE ordering: cursor after journal means a crash duplicates (absorbed, R16);
+# cursor first means a crash silently loses the tail of the batch, with no reconciler.
+run_mutation "schedule: cursor committed before the journal" \
+  "core/schedule.py" \
+  "('                fresh += self._journal_and_route(ch, mine, src.taxonomy)\n                self._commit_cursor(src.name, ch, cursor, new_cursor)', '                self._commit_cursor(src.name, ch, cursor, new_cursor)\n                fresh += self._journal_and_route(ch, mine, src.taxonomy)')" \
+  "test_schedule"
+
+# ENH-6/R3 — the 8h17m bug verbatim: backoff self-gates exactly when owed work stalls.
+run_mutation "schedule: backoff suppresses owed work again" \
+  "core/schedule.py" \
+  "('        if self.owed.should_fire(self._backoff_until, now):', '        if False:')" \
+  "test_schedule"
+
+# ENH-6/R4 — the goal-triggered edge: without it, promised work is only ever noticed
+# when a new inbound message happens to fire the loop's attention.
+run_mutation "schedule: the owed check deleted from the cycle" \
+  "core/schedule.py" \
+  "('        unattended = self._observe_owed()', '        unattended = 0')" \
+  "test_schedule"
+
+# ENH-6 — route is classify->consequence; without the owe, an EXEC-REQUEST is a
+# journal row nobody owes anything about — the incident's exact shape.
+run_mutation "schedule: routed asks stop creating owed work" \
+  "core/schedule.py" \
+  "('            if dest.startswith(\"owed:\") and (res.is_new or res.is_revision):', '            if False:')" \
+  "test_schedule"
+
+# ENH-6 — the lifecycle exit: answered asks must close, or the loop pages the
+# operator about finished work forever and gets muted.
+run_mutation "schedule: answered owed work never closes" \
+  "core/schedule.py" \
+  "('        self._close_answered()', '        pass')" \
+  "test_schedule"
+
+# ENH-6 — a busy channel stuck at the widened cadence is the backoff bug's mirror.
+run_mutation "schedule: activity no longer resets the backoff" \
+  "core/schedule.py" \
+  "('        self._interval = (self.base_interval if fresh', '        self._interval = (self._interval if fresh')" \
+  "test_schedule"
+
+# ENH-6 — a kind the map has never heard of must fail toward a human; 'logged' as the
+# default is the silently-inert class wearing a routing table.
+run_mutation "schedule: unknown kinds routed to silence" \
+  "core/schedule.py" \
+  "('    return ROUTES.get(kind, \"owed:operator\")', '    return ROUTES.get(kind, \"logged\")')" \
+  "test_schedule"
+
+# ENH-6 — answered() is what the scheduler closes owed work from; if it lies, open
+# asks get closed the cycle they arrive.
+run_mutation "journal: answered() returns the unanswered rows" \
+  "core/journal.py" \
+  "('        q = \"SELECT * FROM journal WHERE responded_at IS NOT NULL\"', '        q = \"SELECT * FROM journal WHERE responded_at IS NULL\"')" \
+  "test_journal"
+
+# ENH-6 — the script wiring: a lock refusal that exits 0 tells cron the fire ran.
+run_mutation "scheduler-script: the lock refusal reports success" \
+  "scripts/scheduler.py" \
+  "('        return 3', '        return 0')" \
+  "test_schedule"
+
+# ENH-6 — the script must actually pass the lock path; run() without one is unguarded.
+run_mutation "scheduler-script: the loop runs unguarded" \
+  "scripts/scheduler.py" \
+  "('lock_path=cfg.state_dir / \"scheduler.lock\"', 'lock_path=None')" \
+  "test_schedule"
+
+# ENH-6/R21 — the 'no scheduler' claim was true for months; it must not quietly return
+# over an implemented, tested loop (the made-vague-again class).
+run_mutation "docs: the quickstart claims no scheduler ships again" \
+  "docs/QUICKSTART.md" \
+  "('is a single-process loop, not', 'does not ship — there is no scheduler in this repo, and it is not')" \
+  "test_docs"
+
+# ENH-6/R21 — the reflex fix is the dangerous one: deleting the lock puts two loops
+# on one state directory. The runbook must keep saying never.
+run_mutation "docs: the runbook starts teaching the lock-deletion reflex" \
+  "docs/RUNBOOK.md" \
+  "('**never delete\nthe lock**', 'delete the lock')" \
+  "test_docs"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }

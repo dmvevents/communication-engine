@@ -224,6 +224,17 @@ class Journal:
             args = (channel,)
         return self.conn.execute(q + " ORDER BY ts", args).fetchall()
 
+    def answered(self, channel: str | None = None) -> list:
+        """The closable complement of unanswered(): rows already tied to a response.
+        The reference scheduler closes message-routed owed work from this set — by
+        re-deriving each row's owed id, never by parsing ids back apart."""
+        q = "SELECT * FROM journal WHERE responded_at IS NOT NULL"
+        args: tuple = ()
+        if channel:
+            q += " AND channel=?"
+            args = (channel,)
+        return self.conn.execute(q + " ORDER BY ts", args).fetchall()
+
     def by_kind(self) -> dict:
         return {r[0]: r[1] for r in self.conn.execute(
             "SELECT kind, count(*) FROM journal GROUP BY kind")}

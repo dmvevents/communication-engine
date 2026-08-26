@@ -109,6 +109,16 @@ class JournalTest(unittest.TestCase):
         self.j.record("C_TWO", "2.2")
         self.assertEqual(len(self.j.unanswered("C_ONE")), 1)
 
+    def test_answered_is_the_exact_complement_of_unanswered(self):
+        """The reference scheduler closes owed work from answered() — a row appearing
+        in both lists (or neither) would close open asks or strand closed ones."""
+        self.j.record(CH, "1.1", text="ask one")
+        self.j.record(CH, "2.2", text="ask two")
+        self.j.mark_responded(CH, "1.1", response_key="abc123")
+        self.assertEqual([r["ts"] for r in self.j.answered()], ["1.1"])
+        self.assertEqual([r["ts"] for r in self.j.unanswered()], ["2.2"])
+        self.assertEqual(len(self.j.answered("C_ELSEWHERE")), 0)
+
     def test_export_emits_one_line_per_distinct_message(self):
         for _ in range(4):
             self.j.record(CH, "1.1", text="dup")

@@ -244,6 +244,43 @@ class DoctorDocTest(unittest.TestCase):
                           "config failures go back to surfacing as stack traces")
 
 
+class ReferenceSchedulerDocTest(unittest.TestCase):
+    """ENH-6: the loop is where the incumbent's hardest bugs lived, and the reference
+    scheduler only transfers those lessons if adopters are TOLD it exists and how to
+    run it. The docs must show the command, and the 'no scheduler' framing that was
+    true for months must not quietly return (the made-vague-again class)."""
+
+    def test_the_quickstart_documents_the_run_command(self):
+        text = QUICKSTART.read_text()
+        self.assertIn("python3 scripts/scheduler.py --config settings.json", text,
+                      "the quickstart never shows how to run the reference scheduler — "
+                      "adopters go back to writing their own loop, bugs included")
+        self.assertIn("--once", text,
+                      "the cron-friendly single-cycle mode vanished from the doc — "
+                      "overlapping cron fires racing one state dir is the exact "
+                      "incident the guard exists for")
+
+    def test_the_stale_no_scheduler_claim_cannot_return(self):
+        self.assertNotIn("no scheduler in this repo", QUICKSTART.read_text(),
+                         "the quickstart reverted to claiming no scheduler ships "
+                         "while scripts/scheduler.py is implemented and tested")
+        self.assertNotIn("no scheduler daemon", README.read_text(),
+                         "README.md reverted to claiming no scheduler ships "
+                         "while scripts/scheduler.py is implemented and tested")
+
+    def test_the_runbook_covers_the_second_instance_refusal(self):
+        """The one scheduler failure an operator WILL meet at 2am: exit 3, refused.
+        The runbook must say what it means and must not teach the reflex fix —
+        deleting the lock — that puts two loops on one state directory."""
+        runbook = RUNBOOK.read_text()
+        self.assertIn("scheduler.lock", runbook,
+                      "the runbook never mentions the scheduler lock — the refusal "
+                      "message points at a file the docs do not explain")
+        self.assertRegex(runbook, r"(?is)never\s+delete\s+the\s+lock",
+                         "the runbook no longer warns against deleting the lock — "
+                         "that reflex is how two loops end up racing one cursor")
+
+
 class FrontDoorTest(unittest.TestCase):
     """ENH-19: the front door must not UNDERSTATE what ships. The adoption run found a
     newcomer reading README.md concluded there was nothing to adopt — phases marked

@@ -196,14 +196,55 @@ poll reads the channel's full visible history (no cursor yet), so give a busy ch
 minute. Re-run the command and the count drops to 0 — the cursor survived, exactly like
 the dry run in step 5.
 
+## 8. Keep it running — the reference scheduler
+
+`scripts/first-poll.py` runs exactly one cycle. The reference scheduler keeps that cycle
+running, with the loop bugs an adopter would otherwise re-learn already fixed
+(`core/schedule.py` carries the incident behind each one): only **one instance per state
+directory** — a second refuses with exit 3 instead of racing the first; the cursor
+commits only **after** the journal, so a crash mid-cycle duplicates and the journal
+absorbs it, never loses; idle backoff widens the cadence for a quiet channel but can
+**never suppress owed work**; and unattended owed work pages once per state *change*,
+not once per cycle.
+
+```sh
+python3 scripts/scheduler.py --config settings.json          # run until Ctrl-C
+python3 scripts/scheduler.py --config settings.json --once   # one guarded cycle (cron)
+```
+
+Every classified message is **routed** and the destination recorded on its journal row:
+asks (EXEC-REQUEST, COMMITMENT-ASK, QUESTION, ATTACHMENT-ONLY) become owed work that
+stays visible until answered or attended, STATEMENTs are logged. `OPERATOR:` lines on
+stdout are the escalations — wire them to whatever your operator actually reads, never
+to a send path (the script does not even import the outbox; a test enforces that).
+
+To watch the full wiring fire on the fake adapter, start from a fresh state directory
+(the step-6 rule — the cursor is already past the demo message):
+
+```sh
+rm -rf state && python3 scripts/scheduler.py --config settings.json --once --seed-demo
+```
+
+The demo ask journals as a QUESTION routed `owed:answer`, and because no live process is
+driving it the same cycle prints `OPERATOR: DEGRADED: owed-work-unattended` — the
+goal-triggered edge firing with **no new inbound message**. Owed work closes when the
+ask's journal row is marked responded, when you close it yourself (`owed.close(id)`),
+or goes quiet while a recorded driver is verifiably alive
+(`owed.attach_driver(id, "pid:1234")` — a pid, because a plan written to a file is not
+a driver; only a live process makes progress).
+
 ## What to expect next
 
-- `state/journal.db` — one row per distinct inbound message, with its classification. Replay
-  is safe: re-reading a window never duplicates a row.
+- `state/journal.db` — one row per distinct inbound message, with its classification and
+  the destination the loop routed it to. Replay is safe: re-reading a window never
+  duplicates a row.
 - `state/outbox.db` — every send attempt with its state (`INTENT` → `SENT` → `VERIFIED` →
   `COMMITTED`) and any staged drafts awaiting a human. Created on the first staged or sent
   draft — a read-only first poll leaves no outbox, correctly.
 - `state/messages.db` — the message store.
+- `state/owed.db`, `state/escalate.db`, `state/scheduler.lock` — created by the reference
+  scheduler: the owed-work registry, the escalation edge state, and the single-instance
+  lock (held by the running process; released automatically when it dies).
 
 ## Honest limits
 
@@ -231,8 +272,12 @@ the dry run in step 5.
   Slack does not publish the reduced values, so the engine discovers each method's real
   limit at runtime from `Retry-After` (`core/ratelimit.py`) — a throttled poller slows
   down honestly instead of dropping messages.
-- There is **no scheduler in this repo**. `scripts/first-poll.py` runs exactly one cycle;
-  the engine gives you poll/classify/journal/outbox primitives and you invoke them from
-  cron, a loop, or your own supervisor.
+- The reference scheduler (`scripts/scheduler.py`, step 8) is a single-process loop, not
+  a daemon manager: it does not fork, detach, or restart itself — run it under your own
+  supervisor (cron with `--once`, a service unit, a container), and let a crash restart
+  it; the cursor-commit ordering is what makes that restart safe. Its single-instance
+  guard is a sqlite lock on the state directory and is only trustworthy on a **local**
+  filesystem — two hosts sharing state over NFS can both acquire it. One state
+  directory, one host, one loop.
 - CI on the origin repo is currently disabled by account billing, so the gates run via local
   git hooks. Verify they are installed on your clone (`scripts/install-hooks.sh`).
