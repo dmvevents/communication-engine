@@ -283,17 +283,24 @@ is *reported* missing — never silently created, never rendered as a healthy ze
 
 ## Honest limits
 
-- Three adapters ship: **`fake`** (in-memory dry-run), **`slack`** — **read-only on purpose**
+- Four adapters ship: **`fake`** (in-memory dry-run), **`slack`** — **read-only on purpose**
   (poll/resolve/health; it exposes no send path at any layer, and `tests/test_slack_adapter.py`
-  fails if one appears) — and **`slack_socket`** (Socket Mode push ingestion, equally
-  read-only). Push is for latency only: Socket Mode can MISS events, so the socket adapter is
+  fails if one appears) — **`slack_socket`** (Socket Mode push ingestion, equally
+  read-only; push is for latency only: Socket Mode can MISS events, so the socket adapter is
   never the truth — run `scripts/push-poll-parity.py` against the polling store continuously
-  before trusting it, and know that **it has not yet run against a live workspace** (that
-  needs an operator-created app-level token; see `channels/slack_socket/README.md`).
-  `telegram` remains a contract stub (design README, no `adapter.py` — the engine refuses it
-  by name until one lands). "Multi-channel" is so far proven as a *mechanism* — a new channel
-  type is a directory drop with zero `core/` changes (`tests/test_extensibility.py`) — plus
-  one real platform (two ingestion paths for it), not two platforms.
+  before trusting it, and know that **it has not yet run against a live workspace**; that
+  needs an operator-created app-level token, see `channels/slack_socket/README.md`) — and
+  **`telegram`** (bot-API polling, read-only, the first non-Slack platform). Telegram bots
+  have **no history API**: `getUpdates` is a queue whose offset permanently acknowledges
+  everything below it, so the adapter makes exactly one destructive read per poll at the
+  engine's committed cursor, watches exactly **one chat per instance**, and can never supply
+  the platform snapshot — parity against a Telegram store is **permanently fail-closed**
+  (every miss reads ENGINE_LOST), which `core/parity.py` and the doctor declare by name
+  rather than leave to be misread as a read-path defect (`channels/telegram/README.md`;
+  `tests/test_telegram_adapter.py` fails if a send path or a stub snapshot appears). It has
+  **not yet run against a live bot**. "Multi-channel" is now proven as a *mechanism* — a new
+  channel type is a directory drop with zero `core/` changes (`tests/test_extensibility.py`)
+  — plus two real platforms (three ingestion paths).
 - **Read parity against an existing system has not been demonstrated** over a long window
   (gate G1). If you are replacing an incumbent, run both and diff before trusting this one.
   The diff is shipped, not homework — `core/parity.py` opens the incumbent's own database

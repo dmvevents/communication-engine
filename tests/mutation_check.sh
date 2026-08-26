@@ -985,10 +985,12 @@ run_mutation "example: first instance demands credentials for the no-network dry
   "test_portability"
 
 # ENH-21 — the whole-file property: EVERY instance must name a shipped adapter, or the
-# copy step is unloadable however many env vars the adopter exports.
+# copy step is unloadable however many env vars the adopter exports. (The mutant name
+# was "telegram" until ENH-25 shipped it and the mutation went stale-green — the
+# instrument, not the property; any name with no channels/<name>/adapter.py works.)
 run_mutation "example: a later instance names an unshipped adapter" \
   "settings.example.json" \
-  "('\"adapter\": \"slack\"', '\"adapter\": \"telegram\"')" \
+  "('\"adapter\": \"slack\"', '\"adapter\": \"outlook\"')" \
   "test_portability"
 
 # ---------------------------------------------------------------------------
@@ -1834,6 +1836,118 @@ run_mutation "dashboard.py (shell): raw divergence counts lead the parity tab ag
   "scripts/dashboard.py" \
   "('            st.markdown(lead)\n            if breakdown:', '            st.markdown(raw_note, unsafe_allow_html=True)\n            st.markdown(lead)\n            if breakdown:')" \
   "test_dashboard"
+
+# ENH-25 — THE telegram gap-free property: the offset sent is exactly the cursor the
+# engine committed (after the journal write). One update past it acknowledges — destroys
+# at the platform — a message that was never made durable.
+run_mutation "telegram: offset overshoots the committed cursor" \
+  "channels/telegram/adapter.py" \
+  "('            params[\"offset\"] = cursor', '            params[\"offset\"] = str(int(cursor) + 1)')" \
+  "test_telegram_adapter"
+
+# ENH-25 — in-poll pagination advances the offset past batches the engine has not
+# committed; a crash mid-drain loses them at the platform, unrecoverably.
+run_mutation "telegram: poll drains the queue with an in-poll offset advance" \
+  "channels/telegram/adapter.py" \
+  "('        payload = self._api(\"getUpdates\", **params)\n        batch = payload.get(\"result\") or []', '        payload = self._api(\"getUpdates\", **params)\n        batch = list(payload.get(\"result\") or [])\n        while batch and len(batch) % PAGE_LIMIT == 0:\n            params[\"offset\"] = str(batch[-1][\"update_id\"] + 1)\n            more = self._api(\"getUpdates\", **params).get(\"result\") or []\n            if not more:\n                break\n            batch.extend(more)')" \
+  "test_telegram_adapter"
+
+# ENH-25 — a junk cursor must be refused BEFORE any I/O: a getUpdates call with a
+# guessed offset is itself the destructive act.
+run_mutation "telegram: a junk cursor is guessed at instead of refused" \
+  "channels/telegram/adapter.py" \
+  "('        if cursor is not None and not _CHAT_ID.fullmatch(str(cursor)):', '        if False:')" \
+  "test_telegram_adapter"
+
+# ENH-25 — deny-by-default at the transport funnel; without it the no-send property is
+# one convenience wrapper away from being lost (the channels/slack lesson).
+run_mutation "telegram: the read allowlist stops being enforced" \
+  "channels/telegram/adapter.py" \
+  "('        if method not in READ_METHODS:\n            raise ReadOnlyViolation(method)', '        pass')" \
+  "test_telegram_adapter"
+
+# ENH-25 — Telegram's 429 wait lives in the BODY (parameters.retry_after); a helper
+# that only reads headers silently invents a wait on this platform.
+run_mutation "telegram: 429 wait read from the header instead of the body" \
+  "channels/telegram/adapter.py" \
+  "('            wait = (payload.get(\"parameters\") or {}).get(\"retry_after\")\n            if wait is None:\n                wait = _header(headers, \"Retry-After\", \"1\")', '            wait = _header(headers, \"Retry-After\", \"1\")')" \
+  "test_telegram_adapter"
+
+# ENH-25 — an unlabelled 429 collapses ENH-1's (instance, method) back-off scope.
+run_mutation "telegram: 429 loses the method name" \
+  "channels/telegram/adapter.py" \
+  "('            ex = RateLimited(wait, method=method)', '            ex = RateLimited(wait)')" \
+  "test_telegram_adapter"
+
+# ENH-25 — one chat per instance: a second chat sharing the bot queue lets one chat's
+# committed cursor acknowledge the other's un-journaled messages.
+run_mutation "telegram: a second chat is silently accepted" \
+  "channels/telegram/adapter.py" \
+  "('        if len(chats) != 1:', '        if len(chats) > 99:')" \
+  "test_telegram_adapter"
+
+# ENH-25 — ts identity: message.date is whole seconds, so burst messages would merge
+# into one store row (PRIMARY KEY channel_type, channel_id, ts).
+run_mutation "telegram: ts becomes the wall-clock second" \
+  "channels/telegram/adapter.py" \
+  "('            \"ts\": str(m[\"message_id\"]),', '            \"ts\": str(m[\"date\"]),')" \
+  "test_telegram_adapter"
+
+# ENH-25 — retrievable_ts must stay ABSENT: a stub snapshot marks every still-real
+# message 'deleted upstream' — the one direction that hides a real loss — and
+# un-declares the ENH-27 capability gap.
+run_mutation "telegram: a stub snapshot capability appears" \
+  "channels/telegram/adapter.py" \
+  "('    def resolve(self, ref):', '    def retrievable_ts(self, channel, oldest=None, latest=None):\n        return set()\n\n    def resolve(self, ref):')" \
+  "test_telegram_adapter"
+
+# ENH-25 — the ingest set is pinned at the PLATFORM (allowed_updates); without it the
+# queue holds kinds the adapter drops, and the next ack destroys them unread.
+run_mutation "telegram: allowed_updates no longer pins the ingest set" \
+  "channels/telegram/adapter.py" \
+  "('        params = {\"limit\": PAGE_LIMIT, \"timeout\": 0,\n                  \"allowed_updates\": json.dumps(list(INGEST_UPDATES))}', '        params = {\"limit\": PAGE_LIMIT, \"timeout\": 0}')" \
+  "test_telegram_adapter"
+
+# ENH-25/ENH-4 — attachments are content; dropping them turns an image-only message
+# into an empty row the classifier acknowledges and forgets.
+run_mutation "telegram: attachments dropped at normalization" \
+  "channels/telegram/adapter.py" \
+  "('            \"attachments\": _attachments(m),', '            \"attachments\": [],')" \
+  "test_telegram_adapter"
+
+# ENH-25 — attachment urls stay None: Telegram file URLs embed the bot token, and the
+# url field is the seam through which a credential would enter every adopter's store.
+run_mutation "telegram: attachment url minted from the platform handle" \
+  "channels/telegram/adapter.py" \
+  "('                        \"mimetype\": media.get(\"mime_type\"), \"url\": None})', '                        \"mimetype\": media.get(\"mime_type\"), \"url\": media.get(\"file_id\")})')" \
+  "test_telegram_adapter"
+
+# ENH-25 — watched-channels rule: the bot queue carries every chat the bot is in, and
+# ingesting foreign rows stores channels the instance never declared.
+run_mutation "telegram: foreign chats are ingested" \
+  "channels/telegram/adapter.py" \
+  "('            if str((m.get(\"chat\") or {}).get(\"id\")) == self.channels[0]:\n                messages.append(self._normalize(update, m))', '            messages.append(self._normalize(update, m))')" \
+  "test_telegram_adapter"
+
+# ENH-25 — contract rule 5: a health check that can only pass is a defect (the reason
+# this repo exists, docs/PROVENANCE.md).
+run_mutation "telegram: health reports auth_ok on a rejected token" \
+  "channels/telegram/adapter.py" \
+  "('            return {\"reachable\": True, \"auth_ok\": False,\n                    \"detail\": f\"getMe failed: {ex.error}{detail_suffix}\"}', '            return {\"reachable\": True, \"auth_ok\": True,\n                    \"detail\": f\"getMe failed: {ex.error}{detail_suffix}\"}')" \
+  "test_telegram_adapter"
+
+# ENH-25 — the doc's telegram headline: without the no-history finding, the first
+# fail-closed parity run gets misread as a read-path defect (the R8 misreading).
+run_mutation "docs: telegram's no-history-API limit vanishes" \
+  "docs/QUICKSTART.md" \
+  "('have **no history API**', 'have **a queue-shaped API**')" \
+  "test_docs"
+
+# ENH-25 — and the stated consequence: parity can NEVER go green on deleted history.
+run_mutation "docs: the permanently-fail-closed parity claim vanishes" \
+  "docs/QUICKSTART.md" \
+  "('**permanently fail-closed**', '**conservative at first**')" \
+  "test_docs"
 
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"

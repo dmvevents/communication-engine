@@ -16,7 +16,7 @@ directions). Adapters live one directory per platform, all implementing
 | `fake` | in-memory contract adapter — drives the quickstart dry-run and the fault-injection tests |
 | `slack` | read-only Web API polling (poll / resolve / health) — no send path at any layer |
 | `slack_socket` | Socket Mode push ingestion — read-only, legitimized by a continuous push-vs-poll parity watch |
-| `telegram` | stub — directory and notes only, no adapter yet |
+| `telegram` | read-only bot-API polling — the first non-Slack platform; no history API upstream, so one destructive read per poll at the committed cursor, one chat per instance, no send path at any layer |
 
 What does NOT ship is listed where an adopter acts: the quickstart's honest-limits section.
 Notably there is no live send path (the outbox ladder is complete, but only the `fake`

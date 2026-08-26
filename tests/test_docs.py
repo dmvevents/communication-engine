@@ -82,30 +82,44 @@ class HonestLimitsTest(unittest.TestCase):
                           "while still being true")
 
     def test_the_shipped_adapter_claim_matches_the_filesystem(self):
-        """The limits section claims exactly `fake` + `slack` + `slack_socket` ship. Check
-        the claim against reality: when another adapter lands, THIS test fails, forcing the
-        limits section (and this assertion) to be updated in the same change — the doc
-        cannot drift quietly. (It fired exactly as designed when `slack` landed, and again
-        when `slack_socket` landed.)"""
+        """The limits section claims exactly `fake` + `slack` + `slack_socket` +
+        `telegram` ship. Check the claim against reality: when another adapter lands,
+        THIS test fails, forcing the limits section (and this assertion) to be updated
+        in the same change — the doc cannot drift quietly. (It fired exactly as
+        designed when `slack` landed, again when `slack_socket` landed, and again when
+        `telegram` landed.)"""
         self.assertIn("fake", self.limits,
                       "the limits section no longer names the fake adapter")
         self.assertIn("slack", self.limits,
                       "the limits section no longer names the slack adapter")
         self.assertIn("slack_socket", self.limits,
                       "the limits section no longer names the socket-mode adapter")
+        self.assertIn("telegram", self.limits,
+                      "the limits section no longer names the telegram adapter")
         self.assertIn("read-only", self.limits,
-                      "the slack adapters' defining limit — read-only, no send path — "
+                      "the adapters' defining limit — read-only, no send path — "
                       "vanished from the doc while still being true")
         self.assertIn("push-poll-parity", self.limits,
                       "the socket adapter's defining limit — push can MISS events, so it "
                       "is only trustworthy under the continuous parity watch — vanished "
                       "from the doc while still being true")
+        # \s+ joins because the doc is hard-wrapped (the ThreadPolicyDocTest lesson).
+        self.assertRegex(
+            self.limits, r"(?is)no\s+history\s+API",
+            "telegram's defining limit vanished: bots cannot re-read acknowledged "
+            "updates, and an adopter who does not know that will read the fail-closed "
+            "parity verdict as a read-path defect — the exact R8 misreading")
+        self.assertRegex(
+            self.limits, r"(?is)permanently\s+fail-closed",
+            "the doc no longer says parity against a Telegram store can never go "
+            "green on deleted history — the one expectation that must be set before "
+            "the first parity run, not after")
         shipped = set(discover_adapters(ROOT / "channels"))
         self.assertEqual(
-            shipped, {"fake", "slack", "slack_socket"},
+            shipped, {"fake", "slack", "slack_socket", "telegram"},
             f"channels/ now ships {sorted(shipped)} but docs/QUICKSTART.md's honest-limits "
-            "section still claims fake + slack (read-only) + slack_socket — rewrite the "
-            "limits section, then update this assertion")
+            "section still claims fake + slack (read-only) + slack_socket + telegram — "
+            "rewrite the limits section, then update this assertion")
 
     def test_the_distribution_model_limit_states_the_exemption_and_the_risk(self):
         """ENH-15: since 2025-05-29 the platform throttles conversations.history and
