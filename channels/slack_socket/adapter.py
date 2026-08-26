@@ -26,6 +26,12 @@ Design consequences, each pinned by tests/test_socket_adapter.py:
   limits); pings are answered and reconnects happen inside that pump. The buffer is
   pruned only at the cursor the ENGINE hands back — the one durable acknowledgement —
   so a re-poll with the same cursor may duplicate, never lose (channels/CONTRACT.md);
+* an `app_rate_limited` payload (the Events API's 30k deliveries/app/workspace/hour
+  ceiling — overflow raises an EVENT, not an error) is a first-class LOSS signal
+  (ENH-16): it records a delivery-gap window, `health()` FAILS (`complete: False`)
+  while any window is unrecovered, `recovery_due()` demands the completeness poll
+  regardless of backoff (R3's rule), and only `mark_recovered(completed_at)` with a
+  poll completion past the window closes it;
 * there is no send surface at any layer, same as the polling adapter (ingestion only);
 * the app-level token and channel set arrive as `env:NAME` references via config
   (`auth: {"app_token": ..., "channels": ...}`, comma-separated ids), and a 429 on
@@ -318,6 +324,7 @@ class Adapter:
         self._conn = None
         self._buffer = []           # normalized messages awaiting an engine cursor
         self._last_disconnect = None
+        self._gaps = []             # platform-admitted delivery drops, unrecovered
 
     # ---- contract surface --------------------------------------------------
     def capabilities(self):
@@ -360,21 +367,56 @@ class Adapter:
     def health(self):
         """CAN fail (contract rule 5): a dead app token or unreachable platform is
         reported, not absorbed. Also surfaces the last disconnect reason and any
-        active 429 hold, so 'push went quiet' is diagnosable from health output."""
-        detail_suffix = self._hold_detail()
+        active 429 hold, so 'push went quiet' is diagnosable from health output.
+
+        `complete` (ENH-16) is False while any platform-admitted delivery gap is
+        unrecovered — a distinct failing state from reachable/auth_ok, because the
+        socket is up and the token is fine; the platform just admitted it dropped
+        deliveries. Filing that as detail is how an engine loses messages while
+        looking healthy."""
+        detail_suffix = self._hold_detail() + self._gap_detail()
+        complete = not self._gaps
         if self._conn is None:
             try:
                 self._connect_socket(timeout=5.0)
             except ApiError as ex:
-                return {"reachable": True, "auth_ok": False,
+                return {"reachable": True, "auth_ok": False, "complete": complete,
                         "detail": f"{OPEN_METHOD} failed: {ex.error}{detail_suffix}"}
             except OSError as ex:
-                return {"reachable": False, "auth_ok": False,
+                return {"reachable": False, "auth_ok": False, "complete": complete,
                         "detail": f"unreachable: {ex}{detail_suffix}"}
         last = f"; last drop: {self._last_disconnect}" if self._last_disconnect else ""
-        return {"reachable": True, "auth_ok": True,
+        return {"reachable": True, "auth_ok": True, "complete": complete,
                 "detail": f"socket up; {len(self._buffer)} buffered"
                           f"{last}{detail_suffix}"}
+
+    # ---- delivery gaps (ENH-16) ---------------------------------------------
+    def delivery_gaps(self):
+        """Unrecovered platform-admitted drop windows, oldest first. Feed this to
+        core.checks.delivery_gap_check so the registry FAILS while any is open."""
+        return [dict(g) for g in self._gaps]
+
+    def recovery_due(self):
+        """True while any admitted gap is unrecovered: the completeness poll (the
+        gap-free cursored truth side) is due NOW. Same rule as owed work (R3) —
+        backoff may delay routine polling, never recovery of an admitted loss."""
+        return bool(self._gaps)
+
+    def mark_recovered(self, completed_at):
+        """Close gaps proven covered: `completed_at` is the epoch time a gap-free
+        completeness poll COMPLETED. Cursored polling covers all history up to its
+        completion whatever it found, so completion time — not a message watermark,
+        which never advances on a quiet channel — is the recovery evidence. A gap
+        whose window ends after `completed_at` stays open: that poll cannot have
+        covered it. Unknown-window gaps close on any completed poll, which in the
+        poll-then-mark call order is always one that started after the admission.
+        Returns how many gaps closed."""
+        completed_at = float(completed_at)
+        keep = [g for g in self._gaps
+                if g["end"] is not None and g["end"] > completed_at]
+        closed = len(self._gaps) - len(keep)
+        self._gaps = keep
+        return closed
 
     # ---- socket-mode protocol ------------------------------------------------
     def _pump(self):
@@ -412,10 +454,22 @@ class Adapter:
 
     def _handle(self, obj):
         kind = obj.get("type")
+        if kind == "app_rate_limited":
+            # The documented shape arrives inside an events_api envelope, but an
+            # admission of loss is never ignorable whatever the wrapper looks like.
+            self._record_gap(obj)
+            return
         if kind != "events_api":
             return              # hello / future protocol messages: not ours to ack
-        event = (obj.get("payload") or {}).get("event") or {}
-        self._maybe_ingest(event)
+        payload = obj.get("payload") or {}
+        if payload.get("type") == "app_rate_limited":
+            # ENH-16: above 30k deliveries/app/workspace/hour the platform STOPS
+            # DELIVERING and says so with this payload instead of failing loudly.
+            # Before ENH-16 this fell through _maybe_ingest (no `event` key) and was
+            # acked away — the engine lost messages while health() answered healthy.
+            self._record_gap(payload)
+        else:
+            self._maybe_ingest(payload.get("event") or {})
         envelope_id = obj.get("envelope_id")
         # Ack AFTER buffering: an unacked envelope is re-delivered, so a crash in
         # between duplicates (absorbed by the store, R9) instead of losing.
@@ -436,6 +490,24 @@ class Adapter:
         if any(m["channel_id"] == channel and m["ts"] == ts for m in self._buffer):
             return              # envelope retries re-deliver the same event
         self._buffer.append(self._normalize(channel, event))
+
+    def _record_gap(self, sig):
+        """ENH-16: one admitted drop window per platform-named minute. A missing or
+        unparseable minute_rate_limited still records (start=None): 'unknown window'
+        is an admission of loss, never a reason to shrug."""
+        try:
+            start = float(sig["minute_rate_limited"])
+        except (KeyError, TypeError, ValueError):
+            start = None
+        if any(g["start"] == start for g in self._gaps):
+            return              # envelope retries re-deliver the same admission
+        self._gaps.append({
+            "start": start,
+            "end": None if start is None else start + 60.0,
+            "detail": "app_rate_limited: the platform stopped delivering events"
+                      + ("" if start is None
+                         else f" during the minute at {start:.0f}"),
+        })
 
     def _connect_socket(self, timeout=30.0):
         # A Socket Mode ticket is single-use: every (re)connect must mint a fresh
@@ -520,3 +592,12 @@ class Adapter:
             return ""
         holds = ", ".join(f"{m} ready in {s:.0f}s" for m, s in sorted(active.items()))
         return f"; rate-limit backoff: {holds}"
+
+    def _gap_detail(self):
+        if not self._gaps:
+            return ""
+        windows = ", ".join(
+            "unknown window" if g["start"] is None
+            else f"[{g['start']:.0f}, {g['end']:.0f})" for g in self._gaps)
+        return (f"; DELIVERY GAP app_rate_limited: {len(self._gaps)} unrecovered "
+                f"window(s) {windows} — completeness poll due")

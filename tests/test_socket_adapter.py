@@ -404,6 +404,138 @@ class RateLimitAndHealthTest(SocketAdapterTestCase):
         self.assertFalse(h["auth_ok"])
 
 
+def rate_limited_payload(minute=1518467820):
+    """The Events API request body Slack substitutes for event_callback when the
+    30,000 deliveries/app/workspace/hour ceiling is hit (ENH-16)."""
+    return {"type": "app_rate_limited", "team_id": "T_X", "api_app_id": "A_X",
+            "minute_rate_limited": minute}
+
+
+def rate_limited_envelope(envelope_id="e-rl", minute=1518467820):
+    return {"type": "events_api", "envelope_id": envelope_id,
+            "payload": rate_limited_payload(minute)}
+
+
+class AppRateLimitedTest(SocketAdapterTestCase):
+    """ENH-16: app_rate_limited is a first-class LOSS signal, never noise.
+
+    Above 30,000 event deliveries per workspace per app per hour, the platform stops
+    delivering and says so with an app_rate_limited payload — overflow raises an EVENT
+    rather than failing loudly. Before this test class, the adapter acked that payload
+    and threw it away (`_handle` reached for `payload.event`, found nothing, ingested
+    nothing): the engine lost messages while health() kept answering healthy. The
+    protocol pinned here: the signal records a delivery-gap window, health FAILS while
+    any window is unrecovered, `recovery_due()` demands the completeness poll, and
+    only evidence that a gap-free poll COMPLETED past the window closes it.
+    """
+
+    MINUTE = 1518467820
+
+    def gapped(self, frames=None):
+        conn = FakeConn(frames if frames is not None
+                        else [rate_limited_envelope(minute=self.MINUTE)])
+        a = self.make([open_ok()], [conn])
+        a.poll(None)
+        return a, conn
+
+    def test_an_app_rate_limited_envelope_is_recorded_and_still_acked(self):
+        a, conn = self.gapped()
+        gaps = a.delivery_gaps()
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["start"], float(self.MINUTE))
+        self.assertEqual(gaps[0]["end"], float(self.MINUTE) + 60.0,
+                         "the platform names the MINUTE it dropped deliveries in — "
+                         "the gap window is that minute")
+        # Unacked envelopes are re-delivered then dropped; the admission must be
+        # acked like any other envelope or the platform gives up on us entirely.
+        self.assertEqual(conn.sent, [{"envelope_id": "e-rl"}])
+
+    def test_a_bare_app_rate_limited_frame_is_recorded_too(self):
+        """Defensive: the admission arrives wrapped in an events_api envelope, but a
+        loss signal is never ignorable whatever the wrapper looks like."""
+        a, conn = self.gapped([rate_limited_payload(self.MINUTE)])
+        self.assertEqual(len(a.delivery_gaps()), 1)
+        self.assertEqual(conn.sent, [], "a bare frame has no envelope_id to ack")
+
+    def test_repeat_admissions_for_the_same_minute_record_one_gap(self):
+        """Envelope re-delivery replays the same admission; distinct minutes are
+        distinct losses."""
+        a, _ = self.gapped([rate_limited_envelope("e1", self.MINUTE),
+                            rate_limited_envelope("e2", self.MINUTE),
+                            rate_limited_envelope("e3", self.MINUTE + 60)])
+        self.assertEqual([g["start"] for g in a.delivery_gaps()],
+                         [float(self.MINUTE), float(self.MINUTE) + 60.0])
+
+    def test_messages_keep_flowing_while_a_gap_is_open(self):
+        """The gap means SOME deliveries were dropped, not that the socket is down —
+        refusing survivors would turn a partial loss into a total one."""
+        a, _ = self.gapped([envelope("e1", message_event("1.0")),
+                            rate_limited_envelope(minute=self.MINUTE),
+                            envelope("e2", message_event("2.0"))])
+        msgs, _ = a.poll(None)
+        self.assertEqual([m["ts"] for m in msgs], ["1.0", "2.0"])
+        self.assertEqual(len(a.delivery_gaps()), 1)
+
+    def test_health_fails_while_a_gap_is_unrecovered(self):
+        """THE acceptance property: before ENH-16 the engine lost messages while
+        LOOKING healthy. An unrecovered admitted gap is a failing health state."""
+        a, _ = self.gapped()
+        h = a.health()
+        self.assertFalse(h["complete"])
+        self.assertIn("app_rate_limited", h["detail"])
+        self.assertIn(str(self.MINUTE), h["detail"],
+                      "the window must be named or the gap is undiagnosable")
+        # It is a LOSS signal, not an auth or reachability signal — misfiling it
+        # would send the operator to rotate a perfectly good token.
+        self.assertTrue(h["reachable"])
+        self.assertTrue(h["auth_ok"])
+
+    def test_health_is_complete_when_no_gap_was_ever_admitted(self):
+        a = self.make([open_ok()], [FakeConn([])])
+        h = a.health()
+        self.assertTrue(h["complete"])
+
+    def test_recovery_due_only_while_a_gap_is_open(self):
+        """The trigger for the completeness poll: while a gap is open the poll is due
+        NOW — same rule as owed work (R3), backoff never suppresses it."""
+        a = self.make([open_ok()], [FakeConn([])])
+        self.assertFalse(a.recovery_due())
+        a2, _ = self.gapped()
+        self.assertTrue(a2.recovery_due())
+        a2.mark_recovered(self.MINUTE + 60)
+        self.assertFalse(a2.recovery_due())
+
+    def test_a_completed_poll_past_the_window_recovers_the_gap(self):
+        a, _ = self.gapped()
+        self.assertEqual(a.mark_recovered(self.MINUTE + 60), 1)
+        self.assertEqual(a.delivery_gaps(), [])
+        self.assertTrue(a.health()["complete"])
+
+    def test_a_poll_that_finished_before_the_window_closed_recovers_nothing(self):
+        """Recovery demands EVIDENCE: a completeness poll that completed before the
+        gap window ended cannot have covered it. Clearing the gap on any poll — or on
+        no poll — is exactly the logged-and-forgotten behaviour ENH-16 bans."""
+        a, _ = self.gapped()
+        self.assertEqual(a.mark_recovered(self.MINUTE + 30), 0)
+        self.assertEqual(len(a.delivery_gaps()), 1)
+        self.assertFalse(a.health()["complete"])
+        self.assertTrue(a.recovery_due())
+
+    def test_a_windowless_admission_still_fails_health_until_the_next_completed_poll(self):
+        """A malformed admission (no minute_rate_limited) is still an admission of
+        loss — 'unknown window' must not read as 'no window'. A gap-free cursored
+        poll covers all history up to its completion, so the next completed poll
+        recovers it."""
+        a, _ = self.gapped([{"type": "events_api", "envelope_id": "e-rl",
+                             "payload": {"type": "app_rate_limited"}}])
+        gaps = a.delivery_gaps()
+        self.assertEqual(len(gaps), 1)
+        self.assertIsNone(gaps[0]["start"])
+        self.assertFalse(a.health()["complete"])
+        self.assertEqual(a.mark_recovered(0.0), 1)
+        self.assertTrue(a.health()["complete"])
+
+
 # ---------------------------------------------------------------------------
 # RFC 6455 frame layer — tested against hand-built byte sequences.
 # ---------------------------------------------------------------------------

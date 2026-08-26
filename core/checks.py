@@ -133,6 +133,36 @@ def watcher_source_check(name: str, source_desc: str,
     return Verdict.passed(name, inspected=1, detail=f"source present: {source_desc}")
 
 
+def _gap_window(gap: dict) -> str:
+    start, end = gap.get("start"), gap.get("end")
+    if start is None:
+        return "unknown window"
+    return f"[{start:.0f}, {end:.0f})"
+
+
+def delivery_gap_check(name: str, gaps: list) -> Verdict:
+    """ENH-16: a push platform that ADMITS dropping deliveries must fail, loudly.
+
+    Slack's Events API ceiling is 30,000 deliveries per workspace per app per hour;
+    overflow raises an app_rate_limited EVENT rather than an error, so an engine that
+    files it as a log line loses messages while every check stays green. `gaps` is a
+    push adapter's unrecovered-gap report (dicts with start/end epoch seconds, either
+    may be None for a malformed admission — unknown window is still a loss). The FAIL
+    holds until a completeness poll proves the window covered and the adapter drops
+    the gap from its report.
+    """
+    if gaps:
+        windows = ", ".join(_gap_window(g) for g in gaps)
+        return Verdict.failed(
+            name, f"push platform admitted dropping deliveries — {len(gaps)} "
+                  f"unrecovered gap window(s): {windows}; a completeness poll past "
+                  "each window is due NOW (backoff never defers it, same rule as "
+                  "owed work)",
+            inspected=len(gaps))
+    return Verdict.passed(name, inspected=1,
+                          detail="no admitted delivery gaps outstanding")
+
+
 def freshness_check(name: str, age_s: float | None, budget_s: float | None,
                     action_only_log: bool = False) -> Verdict:
     """Age-vs-budget, with the action-only-log trap made explicit.

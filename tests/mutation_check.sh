@@ -1048,6 +1048,64 @@ run_mutation "docs: the distribution-model risk made vague again" \
   "('the poller is throttled by the platform, not by the engine', 'the poller may run slower')" \
   "test_docs"
 
+# ---------------------------------------------------------------------------
+# ENH-16 — app_rate_limited as a first-class loss signal. The Events API ceiling is
+# 30,000 deliveries/app/workspace/hour; overflow raises an EVENT, not an error. Each
+# mutation below re-creates one way the engine could go back to losing messages while
+# looking healthy: the admission ignored, health passing over it, recovery without
+# poll evidence, or the completeness-poll trigger going quiet.
+# ---------------------------------------------------------------------------
+
+# ENH-16 — the defect verbatim: the enveloped admission falls through to _maybe_ingest
+# (no `event` key), gets acked, and is forgotten.
+run_mutation "socket: an app_rate_limited envelope is acked and forgotten again" \
+  "channels/slack_socket/adapter.py" \
+  "('        if payload.get(\"type\") == \"app_rate_limited\":', '        if False:')" \
+  "test_socket_adapter"
+
+# ENH-16 — the defensive bare-frame path: a loss admission outside the envelope wrapper
+# must not become noise.
+run_mutation "socket: a bare app_rate_limited frame is noise again" \
+  "channels/slack_socket/adapter.py" \
+  "('        if kind == \"app_rate_limited\":', '        if False:')" \
+  "test_socket_adapter"
+
+# ENH-16 — envelope re-delivery replays the same admission; without the dedupe one
+# dropped minute inflates into a pile of phantom gaps.
+run_mutation "socket: repeated admissions pile up as distinct gaps" \
+  "channels/slack_socket/adapter.py" \
+  "('        if any(g[\"start\"] == start for g in self._gaps):', '        if False:')" \
+  "test_socket_adapter"
+
+# ENH-16 — THE acceptance property: an unrecovered gap must FAIL health, not ride along
+# in the detail string (that is exactly \"logged and forgotten\").
+run_mutation "socket: a delivery gap can no longer fail health" \
+  "channels/slack_socket/adapter.py" \
+  "('        complete = not self._gaps', '        complete = True')" \
+  "test_socket_adapter"
+
+# ENH-16 — recovery must demand EVIDENCE: a poll that completed before the window
+# ended cannot have covered it, so clearing on any mark_recovered call is forgetting
+# with extra steps.
+run_mutation "socket: gap recovery stops demanding a poll past the window" \
+  "channels/slack_socket/adapter.py" \
+  "('        keep = [g for g in self._gaps\n                if g[\"end\"] is not None and g[\"end\"] > completed_at]', '        keep = []')" \
+  "test_socket_adapter"
+
+# ENH-16 — the trigger half of the acceptance: an open gap must demand the
+# completeness poll NOW (R3: backoff never defers recovery of an admitted loss).
+run_mutation "socket: recovery_due stops firing the completeness poll" \
+  "channels/slack_socket/adapter.py" \
+  "('        return bool(self._gaps)', '        return False')" \
+  "test_socket_adapter"
+
+# ENH-16 — the registry side: an admitted gap fed to the checks framework must produce
+# a FAIL verdict, or the watchdog layer summarizes over the loss.
+run_mutation "checks: an admitted delivery gap passes the registry" \
+  "core/checks.py" \
+  "('    if gaps:', '    if False:')" \
+  "test_checks"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }

@@ -10,7 +10,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.checks import (CheckContractError, Registry, Verdict,  # noqa: E402
-                         freshness_check, schema_check, watcher_source_check)
+                         delivery_gap_check, freshness_check, schema_check,
+                         watcher_source_check)
 
 
 class VerdictContractTest(unittest.TestCase):
@@ -142,6 +143,34 @@ class FreshnessCheckTest(unittest.TestCase):
         v = freshness_check("poller", age_s=10, budget_s=None)
         self.assertFalse(v.ok)
         self.assertIn("no cadence budget", v.detail)
+
+
+class DeliveryGapCheckTest(unittest.TestCase):
+    """ENH-16: a push platform that ADMITS dropping deliveries (Slack's
+    app_rate_limited at 30k deliveries/app/workspace/hour) must fail the registry
+    until a completeness poll covers the window — an engine that files the admission
+    as detail loses messages while looking healthy."""
+
+    def test_an_admitted_gap_fails_naming_the_window(self):
+        v = delivery_gap_check("push-gaps", [
+            {"start": 1518467820.0, "end": 1518467880.0, "detail": "app_rate_limited"}])
+        self.assertFalse(v.ok)
+        self.assertIn("1518467820", v.detail,
+                      "an unnamed window cannot be checked against the poll cursor")
+        self.assertIn("completeness poll", v.detail)
+
+    def test_a_windowless_gap_still_fails(self):
+        """'unknown window' must never read as 'no window'."""
+        v = delivery_gap_check("push-gaps",
+                               [{"start": None, "end": None, "detail": "x"}])
+        self.assertFalse(v.ok)
+
+    def test_no_gaps_pass_with_the_report_as_evidence(self):
+        v = delivery_gap_check("push-gaps", [])
+        self.assertTrue(v.ok)
+        self.assertEqual(v.inspected, 1,
+                         "the evidence is the gap report itself — one probe, like "
+                         "watcher_source_check")
 
 
 if __name__ == "__main__":

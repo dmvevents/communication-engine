@@ -28,6 +28,28 @@ ephemeral edit wrappers (`message_changed`/`message_deleted`) never ingested (th
 would poison parity permanently); same-cursor re-polls may duplicate, never lose;
 health can fail.
 
+## `app_rate_limited` — the platform admitting it dropped deliveries (ENH-16)
+
+The Events API stops delivering above **30,000 deliveries per workspace per app per
+hour** and announces the overflow with an `app_rate_limited` payload — an event, not
+an error, so an engine that shrugs at it loses messages while looking healthy. This
+adapter treats it as a first-class loss signal:
+
+- the payload (enveloped or bare) records a **delivery-gap window** — the platform
+  names the minute it dropped in (`minute_rate_limited`); a malformed admission
+  records an *unknown window*, which is still a loss;
+- `health()` returns `complete: false` and names the window(s) while any gap is
+  unrecovered (feed `delivery_gaps()` to `core.checks.delivery_gap_check` for a
+  failing registry verdict);
+- `recovery_due()` is true while a gap is open: the **completeness poll** (the
+  gap-free cursored `slack` adapter — the truth side) is due *now*, on the owed-work
+  rule (R3: backoff never defers recovery of an admitted loss);
+- only `mark_recovered(completed_at)` — the epoch time a completeness poll
+  **completed**, past the window's end — closes a gap. Completion time is the
+  evidence, not a message watermark: a cursored poll covers all history up to its
+  completion even when it finds nothing, and a quiet channel's watermark would
+  otherwise leave the gap failing forever.
+
 ## Configuration
 
 ```json
