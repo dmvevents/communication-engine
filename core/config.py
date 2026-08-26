@@ -15,6 +15,11 @@ Rules enforced here:
   worst state to discover during an incident.
 * **Default DENY.** A channel with no explicit `reply_policy` is `never`, so a fresh adopter
   cannot accidentally post as anyone.
+* **Every key is read or refused** (ENH-17). A key the loader does not read configures
+  nothing, and a load that accepts it anyway lies to the adopter — the first non-author
+  adoption run planted a top-level "taxonomy" and believed the classifier retuned when
+  nothing had changed. Keys starting with `_` are comments (JSON has none; the shipped
+  files use `_note`).
 * **Channel types are DISCOVERED, never enumerated** (R11). A channel type is a directory
   under the configured `channels_dir` containing `adapter.py` (channels/CONTRACT.md), so a
   new channel lands with zero core/ changes — the incumbent's second channel type was a
@@ -32,6 +37,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 VALID_POLICIES = ("never", "staged", "direct")
+
+# ENH-17: every key the loader reads, level by level. A key outside these sets configures
+# NOTHING, and silently inert configuration is the same defect class as the silently inert
+# instance (R11): the first non-author adoption run (2026-08-25) planted "taxonomy" at the
+# top level, watched the load succeed, and believed the classifier retuned when nothing
+# had changed. Growing a set here is how a new key is declared read.
+_TOP_KEYS = frozenset(("engine", "instances"))
+_ENGINE_KEYS = frozenset(("state_dir", "channels_dir", "store", "journal", "outbox"))
+_INSTANCE_KEYS = frozenset(("name", "adapter", "channels", "principals", "auth",
+                            "taxonomy"))
+_CHANNEL_KEYS = frozenset(("id", "label", "poll_interval_s", "reply_policy",
+                           "thread_reply_policy", "triggers"))
 
 # Shapes that indicate a real credential pasted where an env reference belongs.
 _SECRET_SHAPES = (
@@ -200,9 +217,28 @@ def load(path: str | Path, base_dir: str | Path | None = None,
     return from_dict(raw, base_dir=base_dir or path.parent, env=env)
 
 
+def _refuse_unknown(obj: dict, known: frozenset, where: str) -> None:
+    """Refuse any key the loader will not read (ENH-17). '_'-prefixed keys are comments:
+    JSON has no comment syntax, and the shipped settings files document themselves with
+    '_note' — refusing those would make every shipped config unloadable."""
+    unknown = sorted(k for k in obj if k not in known and not k.startswith("_"))
+    if not unknown:
+        return
+    # The right key at the wrong level is the measured mistake (top-level taxonomy), so
+    # point at the real home instead of only rejecting the guess.
+    hints = "".join(f" ({k!r} is read per-instance: instances[].{k})"
+                    for k in unknown if k in _INSTANCE_KEYS and known is not _INSTANCE_KEYS)
+    raise ConfigError(
+        f"{where}: unknown key(s) {unknown} are read by nothing — refused so no part of "
+        f"the configuration can be silently inert.{hints} Keys read here: "
+        f"{sorted(known)}; '_'-prefixed keys are comments.")
+
+
 def from_dict(raw: dict, base_dir: str | Path, env: dict | None = None) -> EngineConfig:
     base = Path(base_dir)
+    _refuse_unknown(raw, _TOP_KEYS, "top level")
     eng = raw.get("engine", {})
+    _refuse_unknown(eng, _ENGINE_KEYS, "engine")
     # Relative paths resolve against base_dir, so the same config works on any machine.
     state_dir = _resolve(base, eng.get("state_dir", "state"))
     channels_dir = _resolve(base, eng.get("channels_dir", "channels"))
@@ -234,6 +270,7 @@ def from_dict(raw: dict, base_dir: str | Path, env: dict | None = None) -> Engin
         adapter = spec.get("adapter")
         if not name:
             raise ConfigError("every instance needs a 'name'")
+        _refuse_unknown(spec, _INSTANCE_KEYS, f"instance {name!r}")
         if adapter not in discovered:
             if not discovered:
                 # ENH-20: "unknown adapter ... Discovered: (none)" sent the adoption
@@ -254,6 +291,11 @@ def from_dict(raw: dict, base_dir: str | Path, env: dict | None = None) -> Engin
         for ch in spec.get("channels", []):
             if not ch.get("id"):
                 raise ConfigError(f"instance {name!r}: a channel is missing 'id'")
+            # A typo'd reply_policy here is the nastiest inert-key shape: without the
+            # refusal the channel silently stays at default DENY and the adopter's
+            # 'staged' never takes effect anywhere.
+            _refuse_unknown(ch, _CHANNEL_KEYS,
+                            f"instance {name!r} channel {ch['id']!r}")
             channels.append(ChannelConfig(
                 id=ch["id"], label=ch.get("label", ""),
                 poll_interval_s=int(ch.get("poll_interval_s", 60)),

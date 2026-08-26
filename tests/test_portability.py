@@ -313,6 +313,88 @@ class ConfigErrorQualityTest(unittest.TestCase):
         self.assertNotIn("unknown adapter", msg)
 
 
+class UnknownKeyRefusalTest(unittest.TestCase):
+    """ENH-17. The loader used to read its fixed key set and silently ignore everything
+    else. The R21 non-author adoption run (2026-08-25) planted "taxonomy" at the TOP
+    level, watched the load succeed, and believed the classifier retuned when nothing had
+    changed; the old example's telegram "chats" key was likewise accepted and never read.
+    Silently inert configuration is the same defect class as the silently inert instance
+    that R11's loud refusal exists to prevent: every key must configure something or be
+    refused naming the key. '_'-prefixed keys are the one escape — JSON has no comment
+    syntax, and the shipped settings files document themselves with "_note".
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        seed_fake_adapter(self.base)
+
+    def cfg_dict(self):
+        return {
+            "engine": {"state_dir": "state"},
+            "instances": [{"name": "t", "adapter": "fake",
+                           "channels": [{"id": "C_T", "reply_policy": "never"}]}],
+        }
+
+    def test_a_top_level_taxonomy_is_refused_and_pointed_at_the_instance(self):
+        """The adoption run's mistake verbatim: the adopter had the right key at the
+        wrong level, so the refusal must say where the key actually lives."""
+        d = self.cfg_dict()
+        d["taxonomy"] = {"exec_verbs": ["review"]}
+        with self.assertRaises(ConfigError) as ctx:
+            from_dict(d, base_dir=self.base)
+        msg = str(ctx.exception)
+        self.assertIn("taxonomy", msg)
+        self.assertIn("instances[].taxonomy", msg,
+                      "the refusal names the key but not its real home — the adopter "
+                      "is left knowing only that their guess was wrong")
+
+    def test_an_unknown_instance_key_is_refused_naming_key_and_instance(self):
+        """The old example's telegram 'chats' key: accepted, read by nothing."""
+        d = self.cfg_dict()
+        d["instances"][0]["chats"] = ["@some_group"]
+        with self.assertRaises(ConfigError) as ctx:
+            from_dict(d, base_dir=self.base)
+        msg = str(ctx.exception)
+        self.assertIn("chats", msg)
+        self.assertIn("'t'", msg, "which instance carries the junk key is part of "
+                      "the fix instruction — configs grow many instances")
+
+    def test_a_misspelled_channel_policy_key_is_refused_not_silently_deny(self):
+        """The nastiest channel-level shape: a typo'd reply_policy is not an error
+        today — the channel silently stays at default DENY and the adopter's 'staged'
+        never takes effect anywhere."""
+        d = self.cfg_dict()
+        ch = d["instances"][0]["channels"][0]
+        del ch["reply_policy"]
+        ch["reply_polciy"] = "staged"
+        with self.assertRaises(ConfigError) as ctx:
+            from_dict(d, base_dir=self.base)
+        msg = str(ctx.exception)
+        self.assertIn("reply_polciy", msg)
+        # The known-keys list is the adopter's map back to the right spelling — the
+        # same convention as the discovered-adapters list in the R11 refusal.
+        self.assertIn("reply_policy", msg)
+
+    def test_an_unknown_engine_key_is_refused(self):
+        d = self.cfg_dict()
+        d["engine"]["stat_dir"] = "elsewhere"      # the state_dir typo shape
+        with self.assertRaises(ConfigError) as ctx:
+            from_dict(d, base_dir=self.base)
+        self.assertIn("stat_dir", str(ctx.exception))
+
+    def test_underscore_keys_are_comments_at_every_level(self):
+        """A refused '_note' would make every shipped settings file unloadable."""
+        d = self.cfg_dict()
+        d["_note"] = "top-level comment"
+        d["engine"]["_note"] = "engine comment"
+        d["instances"][0]["_note"] = "instance comment"
+        d["instances"][0]["channels"][0]["_note"] = "channel comment"
+        cfg = from_dict(d, base_dir=self.base)
+        self.assertEqual(len(cfg.instances), 1)
+
+
 class EndToEndFromConfigTest(unittest.TestCase):
     """R17: the whole pipeline, built from a temp-dir config, on a fake adapter."""
 

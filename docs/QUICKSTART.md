@@ -115,9 +115,10 @@ python3 -m unittest tests.test_portability -k EndToEnd -v
 
 Your team's words are not ours. Override them in config, never in code. The taxonomy is
 **per-instance** — it lives *inside* the instance object, next to that instance's `adapter`
-and `channels`. A `"taxonomy"` at the top level of the file is not read (the first
-non-author adoption run made exactly that mistake and the classifier silently kept our
-vocabulary):
+and `channels`. A `"taxonomy"` at the top level of the file is refused at load, with the
+message naming this placement — the first non-author adoption run made exactly that
+mistake back when the loader silently ignored unread keys, and believed the classifier
+was retuned while it kept our vocabulary:
 
 ```json
 "instances": [{

@@ -1,11 +1,9 @@
 {
-  "_note": "Copy to settings.json (gitignored) and fill in. The FIRST instance is the in-memory fake adapter: it loads and polls as copied, with no credentials — QUICKSTART step 5 runs against it. Later instances need their env-var references exported first: values of the form 'env:NAME' under auth are read from the environment at runtime — never put literal credentials in any settings file. Delete any instance you are not using; every instance kept must name a shipped adapter and resolve its env references, or the engine refuses to start. Every channel starts at reply_policy 'never' on purpose: watch first, promote later (docs/QUICKSTART.md step 4).",
+  "_note": "Copy to settings.json (gitignored) and fill in. The FIRST instance is the in-memory fake adapter: it loads and polls as copied, with no credentials — QUICKSTART step 5 runs against it. Later instances need their env-var references exported first: values of the form 'env:NAME' under auth are read from the environment at runtime — never put literal credentials in any settings file. Delete any instance you are not using; every instance kept must name a shipped adapter and resolve its env references, or the engine refuses to start. Every channel starts at reply_policy 'never' on purpose: watch first, promote later (docs/QUICKSTART.md step 4). Every key in this file is READ by the engine; a key it does not read is refused at load (a key that configures nothing would let you believe you changed behaviour when nothing changed). Keys starting with '_' are comments.",
   "engine": {
     "state_dir": "state",
     "channels_dir": "channels",
-    "store": "state/messages.db",
-    "heartbeat_file": "state/heartbeat",
-    "dashboard_out": "state/COMMS-DASHBOARD.md"
+    "store": "state/messages.db"
   },
   "instances": [
     {
@@ -17,11 +15,18 @@
           "label": "dry-run",
           "poll_interval_s": 15,
           "reply_policy": "never",
-          "triggers": ["mention", "principal", "keyword:agent"]
+          "triggers": [
+            "mention",
+            "principal",
+            "keyword:agent"
+          ]
         }
       ],
       "principals": [
-        { "id": "U_EXAMPLE_PRINCIPAL", "label": "watched-colleague" }
+        {
+          "id": "U_EXAMPLE_PRINCIPAL",
+          "label": "watched-colleague"
+        }
       ]
     },
     {
@@ -31,39 +36,39 @@
         "token": "env:SLACK_API_ENV_REF",
         "channels": "env:SLACK_CHANNELS_ENV_REF"
       },
-      "self_user_id": "U_EXAMPLE_SELF",
       "channels": [
         {
           "id": "C_EXAMPLE_CHANNEL",
           "label": "primary-watch",
           "poll_interval_s": 15,
-          "backfill_h": 168,
           "reply_policy": "never",
-          "triggers": ["mention", "principal", "keyword:agent"]
+          "triggers": [
+            "mention",
+            "principal",
+            "keyword:agent"
+          ]
         },
         {
           "id": "D_EXAMPLE_DM",
           "label": "colleague-dm",
           "poll_interval_s": 60,
           "reply_policy": "never",
-          "triggers": ["any_message"]
+          "triggers": [
+            "any_message"
+          ]
         }
       ],
       "principals": [
-        { "id": "U_EXAMPLE_PRINCIPAL", "label": "watched-colleague" }
-      ],
-      "bridge": { "bind": "loopback-only", "port": 0, "hmac_secret": "env:BRIDGE_ENV_REF" }
+        {
+          "id": "U_EXAMPLE_PRINCIPAL",
+          "label": "watched-colleague"
+        }
+      ]
     }
   ],
-  "reply_policies_doc": {
+  "_reply_policies_doc": {
     "never": "read-only; core/outbox refuses send() for this target",
     "staged": "drafts written to state/outbox/, explicit operator gate required before send",
     "direct": "adapter may send after outbox audit logging (only for precedented targets)"
-  },
-  "watchdog": {
-    "cadence_s": 300,
-    "fail_threshold": 3,
-    "alert_cooldown_s": 1800,
-    "maintenance_flag": "state/.maintenance"
   }
 }

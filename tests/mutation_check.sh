@@ -1106,6 +1106,47 @@ run_mutation "checks: an admitted delivery gap passes the registry" \
   "('    if gaps:', '    if False:')" \
   "test_checks"
 
+# ---------------------------------------------------------------------------
+# ENH-17 — a key the loader does not read is REFUSED, never silently ignored.
+# The R21 adoption run planted a top-level "taxonomy", the load succeeded, and
+# the adopter believed the classifier retuned when nothing had changed.
+# ---------------------------------------------------------------------------
+
+# ENH-17 — THE defect verbatim: every unknown key everywhere is accepted again.
+run_mutation "config: unknown keys are silently ignored at every level" \
+  "core/config.py" \
+  "('    unknown = sorted(k for k in obj if k not in known and not k.startswith(\"_\"))', '    unknown = []')" \
+  "test_portability"
+
+# ENH-17 — each call site removed one at a time: a level that stops being checked
+# is exactly the level the next inert key lands on.
+run_mutation "config: the top level stops being checked (the planted taxonomy loads)" \
+  "core/config.py" \
+  "('    _refuse_unknown(raw, _TOP_KEYS, \"top level\")', '    pass')" \
+  "test_portability"
+
+run_mutation "config: the engine block stops being checked" \
+  "core/config.py" \
+  "('    _refuse_unknown(eng, _ENGINE_KEYS, \"engine\")', '    pass')" \
+  "test_portability"
+
+run_mutation "config: instance objects stop being checked (telegram 'chats' loads)" \
+  "core/config.py" \
+  "('        _refuse_unknown(spec, _INSTANCE_KEYS, f\"instance {name!r}\")', '        pass')" \
+  "test_portability"
+
+run_mutation "config: channel objects stop being checked (a typo'd reply_policy means silent DENY)" \
+  "core/config.py" \
+  "('            _refuse_unknown(ch, _CHANNEL_KEYS,', '            (lambda *a: None)(ch, _CHANNEL_KEYS,')" \
+  "test_portability"
+
+# ENH-17 — the refusal must keep saying where the right-key-wrong-level key lives;
+# rejecting the adopter's guess without the pointer restarts the hunt.
+run_mutation "config: the wrong-level refusal stops naming the key's real home" \
+  "core/config.py" \
+  "('    hints = \"\".join(f\" ({k!r} is read per-instance: instances[].{k})\"', '    hints = \"\".join(\"\"')" \
+  "test_portability"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }
