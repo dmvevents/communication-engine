@@ -1596,7 +1596,7 @@ run_mutation "dashboard: staged drafts leave the operator gate" \
 # ENH-8 — severity order: the banner exists so the double-message risk is read FIRST.
 run_mutation "dashboard: the unanswered backlog outranks a crashed send" \
   "core/dashboard.py" \
-  "('SEVERITY = (\"in_flight\", \"edited_after_response\", \"staged\", \"unanswered\")', 'SEVERITY = (\"unanswered\", \"edited_after_response\", \"staged\", \"in_flight\")')" \
+  "('SEVERITY = (\"engine_lost\", \"in_flight\", \"edited_after_response\", \"staged\",\n            \"unanswered\")', 'SEVERITY = (\"engine_lost\", \"unanswered\", \"edited_after_response\", \"staged\",\n            \"in_flight\")')" \
   "test_dashboard"
 
 # ENH-8/R23 — an edit after our answer means the visible reply may answer text that no
@@ -1617,7 +1617,7 @@ run_mutation "dashboard-serve: the UI binds beyond loopback" \
 # A hardwired state path renders this repo's state and calls it the adopter's.
 run_mutation "dashboard-script: reads a hardwired path instead of the adopter's config" \
   "scripts/dashboard.py" \
-  "('snap = snapshot(cfg.journal_path, outbox_paths)', 'snap = snapshot(Path(\"state/journal.db\"), outbox_paths)')" \
+  "('snap = snapshot(cfg.journal_path, outbox_paths,', 'snap = snapshot(Path(\"state/journal.db\"), outbox_paths,')" \
   "test_dashboard"
 
 # ---------------------------------------------------------------------------
@@ -1776,6 +1776,64 @@ run_mutation "docs: step 6 loses the escalation flag's name" \
   "docs/QUICKSTART.md" \
   "('\"escalate_ambiguous\": true', '\"escalated_ambiguity\": true')" \
   "test_docs"
+
+# ENH-24 — the operator surface shows the parity VERDICT, not raw divergence counts.
+# Each of these, if it survived, re-creates the measured failure: '342 missed, 24
+# extra' rendered for a channel whose truth was PARITY OK / ENGINE_LOST=0.
+
+# The lead number silently becomes the raw missed count — the scary number returns
+# wearing the verdict's name.
+run_mutation "parity: the panel's lead number becomes the raw missed count" \
+  "core/parity.py" \
+  "('        lost = sorted(self.by_class(ENGINE_LOST), key=_fl)', '        lost = sorted(self.missed, key=_fl)')" \
+  "test_parity"
+
+# The configuration that waived classes goes unnamed — a green verdict with no
+# reviewable argument behind it.
+run_mutation "parity: the accept-list in force goes unnamed" \
+  "core/parity.py" \
+  "('            \"accept_list\": sorted(self.accepted),', '            \"accept_list\": [],')" \
+  "test_parity"
+
+# Raw counts move back to the head of the panel; key order is render order.
+run_mutation "parity: raw divergence counts return to the head of the panel" \
+  "core/parity.py" \
+  "('        return {\n            \"verdict\": \"PARITY OK\" if self.ok else \"PARITY FAIL\",', '        return {\n            \"raw\": {\"missed\": len(self.missed), \"extra\": len(self.extra)},\n            \"verdict\": \"PARITY OK\" if self.ok else \"PARITY FAIL\",')" \
+  "test_parity"
+
+# A proven archive loss sinks below a maybe-double-send — the queue stops saying
+# 'nothing below this line can be trusted'.
+run_mutation "dashboard: a proven loss no longer outranks a crashed send" \
+  "core/dashboard.py" \
+  "('SEVERITY = (\"engine_lost\", \"in_flight\", \"edited_after_response\", \"staged\",', 'SEVERITY = (\"in_flight\", \"engine_lost\", \"edited_after_response\", \"staged\",')" \
+  "test_dashboard"
+
+# ENGINE_LOST goes nonzero and no attention item fires — the panel exists but the
+# operator is never pointed at it.
+run_mutation "dashboard: the parity attention item goes silent" \
+  "core/dashboard.py" \
+  "('        if panel.get(\"engine_lost\"):', '        if False:')" \
+  "test_dashboard"
+
+# No retention db renders as 'tombstones: 0' — 'nothing was ever deleted' claimed
+# on no evidence (the F-2 false-confidence shape).
+run_mutation "dashboard: a missing tombstone db renders as zero" \
+  "core/dashboard.py" \
+  "('    if tombstones is None or not Path(tombstones).is_file():\n        return None', '    if tombstones is None or not Path(tombstones).is_file():\n        return 0')" \
+  "test_dashboard"
+
+# The shell stops naming what was waived — the operator sees 'accepted' with no
+# reviewable list of what acceptance means here.
+run_mutation "dashboard.py (shell): the accept-list in force goes unnamed" \
+  "scripts/dashboard.py" \
+  "('accept-list in force: {accepts}', 'accept-list in force: (unnamed)')" \
+  "test_dashboard"
+
+# The raw-count footnote climbs back above the verdict on the rendered surface.
+run_mutation "dashboard.py (shell): raw divergence counts lead the parity tab again" \
+  "scripts/dashboard.py" \
+  "('            st.markdown(lead)\n            if breakdown:', '            st.markdown(raw_note, unsafe_allow_html=True)\n            st.markdown(lead)\n            if breakdown:')" \
+  "test_dashboard"
 
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"

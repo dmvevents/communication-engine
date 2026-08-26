@@ -47,11 +47,13 @@ st.set_page_config(page_title="communication engine — operator", page_icon="�
                    layout="wide")
 
 # Glyph + word + colour per severity; the glyphs are text-font characters on purpose.
-GLYPH = {"in_flight": "✖", "edited_after_response": "▲",
+GLYPH = {"engine_lost": "⊘", "in_flight": "✖", "edited_after_response": "▲",
          "staged": "◔", "unanswered": "?"}
-COLOR = {"in_flight": "#d03b3b", "edited_after_response": "#ec835a",
+COLOR = {"engine_lost": "#8f1d1d", "in_flight": "#d03b3b",
+         "edited_after_response": "#ec835a",
          "staged": "#fab219", "unanswered": "#898781"}
-LABEL = {"in_flight": "IN-FLIGHT SEND", "edited_after_response": "EDITED AFTER ANSWER",
+LABEL = {"engine_lost": "ENGINE LOST", "in_flight": "IN-FLIGHT SEND",
+         "edited_after_response": "EDITED AFTER ANSWER",
          "staged": "STAGED DRAFT", "unanswered": "UNANSWERED"}
 
 
@@ -90,7 +92,13 @@ except ConfigError as ex:
     st.stop()
 
 outbox_paths = {inst.name: cfg.outbox_path_for(inst.name) for inst in cfg.instances}
-snap = snapshot(cfg.journal_path, outbox_paths)
+# Parity artifacts live at a state_dir convention rather than config keys: panels
+# are what `python3 -m core.parity --panel-json state/parity/panel-<ch>.json` left
+# behind, and the tombstone db is core/retention.py's store. Both optional state —
+# absent renders as UNKNOWN (reported missing), never as clean.
+snap = snapshot(cfg.journal_path, outbox_paths,
+                parity_dir=cfg.state_dir / "parity",
+                tombstones=cfg.state_dir / "tombstones.db")
 
 with st.sidebar:
     st.markdown("### communication engine")
@@ -109,9 +117,11 @@ if snap["missing"]:
     st.warning("state not created yet — " + "; ".join(
         f"`{m}`" for m in snap["missing"]) +
         ". A fresh adopter grows these by running the engine: "
-        "scripts/first-poll.py writes the journal (quickstart step 5), and the "
-        "outbox appears on the first staged or sent draft. Missing is reported, "
-        "never rendered as zero.")
+        "scripts/first-poll.py writes the journal (quickstart step 5), the "
+        "outbox appears on the first staged or sent draft, and parity panels/"
+        "tombstones appear once the differ (`python3 -m core.parity --panel-json`) "
+        "and retention reconciliation have run. Missing is reported, never "
+        "rendered as zero.")
 
 # ---- triage first ------------------------------------------------------------
 attention = snap["attention"]
@@ -119,8 +129,8 @@ if not attention and not snap["missing"]:
     st.markdown("<div style='border:1px solid rgba(128,128,128,.3);"
                 "border-left:3px solid #0ca30c;border-radius:8px;padding:10px 14px'>"
                 "<span style='color:#0ca30c;font-weight:700'>✓</span> <b>ALL CLEAR</b>"
-                " — no in-flight sends, no stale answers, no drafts waiting, no open "
-                "asks.</div>", unsafe_allow_html=True)
+                " — no proven parity losses, no in-flight sends, no stale answers, "
+                "no drafts waiting, no open asks.</div>", unsafe_allow_html=True)
 for item in attention:
     where = item["where"] + (f" · instance {item['instance']}"
                              if item["instance"] else "")
@@ -143,7 +153,7 @@ for i, sev in enumerate(SEVERITY, start=1):
                     sum(1 for a in attention if a["severity"] == sev))
 
 # ---- the detail tabs ----------------------------------------------------------
-journal_tab, outbox_tab = st.tabs(["Journal", "Outbox"])
+journal_tab, outbox_tab, parity_tab = st.tabs(["Journal", "Outbox", "Parity"])
 
 with journal_tab:
     if j is None:
@@ -184,3 +194,44 @@ with outbox_tab:
                         html.escape(str(a["ts"])), html.escape(a["text"] or ""))
                        for a in gate])
         st.caption(f"source: `{outbox_paths[name]}`")
+
+with parity_tab:
+    # ENH-24: the panel leads with the VERDICT, never with raw divergence counts.
+    # R8's first live window read "342 missed, 24 extra" for a channel whose truth
+    # was PARITY OK / ENGINE_LOST=0 — an operator trained to ignore that number
+    # will ignore it on the day ENGINE_LOST goes to 1.
+    if snap["parity"] is None:
+        st.markdown("_No parity panels yet — parity is UNKNOWN, not clean. A "
+                    "differ run leaves one: `python3 -m core.parity --oracle "
+                    "<incumbent.db> --candidate state/messages.db --channel <ch> "
+                    "--panel-json state/parity/panel-<ch>.json`._")
+    else:
+        for channel in sorted(snap["parity"]):
+            p = snap["parity"][channel]
+            ok = p["verdict"] == "PARITY OK"
+            v_color = "#0ca30c" if ok else COLOR["engine_lost"]
+            st.markdown(f"##### channel `{html.escape(channel)}` — "
+                        f"<span style='color:{v_color};font-weight:700'>"
+                        f"{html.escape(p['verdict'])}</span>",
+                        unsafe_allow_html=True)
+            accepts = ", ".join(p["accept_list"]) or "none — strict two-way diff"
+            tomb = ("unknown — no tombstone db yet" if p["tombstones"] is None
+                    else p["tombstones"])
+            lead = (f"**ENGINE_LOST = {p['engine_lost']}** · "
+                    f"accept-list in force: {accepts} · tombstones: {tomb}")
+            # Unexplained classes first — they are the verdict — then the accepted
+            # breakdown, the stated reason a clean run is clean.
+            breakdown = ([(html.escape(c), n, "UNEXPLAINED")
+                          for c, n in p["unexplained"].items()]
+                         + [(html.escape(c), n, "accepted")
+                            for c, n in p["accepted"].items()])
+            raw_note = ("<span style='opacity:.6;font-size:.85rem'>raw divergence — "
+                        f"missed={p['raw']['missed']} extra={p['raw']['extra']}: a "
+                        "raw count is not a verdict; every row above is classified "
+                        "by cause</span>")
+            st.markdown(lead)
+            if breakdown:
+                dom_table(("class", "count", ""), breakdown)
+            st.markdown(raw_note, unsafe_allow_html=True)
+    st.caption(f"source: `{cfg.state_dir / 'parity'}` · tombstones: "
+               f"`{cfg.state_dir / 'tombstones.db'}`")

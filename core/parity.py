@@ -60,6 +60,7 @@ import argparse
 import json
 import sqlite3
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -154,6 +155,41 @@ class ParityReport:
     @property
     def ok(self) -> bool:
         return not self.unexplained and not self.cursor_divergent
+
+    def panel(self) -> dict:
+        """The verdict-led, machine-readable view an operator surface renders (ENH-24).
+
+        Key order IS render order — json and every dict consumer preserve it — and it
+        encodes the lesson of R8's first live window: the raw missed/extra counts said
+        '342 missed, 24 extra' for a channel whose truthful verdict was PARITY OK /
+        ENGINE_LOST=0. A surface that leads with the scary raw number trains the
+        operator to ignore it, and they will ignore it on the day ENGINE_LOST goes to
+        1. So the ONE number that means a defect leads, the accepted classes are the
+        stated reason the run is clean, and the raw counts sit at the tail — demoted,
+        not deleted.
+
+        `tombstones` is a slot, always None here: the differ has no retention db, and
+        the operator surface fills it from core/retention.py's store. None renders as
+        UNKNOWN, never as 0.
+        """
+        lost = sorted(self.by_class(ENGINE_LOST), key=_fl)
+        return {
+            "verdict": "PARITY OK" if self.ok else "PARITY FAIL",
+            "engine_lost": len(lost),
+            "engine_lost_sample": lost[:10],
+            "unexplained": self.unexplained,
+            "accepted": {cls: n for cls, n in self.counts().items()
+                         if cls in self.accepted},
+            "accept_list": sorted(self.accepted),
+            "tombstones": None,
+            "channel": self.channel,
+            "oracle_count": self.oracle_count,
+            "candidate_count": self.candidate_count,
+            "served_known": self.served_known,
+            "snapshot_unavailable": self.snapshot_unavailable,
+            "cursor_divergent": self.cursor_divergent,
+            "raw": {"missed": len(self.missed), "extra": len(self.extra)},
+        }
 
     def summary(self) -> str:
         verdict = "PARITY OK" if self.ok else "PARITY FAIL"
@@ -371,6 +407,10 @@ def main(argv=None) -> int:
     ap.add_argument("--channels-dir", default="channels",
                     help="adapter discovery dir for --candidate-adapter (default: "
                          "./channels, the same dir config points core at)")
+    ap.add_argument("--panel-json", default=None,
+                    help="also write the verdict-led panel (ENH-24) here, e.g. "
+                         "state/parity/panel-<channel>.json — the dashboard renders "
+                         "these read-only; it never computes parity itself")
     a = ap.parse_args(argv)
 
     try:
@@ -391,6 +431,13 @@ def main(argv=None) -> int:
     except (ConfigError, ParityError) as ex:
         print(f"PARITY ERROR: {ex}", file=sys.stderr)
         return 2
+    if a.panel_json:
+        # The differ run is the WRITER of dashboard state (the viewer never mints
+        # any); generated_at rides along so a stale verdict can be judged stale.
+        out = Path(a.panel_json)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({**report.panel(), "generated_at": time.time()},
+                                  indent=2))
     print(report.summary())
     return 0 if report.ok else 1
 

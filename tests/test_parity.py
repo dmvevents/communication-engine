@@ -11,6 +11,7 @@ Two properties matter more than the rest:
   reviewable argument, and this one class is outside its reach by construction.
 """
 import io
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -358,6 +359,120 @@ class SnapshotDeclarationCliTest(unittest.TestCase):
                                     "--channels-dir", str(self.base / "channels"))
         self.assertEqual(code, 2)
         self.assertIn("nope", err)
+
+
+class PanelTest(unittest.TestCase):
+    """ENH-24: the operator surface renders a VERDICT, not raw divergence counts.
+
+    The measured failure this kills: R8's first live window read '342 missed, 24
+    extra' for a channel whose truthful verdict was PARITY OK / ENGINE_LOST=0. An
+    operator who learns to ignore a scary raw number will ignore it on the day
+    ENGINE_LOST goes to 1, so panel() leads with the one number that means a defect
+    and demotes the raw counts to the tail.
+    """
+
+    def lossy_report(self, accept=("UNRETRIEVABLE", "PRE_ORACLE_FLOOR"),
+                     with_floor_extra=True):
+        """2 ENGINE_LOST, 2 UNRETRIEVABLE, optionally 1 PRE_ORACLE_FLOOR:
+        raw missed=4 / extra=1, but only TWO rows are an engine defect."""
+        candidate = {"2.0", "1.0"} if with_floor_extra else {"2.0"}
+        return compare({"2.0", "3.0", "4.0", "5.0", "6.0"}, candidate, "C_LOST",
+                       served_ts={"2.0", "3.0", "4.0"}, accept=accept)
+
+    def clean_report(self):
+        """The R8 shape: every divergence falls in an accepted class. verdict OK."""
+        return compare({"2.0", "3.0", "4.0", "5.0"}, {"2.0", "3.0", "1.0"}, "C_CLEAN",
+                       served_ts={"2.0", "3.0"},
+                       accept=("UNRETRIEVABLE", "PRE_ORACLE_FLOOR"))
+
+    def test_engine_lost_is_the_class_count_not_the_raw_missed_count(self):
+        p = self.lossy_report().panel()
+        self.assertEqual(p["engine_lost"], 2,
+                         "the panel's lead number must be the ENGINE_LOST class "
+                         "count — reporting the raw missed count (4 here) is the "
+                         "exact scary-number failure ENH-24 removes")
+        self.assertEqual(p["raw"], {"missed": 4, "extra": 1})
+        self.assertEqual(p["engine_lost_sample"], ["3.0", "4.0"],
+                         "the operator acts on rows, not on a count")
+
+    def test_the_panel_leads_with_the_verdict_and_demotes_raw_counts(self):
+        """Key order IS render order — json and every dict consumer preserve it."""
+        keys = list(self.lossy_report().panel())
+        self.assertEqual(keys[0], "verdict")
+        self.assertEqual(keys[1], "engine_lost")
+        self.assertEqual(keys[-1], "raw",
+                         "raw missed/extra counts belong at the tail: a raw count "
+                         "is not a verdict")
+
+    def test_a_clean_run_reads_ok_not_366_divergences(self):
+        p = self.clean_report().panel()
+        self.assertEqual(p["verdict"], "PARITY OK")
+        self.assertEqual(p["engine_lost"], 0)
+        self.assertEqual(p["unexplained"], {})
+        self.assertEqual(p["accepted"],
+                         {"UNRETRIEVABLE": 2, "PRE_ORACLE_FLOOR": 1},
+                         "'clean, for a stated reason' — the accepted-class "
+                         "breakdown IS the stated reason")
+        self.assertEqual(p["raw"], {"missed": 2, "extra": 1})
+
+    def test_a_lossy_run_reads_fail_with_engine_lost_unexplained(self):
+        p = self.lossy_report().panel()
+        self.assertEqual(p["verdict"], "PARITY FAIL")
+        self.assertEqual(p["unexplained"], {"ENGINE_LOST": 2})
+
+    def test_the_accept_list_in_force_is_named_even_when_a_class_never_occurred(self):
+        """The list is the CONFIGURATION, the breakdown is the OCCURRENCE. An
+        operator judging a verdict needs both: what was waived, and what showed up."""
+        p = self.lossy_report(with_floor_extra=False).panel()
+        self.assertEqual(p["accept_list"], ["PRE_ORACLE_FLOOR", "UNRETRIEVABLE"])
+        self.assertEqual(p["accepted"], {"UNRETRIEVABLE": 2},
+                         "the breakdown lists only classes that occurred")
+
+    def test_an_empty_accept_list_is_an_empty_list_not_a_missing_key(self):
+        p = compare({"1.1", "1.2"}, {"1.1", "1.2"}, "C_X").panel()
+        self.assertEqual(p["accept_list"], [])
+
+    def test_the_tombstone_slot_defaults_to_unknown(self):
+        """The differ has no retention db; the operator surface fills the slot from
+        core/retention.py. None is UNKNOWN — rendering it as 0 would be the
+        F-2 false-confidence shape."""
+        self.assertIsNone(self.clean_report().panel()["tombstones"])
+
+
+class PanelCliTest(unittest.TestCase):
+    """--panel-json persists the verdict-led panel so the read-only dashboard can
+    render it. The differ run is the writer; the dashboard never computes parity."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        for name, rows in (("oracle.db", [("C_ONE", "1.1"), ("C_ONE", "1.2")]),
+                           ("engine.db", [("C_ONE", "1.1")])):
+            c = sqlite3.connect(self.base / name)
+            c.execute("CREATE TABLE messages (channel_id TEXT, ts TEXT)")
+            c.executemany("INSERT INTO messages VALUES (?,?)", rows)
+            c.commit()
+            c.close()
+
+    def test_the_cli_writes_the_panel_artifact(self):
+        # The parent dir does not exist yet — the writer creates it (state/parity/
+        # on a fresh adopter); only the VIEWER is forbidden from minting state.
+        out_path = self.base / "parity" / "panel-C_ONE.json"
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = parity_main(["--oracle", str(self.base / "oracle.db"),
+                                "--candidate", str(self.base / "engine.db"),
+                                "--channel", "C_ONE",
+                                "--panel-json", str(out_path)])
+        self.assertEqual(code, 1, "persisting the panel must not soften the exit")
+        panel = json.loads(out_path.read_text())
+        self.assertEqual(list(panel)[0], "verdict")
+        self.assertEqual(panel["verdict"], "PARITY FAIL")
+        self.assertEqual(panel["engine_lost"], 1)
+        self.assertEqual(panel["channel"], "C_ONE")
+        self.assertIsInstance(panel["generated_at"], float,
+                              "a verdict with no timestamp cannot be judged stale")
 
 
 class ReadServedTest(unittest.TestCase):

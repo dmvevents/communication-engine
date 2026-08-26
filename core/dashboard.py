@@ -17,10 +17,15 @@ read the result, so a schema rename goes red instead of drifting.
 The attention queue is SEVERITY-ordered, the spoke UI's one validated UX lesson
 (what needs action is stated before anything scrollable):
 
+    engine_lost             a parity panel proved the platform still serves messages
+                            this engine lost (ENH-24). Every other queue item is READ
+                            FROM the engine's archive; this one says that archive is
+                            wrong, so nothing below it can be trusted until it is 0 —
+                            and it is the one divergence class no accept-list can
+                            waive (core/parity.py NEVER_ACCEPTABLE).
     in_flight               an INTENT/SENT outbox row — the process died mid-send, and
                             only Outbox.recover()'s read-back can tell "sent,
-                            unrecorded" from "never sent". Can double-message someone,
-                            so nothing outranks it.
+                            unrecorded" from "never sent". Can double-message someone.
     edited_after_response   we answered version N and the channel now shows version
                             N+1 — the answer may no longer hold (journal R23).
     staged                  drafts stopped at the operator gate, waiting for a human.
@@ -28,12 +33,18 @@ The attention queue is SEVERITY-ordered, the spoke UI's one validated UX lesson
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
-SEVERITY = ("in_flight", "edited_after_response", "staged", "unanswered")
+SEVERITY = ("engine_lost", "in_flight", "edited_after_response", "staged",
+            "unanswered")
 
 _WHY = {
+    "engine_lost": ("the platform still serves messages this engine LOST — the one "
+                    "divergence class no accept-list can waive; every answer and "
+                    "verdict below is read from this archive, so treat it as "
+                    "incomplete until this is 0"),
     "in_flight": ("a send may have died mid-flight — run Outbox.recover(); only its "
                   "read-back can tell 'sent, unrecorded' from 'never sent'"),
     "edited_after_response": ("edited AFTER we answered — the reply on the channel "
@@ -134,13 +145,78 @@ def _outbox_view(name: str, outbox_path: Path):
         conn.close()
 
 
-def snapshot(journal_path: str | Path, outboxes: dict[str, str | Path] | None = None
-             ) -> dict:
+def _tombstone_count(tombstones: Path | None, channel: str):
+    """This channel's tombstone count from core/retention.py's store, or None when
+    the db does not exist — no retention db means the deletion history is UNKNOWN,
+    and rendering 0 would claim 'nothing was ever deleted' on no evidence. The
+    table/column names are pinned literals like the journal/outbox reads above:
+    core/retention.Tombstones opens read-write and runs its schema, which is a write
+    for a viewer."""
+    if tombstones is None or not Path(tombstones).is_file():
+        return None
+    conn = open_ro(tombstones)
+    try:
+        return conn.execute("SELECT count(*) FROM tombstones WHERE channel_id=?",
+                            (channel,)).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _parity_view(parity_dir: Path, tombstones: Path | None):
+    """(attention items, channel -> panel) from the persisted parity panels
+    (`python3 -m core.parity --panel-json`, ENH-24), or (None, None) when no differ
+    run has left a panel yet — absent parity must read as UNKNOWN, never as clean.
+
+    The dashboard renders verdicts, it never computes them: a panel is the archived
+    evidence of a differ run, reviewable after the fact, which a live comparison
+    from inside a viewer would not be.
+    """
+    paths = sorted(parity_dir.glob("*.json")) if parity_dir.is_dir() else []
+    if not paths:
+        return None, None
+    items, panels = [], {}
+    for p in paths:
+        try:
+            panel = json.loads(p.read_text())
+        except ValueError as ex:
+            raise DashboardError(
+                f"parity panel {p} is not valid JSON ({ex}) — a broken panel must "
+                "not read as 'no parity'") from ex
+        if not isinstance(panel, dict) or "channel" not in panel \
+                or "engine_lost" not in panel:
+            raise DashboardError(
+                f"parity panel {p} lacks channel/engine_lost — not a panel written "
+                "by `core.parity --panel-json`, and guessing would render a verdict "
+                "nobody computed")
+        # Fill the differ's tombstone slot from the retention db, live: the panel
+        # was written at differ time, the deletion history keeps growing after.
+        panel["tombstones"] = _tombstone_count(tombstones, panel["channel"])
+        panels[panel["channel"]] = panel
+    for channel in sorted(panels):
+        panel = panels[channel]
+        if panel.get("engine_lost"):
+            sample = ", ".join(panel.get("engine_lost_sample", [])[:3])
+            items.append({
+                "severity": "engine_lost", "instance": None, "where": channel,
+                "ts": panel.get("generated_at"),
+                "text": (f"ENGINE_LOST={panel['engine_lost']} — the platform still "
+                         f"serves row(s) this engine lost (e.g. ts {sample})"),
+                "kind": None, "state": panel.get("verdict"),
+                "why": _WHY["engine_lost"]})
+    return items, panels
+
+
+def snapshot(journal_path: str | Path, outboxes: dict[str, str | Path] | None = None,
+             parity_dir: str | Path | None = None,
+             tombstones: str | Path | None = None) -> dict:
     """The whole operator view in one read-only pass.
 
     `outboxes` maps instance name -> that instance's outbox file (the caller derives
     them with config's `outbox_path_for`, the same per-tenant split ENH-7 enforces on
-    the write side).
+    the write side). `parity_dir` holds the panels differ runs persisted
+    (--panel-json) and `tombstones` is core/retention.py's db; both are optional
+    because parity is a gate an adopter runs, not state the engine always has —
+    unwired is silent, wired-but-absent is reported missing.
 
     Returns::
 
@@ -148,6 +224,7 @@ def snapshot(journal_path: str | Path, outboxes: dict[str, str | Path] | None = 
         missing     paths that do not exist yet — reported, never created
         journal     distinct/unanswered/answered/by_kind counts, or None if missing
         outbox      instance name -> per-state counts, or None if that file is missing
+        parity      channel -> verdict panel (ENH-24), or None if no panel exists yet
     """
     queues: dict[str, list] = {s: [] for s in SEVERITY}
     missing: list[str] = []
@@ -169,9 +246,21 @@ def snapshot(journal_path: str | Path, outboxes: dict[str, str | Path] | None = 
             for sev, found in o_items.items():
                 queues[sev].extend(found)
 
+    panels = None
+    if parity_dir is not None:
+        p_items, panels = _parity_view(
+            Path(parity_dir), None if tombstones is None else Path(tombstones))
+        if p_items is None:
+            missing.append(str(parity_dir))
+        else:
+            queues["engine_lost"].extend(p_items)
+            if tombstones is not None and not Path(tombstones).is_file():
+                missing.append(str(tombstones))
+
     return {
         "attention": [item for sev in SEVERITY for item in queues[sev]],
         "missing": missing,
         "journal": j_counts,
         "outbox": outbox_counts,
+        "parity": panels,
     }

@@ -25,6 +25,7 @@ installed and skipped honestly where it is not — the data layer's properties h
 either way.
 """
 import ast
+import json
 import os
 import shutil
 import sqlite3
@@ -39,6 +40,8 @@ sys.path.insert(0, str(ROOT))
 from core.dashboard import DashboardError, open_ro, snapshot  # noqa: E402
 from core.journal import Journal  # noqa: E402
 from core.outbox import Outbox, _Crash  # noqa: E402
+from core.parity import compare  # noqa: E402
+from core.retention import Tombstones  # noqa: E402
 
 SCRIPT = ROOT / "scripts" / "dashboard.py"
 SERVE = ROOT / "scripts" / "dashboard-serve.sh"
@@ -101,6 +104,32 @@ def seed_outbox(path):
     ob.close()
 
 
+def seed_parity(parity_dir, tombstones_db=None, lossy=True, clean=True):
+    """Panels written from the REAL differ's panel() (never hand-built dicts, so a
+    schema change in core/parity.py goes red here), plus tombstones recorded through
+    the real core/retention.py — the dashboard must read both."""
+    parity_dir = Path(parity_dir)
+    parity_dir.mkdir(parents=True, exist_ok=True)
+    if lossy:
+        # 2 ENGINE_LOST + 2 UNRETRIEVABLE: verdict FAIL, raw missed=4.
+        panel = compare({"2.0", "3.0", "4.0", "5.0", "6.0"}, {"2.0"}, "C_LOST",
+                        served_ts={"2.0", "3.0", "4.0"},
+                        accept=("UNRETRIEVABLE", "PRE_ORACLE_FLOOR")).panel()
+        (parity_dir / "panel-C_LOST.json").write_text(
+            json.dumps({**panel, "generated_at": 1000.0}))
+    if clean:
+        # The R8 shape: every divergence accepted, verdict OK despite raw missed=2.
+        panel = compare({"2.0", "3.0", "4.0", "5.0"}, {"2.0", "3.0", "1.0"}, "C_CLEAN",
+                        served_ts={"2.0", "3.0"},
+                        accept=("UNRETRIEVABLE", "PRE_ORACLE_FLOOR")).panel()
+        (parity_dir / "panel-C_CLEAN.json").write_text(
+            json.dumps({**panel, "generated_at": 1000.0}))
+    if tombstones_db is not None:
+        t = Tombstones(tombstones_db)
+        t.record("C_LOST", ["9.1", "9.2", "9.3"])
+        t.close()
+
+
 class SnapshotTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -121,11 +150,13 @@ class SnapshotTest(unittest.TestCase):
         """The explicit order, NOT derived from the module's own constant — a reordered
         constant must fail here, not re-derive the expectation."""
         sevs = [i["severity"] for i in self.snap()["attention"]]
-        self.assertEqual(sevs, sorted(sevs, key=["in_flight", "edited_after_response",
+        self.assertEqual(sevs, sorted(sevs, key=["engine_lost", "in_flight",
+                                                 "edited_after_response",
                                                  "staged", "unanswered"].index))
         self.assertEqual(sevs[0], "in_flight",
-                         "a send that may have died mid-flight is the one item that "
-                         "can double-message someone — nothing outranks it")
+                         "with no proven parity loss, a send that may have died "
+                         "mid-flight can double-message someone — nothing else "
+                         "outranks it")
         self.assertEqual(sevs[-1], "unanswered")
 
     def test_in_flight_is_exactly_the_intent_and_sent_rows(self):
@@ -182,6 +213,120 @@ class SnapshotTest(unittest.TestCase):
         self.assertIsNone(s["outbox"]["team"])
         self.assertEqual(list(empty.iterdir()), [],
                          "the viewer created state while reporting it missing")
+
+
+class ParityViewTest(unittest.TestCase):
+    """ENH-24: the dashboard shows the parity VERDICT, not raw divergence counts.
+
+    The panel is the persisted artifact of a differ run (core/parity.py
+    --panel-json); the tombstone count is read live from the retention db. A
+    nonzero ENGINE_LOST outranks everything else on the board, because every other
+    queue item is READ FROM the engine's archive — a proven loss says that archive
+    is wrong, so nothing below it can be trusted until it is 0.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.journal = self.base / "journal.db"
+        self.outbox = self.base / "outbox-team.db"
+        self.parity = self.base / "parity"
+        self.tomb = self.base / "tombstones.db"
+        seed_journal(self.journal)
+        seed_outbox(self.outbox)
+        seed_parity(self.parity, self.tomb)
+
+    def snap(self, **kw):
+        return snapshot(self.journal, {"team": self.outbox}, **kw)
+
+    def lost_items(self, s):
+        return [i for i in s["attention"] if i["severity"] == "engine_lost"]
+
+    def test_a_nonzero_engine_lost_outranks_even_an_in_flight_send(self):
+        s = self.snap(parity_dir=self.parity, tombstones=self.tomb)
+        sevs = [i["severity"] for i in s["attention"]]
+        self.assertEqual(sevs[0], "engine_lost",
+                         "an in-flight send can double-message someone; ENGINE_LOST "
+                         "means the archive every other item is read from is wrong — "
+                         "it takes the top of the queue")
+        self.assertIn("in_flight", sevs)
+        self.assertEqual(sevs, sorted(sevs, key=["engine_lost", "in_flight",
+                                                 "edited_after_response",
+                                                 "staged", "unanswered"].index))
+
+    def test_the_parity_item_names_the_channel_and_the_loss(self):
+        item = self.lost_items(self.snap(parity_dir=self.parity,
+                                         tombstones=self.tomb))[0]
+        self.assertEqual(item["where"], "C_LOST")
+        self.assertIn("ENGINE_LOST=2", item["text"])
+        self.assertEqual(item["state"], "PARITY FAIL")
+        self.assertEqual(item["ts"], 1000.0,
+                         "the verdict's own timestamp — the operator must be able "
+                         "to judge whether it is stale")
+
+    def test_a_clean_panel_raises_no_attention_but_still_shows_its_verdict(self):
+        """'Clean, for a stated reason' renders as a panel, never as an alarm —
+        and never as a scary raw count (the panel still holds raw missed=2)."""
+        clean_only = self.base / "parity-clean"
+        seed_parity(clean_only, lossy=False)
+        s = self.snap(parity_dir=clean_only, tombstones=self.tomb)
+        self.assertEqual(self.lost_items(s), [])
+        self.assertEqual(s["parity"]["C_CLEAN"]["verdict"], "PARITY OK")
+        self.assertEqual(s["parity"]["C_CLEAN"]["engine_lost"], 0)
+
+    def test_the_tombstone_count_comes_from_the_retention_db(self):
+        s = self.snap(parity_dir=self.parity, tombstones=self.tomb)
+        self.assertEqual(s["parity"]["C_LOST"]["tombstones"], 3)
+        self.assertEqual(s["parity"]["C_CLEAN"]["tombstones"], 0,
+                         "the db exists and holds no rows for this channel — an "
+                         "honest zero, unlike a missing db")
+
+    def test_a_missing_tombstone_db_reads_unknown_never_zero(self):
+        ghost = self.base / "no-tombstones.db"
+        s = self.snap(parity_dir=self.parity, tombstones=ghost)
+        self.assertIsNone(s["parity"]["C_LOST"]["tombstones"],
+                          "no retention db means the deletion history is UNKNOWN — "
+                          "0 would claim 'nothing was ever deleted' on no evidence")
+        self.assertIn(str(ghost), s["missing"])
+        self.assertFalse(ghost.exists(), "the viewer minted a tombstone db")
+
+    def test_a_missing_parity_dir_is_reported_never_rendered_as_clean(self):
+        nowhere = self.base / "never-ran-parity"
+        s = self.snap(parity_dir=nowhere, tombstones=self.tomb)
+        self.assertIsNone(s["parity"],
+                          "no panels means parity is UNKNOWN, not OK and not zero")
+        self.assertIn(str(nowhere), s["missing"])
+        self.assertEqual(self.lost_items(s), [])
+        self.assertFalse(nowhere.exists(), "the viewer created the parity dir")
+
+    def test_unwired_parity_claims_nothing_and_reports_nothing_missing(self):
+        s = self.snap()
+        self.assertIsNone(s["parity"])
+        self.assertEqual(s["missing"], [],
+                         "a caller that never wired parity must not be nagged "
+                         "about a path it never named")
+
+    def test_a_malformed_panel_is_refused_by_name(self):
+        (self.parity / "panel-bad.json").write_text("{not json")
+        with self.assertRaises(DashboardError) as ctx:
+            self.snap(parity_dir=self.parity, tombstones=self.tomb)
+        self.assertIn("panel-bad.json", str(ctx.exception),
+                      "a broken panel must not read as 'no parity' — the operator "
+                      "needs the file that is wrong")
+
+    def test_a_wrong_shaped_panel_is_refused_by_name(self):
+        """Valid JSON that is not a panel must not render a verdict nobody computed."""
+        (self.parity / "panel-shape.json").write_text('{"hello": 1}')
+        with self.assertRaises(DashboardError) as ctx:
+            self.snap(parity_dir=self.parity, tombstones=self.tomb)
+        self.assertIn("panel-shape.json", str(ctx.exception))
+
+    def test_the_snapshot_leaves_parity_state_byte_identical(self):
+        panel_file = self.parity / "panel-C_LOST.json"
+        before = (panel_file.read_bytes(), self.tomb.read_bytes())
+        self.snap(parity_dir=self.parity, tombstones=self.tomb)
+        self.assertEqual((panel_file.read_bytes(), self.tomb.read_bytes()), before)
 
 
 class ReadOnlyTest(unittest.TestCase):
@@ -294,6 +439,32 @@ class DashboardAppTest(unittest.TestCase):
         self.assertIn(DRAFT, body, "the staged draft never reached the operator gate "
                                    "surface")
         self.assertIn(ASK, body, "the unanswered ask is not on the surface")
+
+    def test_the_parity_panel_leads_with_the_verdict_on_the_operator_surface(self):
+        """ENH-24 end to end: ENGINE_LOST and the class breakdown lead, the
+        accept-list in force is named, the tombstone count shows, the raw counts
+        are demoted to a footnote, and the loss is the FIRST attention card."""
+        from core.config import load
+        cfg = load(self.base / "settings.json")
+        cfg.state_dir.mkdir(parents=True, exist_ok=True)
+        seed_journal(cfg.journal_path)
+        seed_outbox(cfg.outbox_path_for("team"))
+        seed_parity(cfg.state_dir / "parity", cfg.state_dir / "tombstones.db")
+        at = self.run_app(self.base / "settings.json")
+        self.assertFalse(at.exception, f"the app crashed: {at.exception}")
+        body = self.rendered(at)
+        self.assertIn("ENGINE_LOST = 2", body)
+        self.assertIn("accept-list in force: PRE_ORACLE_FLOOR, UNRETRIEVABLE", body,
+                      "the operator judging a verdict must see WHAT was waived, "
+                      "by name")
+        self.assertIn("tombstones: 3", body)
+        self.assertLess(body.index("ENGINE_LOST = "), body.index("raw divergence"),
+                        "the raw missed/extra counts belong below the verdict — "
+                        "a raw count is not a verdict")
+        cards = [str(m.value) for m in at.markdown
+                 if "border-left" in str(m.value)]
+        self.assertIn("ENGINE LOST", cards[0],
+                      "a proven loss sorts to the top of the attention queue")
 
     def test_a_fresh_clone_renders_guidance_not_a_stacktrace(self):
         at = self.run_app(self.base / "settings.json")
