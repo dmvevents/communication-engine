@@ -144,21 +144,35 @@ class Outbox:
         key = idempotency_key(target, trigger_ts, text)
         row = self.get(key)
 
-        # R2: already delivered (or proven) — return the existing receipt, do NOT re-send.
-        if row and row["state"] in (VERIFIED, COMMITTED):
-            return {"key": key, "receipt": row["receipt"], "state": row["state"],
-                    "deduped": True}
-        if row and row["state"] == STAGED:
-            return {"key": key, "receipt": None, "state": STAGED, "deduped": True}
-
         if row is None:
-            self.conn.execute(
-                "INSERT INTO outbox (key, target, trigger_ts, text, state, policy, "
-                "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            # This INSERT is also the CLAIM on the ladder below: concurrent senders of
+            # the same reply race the SELECT above, and the primary key must arbitrate
+            # to exactly one owner. OR IGNORE because the loser's insert is a clean
+            # no-op, not an IntegrityError crash (6-sender probe delivered 3× before
+            # this, fire=13).
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO outbox (key, target, trigger_ts, text, state, "
+                "policy, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
                 (key, target, str(trigger_ts), text,
                  STAGED if policy == "staged" else INTENT,
                  policy, time.time(), time.time()))
             self.conn.commit()      # R1: INTENT is durable BEFORE the adapter is touched
+            if cur.rowcount == 0:   # lost the SELECT→INSERT race; read what the winner wrote
+                row = self.get(key)
+
+        if row is not None:
+            # R2: already delivered (or proven) — return the existing receipt, do NOT re-send.
+            if row["state"] in (VERIFIED, COMMITTED):
+                return {"key": key, "receipt": row["receipt"], "state": row["state"],
+                        "deduped": True}
+            if row["state"] == STAGED:
+                return {"key": key, "receipt": None, "state": STAGED, "deduped": True}
+            # INTENT/SENT: another sender holds the claim. Sending here is the
+            # double-delivery bug — and if the claimant DIED mid-flight, only
+            # read-back can tell "sent, unrecorded" from "never sent", so the row
+            # belongs to recover(), never to a second live send.
+            return {"key": key, "receipt": None, "state": row["state"],
+                    "in_flight": True}
 
         if policy == "staged":
             # Draft only. The operator gates the actual send; the adapter is never called.

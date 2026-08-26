@@ -309,8 +309,10 @@ class AuditLinkTest(unittest.TestCase):
 
 
 class ConcurrencyTest(unittest.TestCase):
-    """The outbox held under 6 concurrent senders when probed. A property that holds by
-    accident is one refactor from breaking, so it is pinned here."""
+    """This probe caught the outbox delivering 3× from 6 concurrent senders (fire=13):
+    the property really did hold only by accident. The INTENT insert is now the claim
+    (see the deterministic window tests in test_outbox_faults); this stays as the
+    whole-system stress that found the race in the first place."""
 
     def test_concurrent_senders_deliver_exactly_once(self):
         import threading

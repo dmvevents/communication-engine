@@ -110,10 +110,10 @@ run_mutation "parity: swallow query errors and return an empty set" \
 # double-message a customer in Anton's name or silently drop a reply.
 # ---------------------------------------------------------------------------
 
-# R2 — dedupe. Without it, a retry re-sends an already-delivered message.
+# R2 — dedupe. Without it, a retry is never answered with the delivered receipt.
 run_mutation "outbox: drop the already-delivered dedupe" \
   "core/outbox.py" \
-  "('        if row and row[\"state\"] in (VERIFIED, COMMITTED):', '        if False:')" \
+  "('            if row[\"state\"] in (VERIFIED, COMMITTED):', '            if False:')" \
   "test_outbox_faults"
 
 # R1 — recovery must PROVE prior delivery by read-back before re-sending. This is the
@@ -139,6 +139,20 @@ run_mutation "outbox: default policy becomes direct instead of never" \
 run_mutation "outbox: staged target falls through to the adapter" \
   "core/outbox.py" \
   "('            return {\"key\": key, \"receipt\": None, \"state\": STAGED, \"staged\": True}', '            pass')" \
+  "test_outbox_faults"
+
+# R2 — the INTENT insert IS the claim between concurrent senders. A plain INSERT turns
+# the SELECT→INSERT race into an IntegrityError crash instead of a clean dedupe.
+run_mutation "outbox: INTENT insert stops arbitrating concurrent claims" \
+  "core/outbox.py" \
+  "('INSERT OR IGNORE INTO outbox', 'INSERT INTO outbox')" \
+  "test_outbox_faults"
+
+# R2 — a row another sender holds in flight must never fall through to the adapter.
+# This is the 3-deliveries-from-6-senders race the loop caught live (fire=13).
+run_mutation "outbox: an in-flight row falls through to a second live send" \
+  "core/outbox.py" \
+  "('            return {\"key\": key, \"receipt\": None, \"state\": row[\"state\"],\n                    \"in_flight\": True}', '            pass')" \
   "test_outbox_faults"
 
 # ---------------------------------------------------------------------------

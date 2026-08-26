@@ -19,3 +19,6 @@ outbox/
 __pycache__/
 *.pyc
 .venv/
+
+# ephemeral working files (evidence kept locally, never shipped)
+scratch/

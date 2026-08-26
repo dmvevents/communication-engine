@@ -191,6 +191,68 @@ class Harness(unittest.TestCase):
         with self.assertRaises(SendBlocked):
             b.send(TARGET, TS, TEXT)
 
+    # ---- concurrent senders (the INTENT insert is the claim) ---------------
+    # The 6-thread probe in test_journal.ConcurrencyTest caught this racing in the
+    # wild (3 deliveries from 6 senders, fire=13); these two force each window
+    # deterministically so the property can never again hold only by timing luck.
+
+    def test_a_second_sender_mid_flight_does_not_double_deliver(self):
+        """While one sender is inside adapter.send, a second sender of the SAME
+        message must not reach the adapter — its row is INTENT, and only read-back
+        (recover()'s job) can ever prove whether that in-flight send landed."""
+        import threading
+        in_flight, release = threading.Event(), threading.Event()
+        outer = self
+
+        class MidFlight(FakeAdapter):
+            def send(self, target, text, key=None):
+                in_flight.set()
+                release.wait(5)
+                return super().send(target, text, key=key)
+
+        adapter = MidFlight()
+
+        def claimant():   # own Outbox in-thread: sqlite connections are thread-bound
+            Outbox(outer.db, adapter, outer.policies).send(TARGET, TS, TEXT)
+
+        t = threading.Thread(target=claimant)
+        t.start()
+        try:
+            self.assertTrue(in_flight.wait(5), "claimant never reached the adapter")
+            r = Outbox(self.db, adapter, self.policies).send(TARGET, TS, TEXT)
+        finally:
+            release.set()
+            t.join(5)
+        self.assertEqual(adapter.send_calls, 1,
+                         "a second sender reached the adapter while the first was "
+                         "mid-flight — this double-messages a customer")
+        self.assertTrue(r.get("in_flight"),
+                        "the losing sender must say the send is in flight, not "
+                        "pretend it delivered")
+        self.assertEqual(r["state"], "INTENT")
+
+    def test_losing_the_intent_insert_race_neither_raises_nor_double_delivers(self):
+        """The SELECT→INSERT window: our get() saw no row, but another sender's
+        INSERT lands before ours. The primary key must arbitrate to a clean dedupe,
+        not an IntegrityError crash and not a second delivery."""
+        winner = self.box()
+        winner.send(TARGET, TS, TEXT)          # the racing winner completed first
+
+        class StaleRead(Outbox):
+            stale = True
+
+            def get(self, key):
+                if StaleRead.stale:            # our SELECT ran before their INSERT
+                    StaleRead.stale = False
+                    return None
+                return super().get(key)
+
+        r = StaleRead(self.db, self.adapter, self.policies).send(TARGET, TS, TEXT)
+        self.assertEqual(self.adapter.send_calls, 1,
+                         "losing the insert race re-delivered the message")
+        self.assertTrue(r["deduped"])
+        self.assertEqual(r["state"], COMMITTED)
+
     # ---- idempotency key --------------------------------------------------
     def test_key_is_stable_and_content_sensitive(self):
         k1 = idempotency_key(TARGET, TS, TEXT)
