@@ -22,7 +22,11 @@ What does NOT ship is listed where an adopter acts: the quickstart's honest-limi
 Notably there is no live send path (the outbox ladder is complete, but only the `fake`
 adapter exposes `send()`) and `watchers/` is a stub. A reference scheduler ships
 (`scripts/scheduler.py`): a guarded, read-only probe → classify → journal → route → owed
-loop you run under your own supervisor.
+loop you run under your own supervisor. An operator dashboard ships too
+(`scripts/dashboard.py` over `core/dashboard.py`): a read-only, loopback-only Streamlit
+surface over YOUR journal and outboxes — severity-ordered attention (crashed sends,
+answers invalidated by edits, drafts at the gate, the unanswered backlog); streamlit is
+the one optional extra it needs, and the engine core never imports it.
 
 ## Quickstart
 

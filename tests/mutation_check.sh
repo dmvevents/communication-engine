@@ -1401,6 +1401,54 @@ run_mutation "config: credentials accumulate across instances" \
   "('        auth = {k: resolve_secret(v, env) for k, v in (spec.get(\"auth\") or {}).items()}', '        auth = dict(instances[-1].auth) if instances else {}\n        auth.update({k: resolve_secret(v, env) for k, v in (spec.get(\"auth\") or {}).items()})')" \
   "test_isolation"
 
+# ENH-8 — the viewer property. mode=ro is what makes the dashboard structurally unable
+# to alter the audit trail it displays; a writable connection is one bug from an editor.
+run_mutation "dashboard: the read connection accepts writes" \
+  "core/dashboard.py" \
+  "('sqlite3.connect(f\"file:{p}?mode=ro\", uri=True)', 'sqlite3.connect(f\"file:{p}?mode=rwc\", uri=True)')" \
+  "test_dashboard"
+
+# ENH-8 — an INTENT/SENT row is a send that may have died mid-flight (the 24-reconcile
+# seam, viewed from the operator's side). Dropping it hides double-message risk.
+run_mutation "dashboard: crashed in-flight sends vanish from the attention queue" \
+  "core/dashboard.py" \
+  "(\"WHERE state IN ('INTENT','SENT')\", \"WHERE state IN ('COMMITTED')\")" \
+  "test_dashboard"
+
+# ENH-8 — the operator gate: a staged draft the surface never shows is a draft nobody
+# ever approves, which silently turns 'staged' policy into 'never'.
+run_mutation "dashboard: staged drafts leave the operator gate" \
+  "core/dashboard.py" \
+  "(\"WHERE state='STAGED'\", \"WHERE state='STAGED' AND 0\")" \
+  "test_dashboard"
+
+# ENH-8 — severity order: the banner exists so the double-message risk is read FIRST.
+run_mutation "dashboard: the unanswered backlog outranks a crashed send" \
+  "core/dashboard.py" \
+  "('SEVERITY = (\"in_flight\", \"edited_after_response\", \"staged\", \"unanswered\")', 'SEVERITY = (\"unanswered\", \"edited_after_response\", \"staged\", \"in_flight\")')" \
+  "test_dashboard"
+
+# ENH-8/R23 — an edit after our answer means the visible reply may answer text that no
+# longer exists; comparing the wrong way round buries exactly those rows.
+run_mutation "dashboard: an edit after our answer stops being surfaced" \
+  "core/dashboard.py" \
+  "('r.recorded_at > j.responded_at', 'r.recorded_at < j.responded_at')" \
+  "test_dashboard"
+
+# ENH-8 — HARD security bound: the UI renders journal text and staged drafts, so the
+# serve wrapper must bind loopback only; streamlit's own default is every interface.
+run_mutation "dashboard-serve: the UI binds beyond loopback" \
+  "scripts/dashboard-serve.sh" \
+  "('--server.address 127.0.0.1', '--server.address 0.0.0.0')" \
+  "test_dashboard"
+
+# ENH-8 — the acceptance itself: THEIR journal and outbox, resolved from THEIR config.
+# A hardwired state path renders this repo's state and calls it the adopter's.
+run_mutation "dashboard-script: reads a hardwired path instead of the adopter's config" \
+  "scripts/dashboard.py" \
+  "('snap = snapshot(cfg.journal_path, outbox_paths)', 'snap = snapshot(Path(\"state/journal.db\"), outbox_paths)')" \
+  "test_dashboard"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }

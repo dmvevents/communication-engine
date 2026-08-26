@@ -233,6 +233,30 @@ or goes quiet while a recorded driver is verifiably alive
 (`owed.attach_driver(id, "pid:1234")` — a pid, because a plan written to a file is not
 a driver; only a live process makes progress).
 
+## 9. Watch it — the operator dashboard (optional)
+
+Everything so far runs on the standard library. The dashboard is the one place that
+wants a third-party package: `pip install streamlit` (the engine core never imports
+it, and every other step works without it).
+
+```sh
+COMMS_SETTINGS=settings.json scripts/dashboard-serve.sh
+```
+
+Then browse `http://127.0.0.1:8502` — from another machine, tunnel first:
+`ssh -L 8502:127.0.0.1:8502 <host>`. The wrapper binds **loopback only**, on purpose:
+the page shows journal text and staged drafts, so it is never put on an open port
+(a test pins the bind address).
+
+What you get is the attention queue, severity first: sends that may have died
+mid-flight (run `Outbox.recover()`), answers invalidated by a later edit, drafts
+waiting at the operator gate with their exact text, then the unanswered backlog —
+all read from YOUR `journal.db` and one outbox per instance, as resolved by YOUR
+`settings.json`. It is a viewer by construction: every database connection is
+read-only (`core/dashboard.py` opens sqlite `mode=ro`), the send layer is never even
+imported (same AST-enforced rule as the scheduler), and state that does not exist yet
+is *reported* missing — never silently created, never rendered as a healthy zero.
+
 ## What to expect next
 
 - `state/journal.db` — one row per distinct inbound message, with its classification and
