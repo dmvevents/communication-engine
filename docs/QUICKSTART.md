@@ -130,10 +130,12 @@ on your own message samples.
 
 ## Honest limits
 
-- The **`fake` adapter is the only one implemented**; `slack` and `telegram` are contract
-  stubs (design READMEs, no `adapter.py` — the engine refuses them by name until one lands).
+- Two adapters ship: **`fake`** (in-memory dry-run) and **`slack`** — and the slack one is
+  **read-only on purpose** (poll/resolve/health; it exposes no send path at any layer, and
+  `tests/test_slack_adapter.py` fails if one appears). `telegram` remains a contract stub
+  (design README, no `adapter.py` — the engine refuses it by name until one lands).
   "Multi-channel" is so far proven as a *mechanism* — a new channel type is a directory drop
-  with zero `core/` changes (`tests/test_extensibility.py`) — not as shipped platform adapters.
+  with zero `core/` changes (`tests/test_extensibility.py`) — plus one real platform, not two.
 - **Read parity against an existing system has not been demonstrated** over a long window
   (gate G1). If you are replacing an incumbent, run both and diff before trusting this one.
 - There is **no scheduler in this repo**. `scripts/first-poll.py` runs exactly one cycle;

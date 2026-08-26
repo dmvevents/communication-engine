@@ -110,8 +110,8 @@ class ThirdAdapterZeroCoreChangeTest(unittest.TestCase):
         self.assertIn("aviary", str(ctx.exception))
 
     def test_a_directory_without_the_entry_point_is_not_a_channel_type(self):
-        """channels/slack today is README-only; offering it as loadable would recreate the
-        silently-inert-instance defect the loud refusal exists to prevent."""
+        """channels/telegram today is README-only; offering it as loadable would recreate
+        the silently-inert-instance defect the loud refusal exists to prevent."""
         d = self.channels / "docsonly"
         d.mkdir(parents=True)
         (d / "README.md").write_text("design notes, no adapter.py")

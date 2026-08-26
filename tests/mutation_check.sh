@@ -462,6 +462,48 @@ run_mutation "first-poll: a polled message is no longer journaled" \
   "('    return journal.record(', '    return object() or journal.record(')" \
   "test_docs"
 
+# ---------------------------------------------------------------------------
+# ENH-18 — the slack adapter is read-only BY AUTHORIZATION (operator granted the
+# token read-only, 2026-08-26). Each of these mutations, if it survived, would let a
+# write reach the workspace, silently lose polled history, or blind the engine's
+# (instance, method) back-off.
+# ---------------------------------------------------------------------------
+
+# ENH-18 — THE read-only property: the transport's deny-by-default allowlist. With
+# it gone, chat.postMessage is one _api call away, in Anton's name.
+run_mutation "slack: transport allowlist deleted (write methods reach the wire)" \
+  "channels/slack/adapter.py" \
+  "('        if method not in READ_METHODS:', '        if False:')" \
+  "test_slack_adapter"
+
+# ENH-18 — gap-free polling: stopping at page one silently loses every older message
+# in the window, and the cursor then advances PAST them — unrecoverable.
+run_mutation "slack: pagination stops after the first page (history silently truncated)" \
+  "channels/slack/adapter.py" \
+  "('            if not payload.get(\"has_more\"):', '            if True:')" \
+  "test_slack_adapter"
+
+# ENH-18 — the wait is the platform's number EXACTLY (ENH-1); a guessed constant
+# either hammers the platform or invents a limit it never stated.
+run_mutation "slack: Retry-After header discarded (a guess replaces the platform's wait)" \
+  "channels/slack/adapter.py" \
+  "('            ex = RateLimited(_header(headers, \"Retry-After\", \"1\"), method=method)', '            ex = RateLimited(\"1\", method=method)')" \
+  "test_slack_adapter"
+
+# ENH-18 — an unlabelled 429 collapses the engine's keyed back-off to global scope:
+# a read 429 would then pause every other method on the workspace.
+run_mutation "slack: 429 stripped of its method (keyed back-off collapses to global)" \
+  "channels/slack/adapter.py" \
+  "('            ex = RateLimited(_header(headers, \"Retry-After\", \"1\"), method=method)', '            ex = RateLimited(_header(headers, \"Retry-After\", \"1\"))')" \
+  "test_slack_adapter"
+
+# ENH-18 — contract rule 5: a health check that cannot fail is the incumbent's inert
+# check wearing a new name (docs/PROVENANCE.md — the defect this repo exists to kill).
+run_mutation "slack: health reports auth_ok on a failed auth.test" \
+  "channels/slack/adapter.py" \
+  "('            return {\"reachable\": True, \"auth_ok\": False,', '            return {\"reachable\": True, \"auth_ok\": True,')" \
+  "test_slack_adapter"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }

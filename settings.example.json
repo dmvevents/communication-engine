@@ -11,7 +11,10 @@
     {
       "name": "example-slack-workspace",
       "adapter": "slack",
-      "auth": { "token": "env:SLACK_API_ENV_REF" },
+      "auth": {
+        "token": "env:SLACK_API_ENV_REF",
+        "channels": "env:SLACK_CHANNELS_ENV_REF"
+      },
       "self_user_id": "U_EXAMPLE_SELF",
       "channels": [
         {

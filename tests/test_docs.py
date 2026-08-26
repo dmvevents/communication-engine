@@ -73,17 +73,23 @@ class HonestLimitsTest(unittest.TestCase):
                           f"a known, load-bearing limit ({gap}) vanished from the doc "
                           "while still being true")
 
-    def test_the_only_shipped_adapter_claim_matches_the_filesystem(self):
-        """The limits section claims only `fake` ships. Check the claim against reality:
-        when a real adapter lands, THIS test fails, forcing the limits section (and this
-        assertion) to be updated in the same change — the doc cannot drift quietly."""
+    def test_the_shipped_adapter_claim_matches_the_filesystem(self):
+        """The limits section claims exactly `fake` + `slack` (read-only) ship. Check the
+        claim against reality: when another adapter lands, THIS test fails, forcing the
+        limits section (and this assertion) to be updated in the same change — the doc
+        cannot drift quietly. (It fired exactly as designed when `slack` landed.)"""
         self.assertIn("fake", self.limits,
                       "the limits section no longer names the fake adapter")
+        self.assertIn("slack", self.limits,
+                      "the limits section no longer names the slack adapter")
+        self.assertIn("read-only", self.limits,
+                      "the slack adapter's defining limit — read-only, no send path — "
+                      "vanished from the doc while still being true")
         shipped = set(discover_adapters(ROOT / "channels"))
         self.assertEqual(
-            shipped, {"fake"},
+            shipped, {"fake", "slack"},
             f"channels/ now ships {sorted(shipped)} but docs/QUICKSTART.md's honest-limits "
-            "section still claims only 'fake' is implemented — rewrite the limits section, "
+            "section still claims fake + slack (read-only) — rewrite the limits section, "
             "then update this assertion")
 
 
