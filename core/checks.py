@@ -163,6 +163,35 @@ def delivery_gap_check(name: str, gaps: list) -> Verdict:
                           detail="no admitted delivery gaps outstanding")
 
 
+def deletion_burst_check(name: str, newly_unretrievable: int,
+                         budget: int | None) -> Verdict:
+    """R26: a SPIKE in upstream deletions must fail, because parity accepts the class.
+
+    The differ accepts `UNRETRIEVABLE` (342 rows were legitimately deleted upstream — see
+    state/parity/R8-DIVERGENCE-EXPLAINED.md), which means the class's *growth* is invisible
+    to it by design. `core/retention.py` turns each new deletion into an event; this judges
+    the rate.
+
+    A missing budget is a FAIL, not a pass — same rule as `freshness_check`: an
+    undefined threshold cannot clear a count, and defaulting to a generous number here
+    would silently tolerate exactly the mass deletion this check exists to catch.
+    """
+    if budget is None:
+        return Verdict.failed(
+            name, f"no deletion budget defined for {name} — {newly_unretrievable} newly "
+                  "unretrievable row(s) cannot be judged")
+    if newly_unretrievable > budget:
+        return Verdict.failed(
+            name, f"upstream deletion burst: {newly_unretrievable} row(s) we hold stopped "
+                  f"being retrievable since the last snapshot, over a budget of {budget} "
+                  "— parity ACCEPTS this class, so its growth is invisible there; confirm "
+                  "this was an intended deletion before waving it through",
+            inspected=newly_unretrievable)
+    return Verdict.passed(
+        name, inspected=1,
+        detail=f"{newly_unretrievable} newly unretrievable row(s) within budget {budget}")
+
+
 def freshness_check(name: str, age_s: float | None, budget_s: float | None,
                     action_only_log: bool = False) -> Verdict:
     """Age-vs-budget, with the action-only-log trap made explicit.

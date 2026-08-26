@@ -167,6 +167,44 @@ run_mutation "parity: a malformed platform snapshot degrades to no snapshot" \
   "('        raise ParityError(f\"platform snapshot {path} is not valid JSON: {ex}\") from ex', '        return set()')" \
   "test_parity"
 
+# R26 — the differ ACCEPTS the UNRETRIEVABLE class, so its growth is invisible there.
+# These are the guards that keep the blindness from moving into retention.py.
+run_mutation "retention: an empty previous snapshot reports 'nothing deleted'" \
+  "core/retention.py" \
+  "('    if not previous_served:', '    if False:')" \
+  "test_retention"
+
+run_mutation "retention: an empty current snapshot reported as a mass deletion" \
+  "core/retention.py" \
+  "('    if not current_served:', '    if False:')" \
+  "test_retention"
+
+run_mutation "retention: deletions counted for rows we never stored" \
+  "core/retention.py" \
+  "('    return (set(stored_ts) & previous_served) - current_served', '    return previous_served - current_served')" \
+  "test_retention"
+
+# R26 — the instant a row vanished is a fact about the past; a re-run must not move it.
+run_mutation "retention: tombstone instant rewritten on every re-run" \
+  "core/retention.py" \
+  "('                \"INSERT OR IGNORE INTO tombstones (channel_id, ts, detected_at) \"', '                \"INSERT OR REPLACE INTO tombstones (channel_id, ts, detected_at) \"')" \
+  "test_retention"
+
+run_mutation "checks: a deletion burst over budget passes anyway" \
+  "core/checks.py" \
+  "('    if newly_unretrievable > budget:', '    if False:')" \
+  "test_retention"
+
+run_mutation "checks: an undefined deletion budget treated as satisfied" \
+  "core/checks.py" \
+  "('    if budget is None:\n        return Verdict.failed(\n            name, f\"no deletion budget defined for {name}', '    if False:\n        return Verdict.failed(\n            name, f\"no deletion budget defined for {name}')" \
+  "test_retention"
+
+run_mutation "retention: a malformed snapshot degrades to an empty one" \
+  "core/retention.py" \
+  "('        raise RetentionError(f\"snapshot {path} is not valid JSON: {ex}\") from ex', '        return set()')" \
+  "test_retention"
+
 # R8 — a schema mismatch must not look like an empty channel.
 run_mutation "parity: swallow query errors and return an empty set" \
   "core/parity.py" \
