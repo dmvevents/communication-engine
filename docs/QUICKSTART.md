@@ -167,12 +167,17 @@ the dry run in step 5.
 
 ## Honest limits
 
-- Two adapters ship: **`fake`** (in-memory dry-run) and **`slack`** — and the slack one is
-  **read-only on purpose** (poll/resolve/health; it exposes no send path at any layer, and
-  `tests/test_slack_adapter.py` fails if one appears). `telegram` remains a contract stub
-  (design README, no `adapter.py` — the engine refuses it by name until one lands).
-  "Multi-channel" is so far proven as a *mechanism* — a new channel type is a directory drop
-  with zero `core/` changes (`tests/test_extensibility.py`) — plus one real platform, not two.
+- Three adapters ship: **`fake`** (in-memory dry-run), **`slack`** — **read-only on purpose**
+  (poll/resolve/health; it exposes no send path at any layer, and `tests/test_slack_adapter.py`
+  fails if one appears) — and **`slack_socket`** (Socket Mode push ingestion, equally
+  read-only). Push is for latency only: Socket Mode can MISS events, so the socket adapter is
+  never the truth — run `scripts/push-poll-parity.py` against the polling store continuously
+  before trusting it, and know that **it has not yet run against a live workspace** (that
+  needs an operator-created app-level token; see `channels/slack_socket/README.md`).
+  `telegram` remains a contract stub (design README, no `adapter.py` — the engine refuses it
+  by name until one lands). "Multi-channel" is so far proven as a *mechanism* — a new channel
+  type is a directory drop with zero `core/` changes (`tests/test_extensibility.py`) — plus
+  one real platform (two ingestion paths for it), not two platforms.
 - **Read parity against an existing system has not been demonstrated** over a long window
   (gate G1). If you are replacing an incumbent, run both and diff before trusting this one.
 - There is **no scheduler in this repo**. `scripts/first-poll.py` runs exactly one cycle;

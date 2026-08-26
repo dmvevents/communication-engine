@@ -74,23 +74,30 @@ class HonestLimitsTest(unittest.TestCase):
                           "while still being true")
 
     def test_the_shipped_adapter_claim_matches_the_filesystem(self):
-        """The limits section claims exactly `fake` + `slack` (read-only) ship. Check the
-        claim against reality: when another adapter lands, THIS test fails, forcing the
+        """The limits section claims exactly `fake` + `slack` + `slack_socket` ship. Check
+        the claim against reality: when another adapter lands, THIS test fails, forcing the
         limits section (and this assertion) to be updated in the same change — the doc
-        cannot drift quietly. (It fired exactly as designed when `slack` landed.)"""
+        cannot drift quietly. (It fired exactly as designed when `slack` landed, and again
+        when `slack_socket` landed.)"""
         self.assertIn("fake", self.limits,
                       "the limits section no longer names the fake adapter")
         self.assertIn("slack", self.limits,
                       "the limits section no longer names the slack adapter")
+        self.assertIn("slack_socket", self.limits,
+                      "the limits section no longer names the socket-mode adapter")
         self.assertIn("read-only", self.limits,
-                      "the slack adapter's defining limit — read-only, no send path — "
+                      "the slack adapters' defining limit — read-only, no send path — "
                       "vanished from the doc while still being true")
+        self.assertIn("push-poll-parity", self.limits,
+                      "the socket adapter's defining limit — push can MISS events, so it "
+                      "is only trustworthy under the continuous parity watch — vanished "
+                      "from the doc while still being true")
         shipped = set(discover_adapters(ROOT / "channels"))
         self.assertEqual(
-            shipped, {"fake", "slack"},
+            shipped, {"fake", "slack", "slack_socket"},
             f"channels/ now ships {sorted(shipped)} but docs/QUICKSTART.md's honest-limits "
-            "section still claims fake + slack (read-only) — rewrite the limits section, "
-            "then update this assertion")
+            "section still claims fake + slack (read-only) + slack_socket — rewrite the "
+            "limits section, then update this assertion")
 
 
 class DocCitationsTest(unittest.TestCase):

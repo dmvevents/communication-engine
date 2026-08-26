@@ -588,6 +588,75 @@ run_mutation "outbox: attempts are never recorded (the hold never engages)" \
   "('        self._pace_last[target] = self._clock()', '        pass')" \
   "test_outbox_pacing"
 
+# ---------------------------------------------------------------------------
+# ENH-14 — Socket Mode ingestion: push for latency, poll for truth. Each of these
+# mutations, if it survived, is a way for the push path to go silently deaf, or for
+# the parity watch that legitimizes it to stop telling the truth.
+# ---------------------------------------------------------------------------
+
+# ENH-14 — THE acceptance: the platform cycles connections and says so with a
+# disconnect frame; ignoring it keeps a dead socket and push goes silently deaf.
+run_mutation "socket: disconnect frames ignored (the connection is never re-established)" \
+  "channels/slack_socket/adapter.py" \
+  "('            if obj.get(\"type\") == \"disconnect\":', '            if False:')" \
+  "test_socket_adapter"
+
+# ENH-14 — Socket Mode tickets are single-use: a reconnect that replays the dead
+# connection's url is refused by the platform, permanently.
+run_mutation "socket: reconnect replays the dead connection's single-use url" \
+  "channels/slack_socket/adapter.py" \
+  "('        url = self._connections_open(timeout=timeout)', '        url = getattr(self, \"_last_url\", None) or self._connections_open(timeout=timeout)')" \
+  "test_socket_adapter"
+
+# ENH-14 — unacked envelopes are re-delivered and then DROPPED by the platform;
+# the ack is what keeps push delivery alive at all.
+run_mutation "socket: envelopes never acknowledged (the platform re-delivers, then drops)" \
+  "channels/slack_socket/adapter.py" \
+  "('            self._conn.send_text(json.dumps({\"envelope_id\": envelope_id}))', '            pass')" \
+  "test_socket_adapter"
+
+# ENH-14 — a foreign-channel ingest shows up as permanent 'extra' in the parity
+# watch: the differ compares exactly the watched channels.
+run_mutation "socket: unwatched channels ingested (foreign rows poison parity)" \
+  "channels/slack_socket/adapter.py" \
+  "('        if channel not in self._watched:', '        if False:')" \
+  "test_socket_adapter"
+
+# ENH-14 — message_changed/message_deleted are event-only wrappers history never
+# shows as rows; ingesting one is a divergence the poll side can never confirm away.
+run_mutation "socket: ephemeral edit wrappers ingested as new rows (permanent divergence)" \
+  "channels/slack_socket/adapter.py" \
+  "('        if event.get(\"subtype\") in EPHEMERAL_SUBTYPES:', '        if False:')" \
+  "test_socket_adapter"
+
+# ENH-14 — RFC 6455 §5.3: a compliant server MUST drop the connection on an unmasked
+# client frame — in production the link dies invisibly on the first ack.
+run_mutation "socket: client frames sent unmasked (a compliant server drops the link)" \
+  "channels/slack_socket/adapter.py" \
+  "('        self._sock.sendall(_encode_frame(OP_TEXT, text.encode(), os.urandom(4)))', '        self._sock.sendall(_encode_frame(OP_TEXT, text.encode(), None))')" \
+  "test_socket_adapter"
+
+# ENH-14 — THE parity acceptance: a watch that reports a divergence but exits clean
+# legitimizes a push path that is losing messages.
+run_mutation "parity-watch: a divergence is reported but the run exits clean" \
+  "scripts/push-poll-parity.py" \
+  "('            if not report.ok:', '            if False:')" \
+  "test_push_poll_parity"
+
+# ENH-14 — without the settled-window rule every fresh message is a false alarm,
+# and a watch that cries wolf gets muted — which is how a real loss slips through.
+run_mutation "parity-watch: unsettled push rows compared before poll catches up (false alarms)" \
+  "scripts/push-poll-parity.py" \
+  "('        push_ts = {t for t in push_ts if float(t) <= watermark}', '        pass')" \
+  "test_push_poll_parity"
+
+# ENH-14/R8 — an empty poll oracle downgraded to a pass is the vacuous-pass defect
+# this repo exists to kill, wearing yet another new name.
+run_mutation "parity-watch: an empty poll oracle downgraded to a clean pass" \
+  "scripts/push-poll-parity.py" \
+  "('        return 2', '        return 0')" \
+  "test_push_poll_parity"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }
