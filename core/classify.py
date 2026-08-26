@@ -33,8 +33,10 @@ import re
 from dataclasses import dataclass, field
 
 # Precedence: highest consequence first, EXCEPT that an exec verb with no directive is
-# downgraded rather than acted on.
-PRECEDENCE = ("EXEC-REQUEST", "COMMITMENT-ASK", "QUESTION", "STATEMENT")
+# downgraded rather than acted on. ATTACHMENT-ONLY sits outside the keyword ladder: it
+# can only fire when there is no text for the other classes to compete over (ENH-4).
+PRECEDENCE = ("EXEC-REQUEST", "COMMITMENT-ASK", "QUESTION", "ATTACHMENT-ONLY",
+              "STATEMENT")
 
 DEFAULT_EXEC_VERBS = ("run", "deploy", "test", "build", "rebuild", "launch", "start",
                       "scale", "retest", "reproduce", "apply", "restart", "merge")
@@ -93,10 +95,40 @@ def _word_hits(text: str, needles) -> list:
     return hits
 
 
-def classify(text: str, taxonomy: Taxonomy | None = None) -> Classification:
-    """Classify one message. Never raises; an empty message is a STATEMENT."""
+def _attachment_cues(attachments) -> list:
+    """Name the evidence (R22): 'image:screenshot.png' in a journal row is disputable
+    months later; a bare ATTACHMENT-ONLY kind is not. Junk shapes degrade to str()
+    because classify() never raises — an adapter bug must not un-journal a message."""
+    cues = []
+    for a in attachments:
+        if isinstance(a, dict):
+            cues.append(f"{a.get('kind') or 'attachment'}:"
+                        f"{a.get('name') or a.get('url') or 'unnamed'}")
+        else:
+            cues.append(str(a))
+    return cues
+
+
+def classify(text: str, taxonomy: Taxonomy | None = None,
+             attachments=None) -> Classification:
+    """Classify one message. Never raises; an empty message is a STATEMENT.
+
+    `attachments` is the normalized message's attachment list (ENH-4). The live system
+    downloads screenshots and treats them as content, so a message with no text but an
+    attachment must NOT read as an empty STATEMENT (ack-and-forget): the one thing the
+    engine knows is that content arrived which the text pipeline cannot read. When text
+    IS present it wins — a screenshot under "can you check this?" is already a QUESTION,
+    and the attachment adds content without overriding what the sender wrote.
+    """
     t = (text or "").strip()
+    atts = list(attachments or ())
     if not t:
+        if atts:
+            return Classification(
+                "ATTACHMENT-ONLY",
+                f"no text but {len(atts)} attachment(s) — content the text "
+                "classifier cannot read; needs eyes, not an auto-ack",
+                _attachment_cues(atts))
         return Classification("STATEMENT", "empty message")
     tax = taxonomy or Taxonomy()
 

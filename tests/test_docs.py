@@ -348,6 +348,41 @@ class FirstPollTest(unittest.TestCase):
                          "read-only by construction")
 
 
+class AttachmentBoundaryTest(unittest.TestCase):
+    """ENH-4 at the caller boundary — the same seam where the R22 cues once died:
+    first-poll stands between the adapter's normalized message and the classifier, and
+    a classify() call that passes only msg['text'] silently re-drops every attachment
+    however well both ends handle them. The journal row is the observable: an
+    image-only message must land as an explicit ATTACHMENT-ONLY decision, not as the
+    empty STATEMENT the live system acknowledged and forgot."""
+
+    def journal_message(self):
+        spec = importlib.util.spec_from_file_location("first_poll_enh4_test", FIRST_POLL)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.journal_message
+
+    def test_an_image_only_message_reaches_the_journal_as_attachment_only(self):
+        image_only = {"channel_type": "fake", "channel_id": "C_DEMO",
+                      "sender_id": "U_DEMO", "ts": "1.0", "text": "",
+                      "attachments": [{"kind": "image", "name": "screenshot.png",
+                                       "mimetype": "image/png",
+                                       "url": "https://files.example/x.png"}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            j = Journal(Path(tmp) / "journal.db")
+            try:
+                self.journal_message()(j, "C_DEMO", image_only, Taxonomy())
+                a = j.audit("C_DEMO", "1.0")
+            finally:
+                j.close()
+        self.assertEqual(a["kind"], "ATTACHMENT-ONLY",
+                         "the attachments never reached the classifier — the polled "
+                         "screenshot journals as an empty STATEMENT again")
+        self.assertIn("image:screenshot.png", a["matched"],
+                      "the decision does not name the attachment it saw — it cannot "
+                      "be disputed from the audit trail (R22)")
+
+
 class RealPollDocTest(unittest.TestCase):
     """R17: the quickstart must walk the adopter past the fake dry-run to THEIR real
     workspace — config alone, no code edits. The fake-adapter step proves the pipeline;

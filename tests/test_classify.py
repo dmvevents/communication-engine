@@ -170,6 +170,54 @@ class RobustnessTest(unittest.TestCase):
                          [classify(t).kind for t in texts])
 
 
+class AttachmentOnlyTest(unittest.TestCase):
+    """ENH-4: the live system downloads screenshots and treats them as content, but a
+    text-only pipeline sees an image-only message as empty — so it was classified as an
+    empty STATEMENT, acknowledged, and forgotten. 'No text but has an attachment' must
+    be an EXPLICIT outcome: the one thing the engine knows for sure is that content
+    arrived which the text classifier cannot read."""
+
+    IMAGE = {"kind": "image", "name": "screenshot.png",
+             "mimetype": "image/png", "url": "https://files.example/screenshot.png"}
+
+    def test_an_image_only_message_is_not_an_empty_statement(self):
+        c = classify("", attachments=[self.IMAGE])
+        self.assertEqual(c.kind, "ATTACHMENT-ONLY")
+        self.assertNotEqual(c.reason, "empty message",
+                            "a screenshot with no caption read as saying nothing — "
+                            "the exact silent drop ENH-4 exists to kill")
+
+    def test_the_decision_names_the_attachment_it_saw(self):
+        """R22 discipline: the journal row is where this decision gets disputed, and
+        'ATTACHMENT-ONLY because trust me' cannot be argued with."""
+        c = classify("", attachments=[self.IMAGE])
+        self.assertIn("image:screenshot.png", c.matched)
+
+    def test_whitespace_text_with_an_attachment_is_attachment_only(self):
+        self.assertEqual(classify("  \n", attachments=[self.IMAGE]).kind,
+                         "ATTACHMENT-ONLY")
+
+    def test_no_text_and_no_attachments_is_still_an_empty_statement(self):
+        for atts in (None, [], ()):
+            c = classify("", attachments=atts)
+            self.assertEqual((c.kind, c.reason), ("STATEMENT", "empty message"))
+
+    def test_text_alongside_an_attachment_classifies_on_the_text(self):
+        """A screenshot under 'can you check this?' is already a QUESTION; the
+        attachment adds content, never overrides what the sender wrote."""
+        c = classify("Can you check this?", attachments=[self.IMAGE])
+        self.assertEqual(c.kind, "QUESTION")
+        self.assertEqual(classify("Numbers attached.", attachments=[self.IMAGE]).kind,
+                         "STATEMENT")
+
+    def test_junk_attachment_shapes_never_raise(self):
+        """classify() never raises (its own contract); an adapter handing a bare
+        filename instead of a descriptor dict still gets an explicit decision."""
+        c = classify("", attachments=["trace.log"])
+        self.assertEqual(c.kind, "ATTACHMENT-ONLY")
+        self.assertIn("trace.log", c.matched)
+
+
 class AuditabilityTest(unittest.TestCase):
     """R22: a decision is disputable only if it NAMES the cues that produced it. The
     dispute may come months later, after the taxonomy changed — so the evidence must

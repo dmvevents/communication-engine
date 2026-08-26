@@ -272,6 +272,31 @@ class IngestTest(SocketAdapterTestCase):
         Store.validate(msgs[0])
 
 
+class AttachmentIngestTest(SocketAdapterTestCase):
+    """ENH-4, push side: the same message event carries the same `files` array Socket
+    Mode or history. Both ingestion paths must keep the upload, or push-vs-poll parity
+    would hold on ts while the two stores disagree about what the message contained."""
+
+    FILE = {"id": "F_X", "name": "screenshot.png", "title": "screenshot",
+            "mimetype": "image/png", "url_private": "https://files.example/x.png"}
+
+    def test_an_upload_carrying_event_keeps_its_attachment(self):
+        ev = message_event("1.0", text="", files=[self.FILE])
+        a = self.make([open_ok()], [FakeConn([envelope("e1", ev)])])
+        msgs, _ = a.poll(None)
+        atts = msgs[0]["attachments"]
+        self.assertEqual(len(atts), 1)
+        self.assertEqual(atts[0], {"kind": "image", "name": "screenshot.png",
+                                   "mimetype": "image/png",
+                                   "url": "https://files.example/x.png"})
+        Store.validate(msgs[0])
+
+    def test_a_fileless_event_carries_a_known_empty_list(self):
+        a = self.make([open_ok()], [FakeConn([envelope("e1", message_event("2.0"))])])
+        msgs, _ = a.poll(None)
+        self.assertEqual(msgs[0]["attachments"], [])
+
+
 class CursorTest(SocketAdapterTestCase):
     def test_repolling_the_same_cursor_returns_the_same_messages_never_fewer(self):
         """channels/CONTRACT.md: a re-poll may DUPLICATE, never lose. The buffer may

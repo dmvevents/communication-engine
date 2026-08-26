@@ -93,6 +93,24 @@ def _header(headers: dict, name: str, default=None):
     return default
 
 
+def _attachments(event):
+    """Same normalization as the polling adapter's (ENH-4): the message event carries
+    the same `files` array conversations.history shows, and both ingestion paths must
+    keep the upload — parity holds on ts, so the two stores could otherwise agree a
+    message exists while disagreeing about what it contained. Message-level
+    `attachments` (unfurls, bot decoration) are not content and are not ingested."""
+    out = []
+    for f in event.get("files") or ():
+        mimetype = f.get("mimetype") or None
+        out.append({
+            "kind": "image" if (mimetype or "").startswith("image/") else "file",
+            "name": f.get("name") or f.get("title"),
+            "mimetype": mimetype,
+            "url": f.get("url_private"),
+        })
+    return out
+
+
 # ---------------------------------------------------------------------------
 # RFC 6455 frame layer (client side), stdlib only.
 # ---------------------------------------------------------------------------
@@ -452,6 +470,7 @@ class Adapter:
             "ts": ts,
             "text": event.get("text", ""),
             "thread_id": thread if (thread and thread != ts) else None,
+            "attachments": _attachments(event),
             "raw": json.dumps(event, sort_keys=True),
         }
 

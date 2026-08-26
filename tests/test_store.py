@@ -3,6 +3,7 @@
 Requirements covered: R9 (idempotent re-ingest, schema pinned), R5 (a schema drift must
 raise rather than silently store nothing).
 """
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -161,6 +162,85 @@ class ArrivalTest(unittest.TestCase):
                                     msg(ts="4.2", channel_id="C_TWO")])
         self.assertEqual(set(self.store.arrivals("C_ONE")), {"4.1"})
         self.assertEqual(set(self.store.arrivals("C_TWO")), {"4.2"})
+
+
+class AttachmentFieldTest(unittest.TestCase):
+    """ENH-4: the live system downloads screenshots and treats them as content; a store
+    whose contract has no attachments field forces every adapter to drop them at ingest
+    — the message survives, the content does not."""
+
+    IMAGE = {"kind": "image", "name": "screenshot.png",
+             "mimetype": "image/png", "url": "https://files.example/screenshot.png"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.tmp.name) / "s.db")
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def stored(self, ts):
+        return self.store.conn.execute(
+            "SELECT attachments FROM messages WHERE ts=?", (ts,)).fetchone()[0]
+
+    def test_an_attachment_carrying_message_round_trips(self):
+        self.store.upsert_messages([msg(ts="1.1", text="", attachments=[self.IMAGE])])
+        self.assertEqual(json.loads(self.stored("1.1")), [self.IMAGE],
+                         "the attachment did not survive persistence — the silent "
+                         "drop just moved from the adapter to the store")
+
+    def test_known_empty_is_distinct_from_never_recorded(self):
+        """Same rule the journal keeps for cues (R22): [] means 'the adapter looked and
+        found none', NULL means 'this row predates the field' — a reader must be able
+        to tell an old row from an attachment-free one."""
+        self.store.upsert_messages([msg(ts="2.1", attachments=[]),
+                                    msg(ts="2.2")])
+        self.assertEqual(self.stored("2.1"), "[]")
+        self.assertIsNone(self.stored("2.2"))
+
+    def test_a_non_list_attachments_value_raises(self):
+        """A JSON string or a lone dict here would persist as junk and answer the
+        classifier's has-attachments question with its truthiness."""
+        with self.assertRaises(SchemaError):
+            self.store.upsert_messages([msg(ts="3.1", attachments=self.IMAGE)])
+        with self.assertRaises(SchemaError):
+            self.store.upsert_messages([msg(ts="3.2", attachments="[]")])
+
+    def test_reingest_with_attachments_stays_idempotent(self):
+        batch = [msg(ts="4.1", attachments=[self.IMAGE])]
+        self.store.upsert_messages(batch)
+        self.store.upsert_messages(batch)
+        self.assertEqual(self.store.count(), 1)
+
+    def test_a_pre_attachment_database_is_migrated_not_refused(self):
+        """Adopters hold messages.db files created before the column existed, and
+        CREATE TABLE IF NOT EXISTS never alters an existing table (the journal hit
+        this with the R22 cues column). Refusing the file would destroy history to
+        improve it; writing past the missing column would crash every ingest."""
+        old = Path(self.tmp.name) / "old.db"
+        conn = sqlite3.connect(old)
+        conn.executescript("""
+            CREATE TABLE messages (
+                channel_type TEXT NOT NULL, channel_id TEXT NOT NULL,
+                ts TEXT NOT NULL, sender_id TEXT NOT NULL, sender_name TEXT,
+                text TEXT, thread_id TEXT, raw TEXT,
+                PRIMARY KEY (channel_type, channel_id, ts));
+            INSERT INTO messages VALUES ('slack','C_EXAMPLE','0.9','U_EXAMPLE',
+                                         NULL,'legacy row',NULL,NULL);
+        """)
+        conn.commit()
+        conn.close()
+        s = Store(old)
+        try:
+            s.upsert_messages([msg(ts="5.1", attachments=[self.IMAGE])])
+            rows = dict(s.conn.execute("SELECT ts, attachments FROM messages"))
+            self.assertEqual(json.loads(rows["5.1"]), [self.IMAGE])
+            self.assertIsNone(rows["0.9"],
+                              "a legacy row must read back None, never a fabricated "
+                              "attachment record")
+        finally:
+            s.close()
 
 
 if __name__ == "__main__":

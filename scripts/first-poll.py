@@ -40,7 +40,10 @@ def demo_messages(inst):
 def journal_message(journal, channel_id, msg, taxonomy):
     """Classify and journal one polled message. The journal row IS the proof the poll
     happened (mutation_check deletes this write; the docs test must go red)."""
-    c = classify(msg["text"], taxonomy)
+    # attachments travel to the classifier (ENH-4): passing only msg["text"] here
+    # would re-drop every upload however well the adapter and classifier handle them,
+    # and an image-only message would journal as an empty STATEMENT again.
+    c = classify(msg["text"], taxonomy, attachments=msg.get("attachments"))
     # matched travels with the decision (R22): the journal row is where a classification
     # gets disputed, and the taxonomy may have changed by then.
     return journal.record(channel_id, msg["ts"], sender_id=msg.get("sender_id"),

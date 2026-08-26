@@ -244,6 +244,42 @@ class PollTest(SlackAdapterTestCase):
         Store.validate(msgs[0])
 
 
+class AttachmentTest(SlackAdapterTestCase):
+    """ENH-4: uploads ride the platform's `files` array, and the live system downloads
+    those screenshots and treats them as content. An adapter that normalizes only text
+    turns an image-only message into an empty row — represented, but saying nothing."""
+
+    FILE = {"id": "F_X", "name": "screenshot.png", "title": "screenshot",
+            "mimetype": "image/png", "url_private": "https://files.example/x.png"}
+
+    def test_an_upload_is_normalized_into_attachments(self):
+        row = slack_msg("7.0", text="", files=[self.FILE])
+        a = self.make([history([row])])
+        msgs, _ = a.poll(None)
+        atts = msgs[0]["attachments"]
+        self.assertEqual(len(atts), 1)
+        self.assertEqual(atts[0]["kind"], "image")
+        self.assertEqual(atts[0]["name"], "screenshot.png")
+        self.assertEqual(atts[0]["mimetype"], "image/png")
+        self.assertEqual(atts[0]["url"], "https://files.example/x.png")
+        Store.validate(msgs[0])
+
+    def test_a_non_image_upload_is_kept_as_a_file(self):
+        pdf = dict(self.FILE, mimetype="application/pdf", name="report.pdf")
+        a = self.make([history([slack_msg("7.1", files=[pdf])])])
+        msgs, _ = a.poll(None)
+        self.assertEqual(msgs[0]["attachments"][0]["kind"], "file",
+                         "kind must degrade honestly for anything that is not an "
+                         "image, never invent a category from the mimetype prefix")
+
+    def test_a_fileless_message_carries_a_known_empty_list(self):
+        """[] is the adapter saying 'I looked and there were none' — distinct from a
+        row that predates the field (store keeps None for those)."""
+        a = self.make([history([slack_msg("7.2")])])
+        msgs, _ = a.poll(None)
+        self.assertEqual(msgs[0]["attachments"], [])
+
+
 class RateLimitTest(SlackAdapterTestCase):
     def test_429_surfaces_the_exact_retry_after_and_names_the_method(self):
         """ENH-1's back-off is keyed (instance, method); a 429 that loses either the

@@ -41,9 +41,20 @@ is the reference implementation to copy.
   "ts": "platform-native timestamp, sortable within the channel",
   "text": "plain text (platform markup preserved)",
   "thread_id": "null when top-level",
+  "attachments": [ {"kind": "image", "name": "screenshot.png",
+                    "mimetype": "image/png", "url": "platform download url"} ],
   "raw": { "the untouched platform payload": "kept for audit" }
 }
 ```
+
+Attachments are content, not decoration (ENH-4): the live system downloads screenshots
+and treats them as the message. An adapter that keeps only text turns an image-only
+message into an empty row, and the engine would classify it as an empty STATEMENT —
+acknowledged and forgotten. `attachments` is a list of descriptors (`kind` is `image`
+or `file`; `name`/`mimetype`/`url` may be null); `[]` means "the adapter looked and
+found none", which the store keeps distinct from rows that predate the field. A message
+with no text but at least one attachment classifies as `ATTACHMENT-ONLY`, never as an
+empty statement.
 
 ## Instance binding
 

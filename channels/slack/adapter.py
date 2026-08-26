@@ -92,6 +92,26 @@ def _header(headers: dict, name: str, default=None):
     return default
 
 
+def _attachments(m):
+    """Uploads ride the platform's `files` array, and the live system downloads those
+    screenshots and treats them as content (ENH-4) — dropping them here turns an
+    image-only message into an empty row for every downstream consumer. The message-
+    level `attachments` array is deliberately NOT ingested: those are unfurls and bot
+    decoration rendering links the text already carries, not new content. kind degrades
+    to "file" for anything that is not an image — inventing categories from mimetype
+    prefixes would call a PDF an "application"."""
+    out = []
+    for f in m.get("files") or ():
+        mimetype = f.get("mimetype") or None
+        out.append({
+            "kind": "image" if (mimetype or "").startswith("image/") else "file",
+            "name": f.get("name") or f.get("title"),
+            "mimetype": mimetype,
+            "url": f.get("url_private"),
+        })
+    return out
+
+
 class Adapter:
     def __init__(self, auth=None, http=None, clock=None):
         auth = auth or {}
@@ -248,6 +268,7 @@ class Adapter:
             # Slack marks a thread PARENT with thread_ts == its own ts; the contract
             # wants null for top-level messages.
             "thread_id": thread if (thread and thread != ts) else None,
+            "attachments": _attachments(m),
             "raw": json.dumps(m, sort_keys=True),
         }
 

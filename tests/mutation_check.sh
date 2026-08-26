@@ -959,6 +959,65 @@ run_mutation "docs: the runbook diagnostic drops the placement argument" \
   "('outbox.policy_for(\"C_YOUR_CHANNEL\", \"thread\")', 'outbox.policy_for(\"C_YOUR_CHANNEL\")')" \
   "test_docs"
 
+# ---------------------------------------------------------------------------
+# ENH-4 — attachments are content. The live system downloads screenshots and treats
+# them as the message; an engine that keeps only text classified an image-only message
+# as an empty STATEMENT — acknowledged and forgotten. Each of these, if it survived,
+# re-drops the attachment at one boundary of the pipeline (adapter → store →
+# classifier), and any single boundary is enough to lose the content end to end.
+# ---------------------------------------------------------------------------
+
+# ENH-4 — THE acceptance: no text + an attachment must be an explicit decision,
+# never the empty-message fall-through.
+run_mutation "classify: an image-only message is an empty STATEMENT again" \
+  "core/classify.py" \
+  "('    if not t:\n        if atts:', '    if not t:\n        if False:')" \
+  "test_classify"
+
+# ENH-4 — the polling adapter is where a screenshot first exists engine-side;
+# dropping it here loses it for every downstream consumer at once.
+run_mutation "slack: uploads dropped at normalization" \
+  "channels/slack/adapter.py" \
+  "('            \"attachments\": _attachments(m),', '            \"attachments\": [],')" \
+  "test_slack_adapter"
+
+# ENH-4 — the push path must keep the same upload, or parity holds on ts while the
+# two stores disagree about what the message contained.
+run_mutation "socket: uploads dropped at normalization" \
+  "channels/slack_socket/adapter.py" \
+  "('            \"attachments\": _attachments(event),', '            \"attachments\": [],')" \
+  "test_socket_adapter"
+
+# ENH-4 — the store must persist what the adapter normalized; binding NULL for
+# everything is the silent drop moved one layer down (and erases the None-vs-[]
+# distinction that separates legacy rows from attachment-free ones).
+run_mutation "store: attachments silently dropped at persistence" \
+  "core/store.py" \
+  "('    return None if atts is None else json.dumps(atts)', '    return None')" \
+  "test_store"
+
+# ENH-4 — the pinned contract must ADMIT the field: without it, validate() refuses
+# every attachment-carrying message and the whole batch is lost at ingest.
+run_mutation "store: the pinned contract no longer admits attachments" \
+  "core/store.py" \
+  "('OPTIONAL_FIELDS = (\"sender_name\", \"thread_id\", \"raw\", \"attachments\")', 'OPTIONAL_FIELDS = (\"sender_name\", \"thread_id\", \"raw\")')" \
+  "test_store"
+
+# ENH-4 — an adopter's pre-attachment messages.db must be migrated in place (the
+# journal's R22 cues-column lesson): unmigrated, every ingest crashes on the missing
+# column, which destroys the audit trail in order to improve it.
+run_mutation "store: a pre-attachment messages.db is no longer migrated" \
+  "core/store.py" \
+  "('        if \"attachments\" not in cols:', '        if False:')" \
+  "test_store"
+
+# ENH-4 — the caller boundary where the R22 cues once died, same seam: first-poll
+# classifies the text and drops the attachments on the way to the classifier.
+run_mutation "first-poll: attachments never reach the classifier" \
+  "scripts/first-poll.py" \
+  "('    c = classify(msg[\"text\"], taxonomy, attachments=msg.get(\"attachments\"))', '    c = classify(msg[\"text\"], taxonomy)')" \
+  "test_docs"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }
