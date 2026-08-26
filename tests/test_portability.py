@@ -200,6 +200,81 @@ class ConfigTest(unittest.TestCase):
         self.assertIn("instances", raw, "example config has no instances to copy")
 
 
+class ConfigErrorQualityTest(unittest.TestCase):
+    """ENH-20. The adoption test drove 17 deliberate config mistakes through load: 14
+    produced clean, actionable ConfigErrors and three escaped — a raw PermissionError
+    traceback, a bare FileExistsError AFTER load, and a message blaming the adapter name
+    for an empty channels_dir. Every mistake must fail AT LOAD, as ConfigError, naming
+    the offending config key: a traceback names an errno, not the key to fix.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        # Cleanups run LIFO, so a per-test chmod-restore registered later runs BEFORE
+        # the tree is removed (a tearDown would remove it first).
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+
+    def cfg_dict(self, **engine):
+        return {
+            "engine": engine,
+            "instances": [{"name": "t", "adapter": "fake",
+                           "channels": [{"id": "C_T"}]}],
+        }
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores file modes; denial cannot be staged")
+    def test_an_unreadable_channels_dir_is_a_config_error_naming_the_key(self):
+        locked = self.base / "channels"
+        locked.mkdir()
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o755)
+        with self.assertRaises(ConfigError) as ctx:
+            from_dict(self.cfg_dict(), base_dir=self.base)
+        self.assertIn("channels_dir", str(ctx.exception))
+        self.assertIn(str(locked), str(ctx.exception))
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores file modes; denial cannot be staged")
+    def test_an_unreadable_subdirectory_during_discovery_is_a_config_error(self):
+        """The adoption test's exact shape (channels_dir=/etc): iterating the dir works,
+        then stat on a child of a non-traversable subdirectory raises mid-walk."""
+        seed_fake_adapter(self.base)
+        locked = self.base / "channels" / "private"
+        locked.mkdir()
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o755)
+        with self.assertRaises(ConfigError) as ctx:
+            from_dict(self.cfg_dict(), base_dir=self.base)
+        self.assertIn("channels_dir", str(ctx.exception))
+
+    def test_a_state_dir_that_is_a_file_fails_at_load_not_at_first_write(self):
+        seed_fake_adapter(self.base)
+        (self.base / "state").write_text("a FILE where the engine must make a directory")
+        with self.assertRaises(ConfigError) as ctx:
+            from_dict(self.cfg_dict(state_dir="state"), base_dir=self.base)
+        self.assertIn("state_dir", str(ctx.exception))
+
+    def test_a_nonexistent_channels_dir_blames_the_directory_not_the_adapter(self):
+        with self.assertRaises(ConfigError) as ctx:
+            from_dict(self.cfg_dict(), base_dir=self.base)
+        msg = str(ctx.exception)
+        self.assertIn("channels_dir", msg)
+        self.assertIn("does not exist", msg)
+        self.assertNotIn("unknown adapter", msg,
+                         "an empty discovery sent the adopter hunting a typo in the "
+                         "adapter name; the fault is the directory")
+
+    def test_an_empty_channels_dir_blames_the_directory_not_the_adapter(self):
+        (self.base / "channels").mkdir()
+        with self.assertRaises(ConfigError) as ctx:
+            from_dict(self.cfg_dict(), base_dir=self.base)
+        msg = str(ctx.exception)
+        self.assertIn("channels_dir", msg)
+        self.assertIn("adapter.py", msg,
+                      "the message must say what discovery looks for, or the adopter "
+                      "cannot tell an empty dir from a wrong one")
+        self.assertNotIn("unknown adapter", msg)
+
+
 class EndToEndFromConfigTest(unittest.TestCase):
     """R17: the whole pipeline, built from a temp-dir config, on a fake adapter."""
 

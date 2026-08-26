@@ -128,10 +128,20 @@ def discover_adapters(channels_dir: str | Path) -> dict:
     if not channels_dir.is_dir():
         return {}
     found = {}
-    for d in sorted(channels_dir.iterdir()):
-        entry = d / "adapter.py"
-        if entry.is_file():
-            found[d.name] = entry
+    try:
+        for d in sorted(channels_dir.iterdir()):
+            entry = d / "adapter.py"
+            if entry.is_file():
+                found[d.name] = entry
+    except OSError as ex:
+        # ENH-20: channels_dir=/etc in the adoption test escaped as a raw
+        # PermissionError traceback mid-walk — an errno names no config key. Discovery
+        # stats <type>/adapter.py inside every subdirectory, so the whole tree must be
+        # readable.
+        raise ConfigError(
+            f"channels_dir {channels_dir} is not readable ({ex}) — discovery must stat "
+            "adapter.py in every subdirectory; point channels_dir at the engine's "
+            "channel tree") from ex
     return found
 
 
@@ -186,6 +196,18 @@ def from_dict(raw: dict, base_dir: str | Path, env: dict | None = None) -> Engin
         channels_dir=channels_dir,
     )
 
+    # ENH-20: a state_dir pointing at an existing FILE used to load clean and surface
+    # only as ensure_dirs()'s bare FileExistsError at first write — the exact
+    # fail-at-load-not-later violation this module's docstring promises against.
+    # Validate every directory ensure_dirs() will create, naming the key behind it.
+    for key, d in (("state_dir", cfg.state_dir), ("store", cfg.store_path.parent),
+                   ("journal", cfg.journal_path.parent),
+                   ("outbox", cfg.outbox_path.parent)):
+        if d.exists() and not d.is_dir():
+            raise ConfigError(
+                f"{key}: {d} exists and is not a directory — the engine refuses to "
+                "start half-configured rather than fail at first write")
+
     discovered = discover_adapters(channels_dir)
     instances = []
     for spec in raw.get("instances", []):
@@ -194,9 +216,20 @@ def from_dict(raw: dict, base_dir: str | Path, env: dict | None = None) -> Engin
         if not name:
             raise ConfigError("every instance needs a 'name'")
         if adapter not in discovered:
+            if not discovered:
+                # ENH-20: "unknown adapter ... Discovered: (none)" sent the adoption
+                # tester hunting a typo in the adapter NAME when the fault was the
+                # DIRECTORY. Nothing discovered is never a spelling problem.
+                detail = (("is not a directory" if channels_dir.exists()
+                           else "does not exist") if not channels_dir.is_dir()
+                          else "contains no channel types (no <type>/adapter.py in it)")
+                raise ConfigError(
+                    f"instance {name!r}: channels_dir {channels_dir} {detail}, so no "
+                    f"adapter (including {adapter!r}) can be offered — fix "
+                    "channels_dir, not the adapter name")
             raise ConfigError(
                 f"instance {name!r}: unknown adapter {adapter!r}. Discovered under "
-                f"{channels_dir}: {sorted(discovered) or '(none)'}. "
+                f"{channels_dir}: {sorted(discovered)}. "
                 "A misspelled adapter must fail loudly, not leave an inert instance.")
         channels = []
         for ch in spec.get("channels", []):

@@ -341,7 +341,7 @@ run_mutation "config: hardcode an adapter whitelist back into core" \
 # a channel type is the silently-inert-instance class again.
 run_mutation "config: discover any directory as a channel type" \
   "core/config.py" \
-  "('        entry = d / \"adapter.py\"\n        if entry.is_file():', '        entry = d / \"adapter.py\"\n        if d.is_dir():')" \
+  "('            entry = d / \"adapter.py\"\n            if entry.is_file():', '            entry = d / \"adapter.py\"\n            if d.is_dir():')" \
   "test_extensibility"
 
 # R11 — an adapter module without the pinned entry class must fail at load, not return
@@ -764,6 +764,33 @@ run_mutation "slo: the push-lead delta is fabricated" \
   "core/slo.py" \
   "('        lead_s.append(poll_arr[ts] - push_at)', '        lead_s.append(0.0)')" \
   "test_slo"
+
+# ---------------------------------------------------------------------------
+# ENH-20 — every config mistake fails AT LOAD as a ConfigError naming the offending
+# KEY. The adoption test drove 17 deliberate mistakes through load: 14 were clean
+# ConfigErrors, and these three escaped as raw tracebacks or misdirection.
+# ---------------------------------------------------------------------------
+
+# ENH-20 — an unreadable channels_dir (the /etc case) must not escape as a raw
+# PermissionError mid-walk: a traceback names an errno, never the key to fix.
+run_mutation "config: an unreadable channels_dir escapes as a raw PermissionError" \
+  "core/config.py" \
+  "('    except OSError as ex:', '    except () as ex:')" \
+  "test_portability"
+
+# ENH-20 — a state_dir pointing at an existing FILE must fail at load, not as
+# ensure_dirs()'s bare FileExistsError at first write (the module's own stated rule).
+run_mutation "config: a state_dir that is a file loads clean and explodes at first write" \
+  "core/config.py" \
+  "('        if d.exists() and not d.is_dir():', '        if False:')" \
+  "test_portability"
+
+# ENH-20 — nothing discovered is a channels_dir fault; 'unknown adapter ... (none)'
+# sends the adopter hunting a typo in a name that was never the problem.
+run_mutation "config: an empty discovery blames the adapter name again" \
+  "core/config.py" \
+  "('            if not discovered:', '            if False:')" \
+  "test_portability"
 
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
