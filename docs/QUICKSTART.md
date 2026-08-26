@@ -108,16 +108,32 @@ vocabulary):
   "name": "my-team-slack",
   "adapter": "fake",
   "taxonomy": {
-    "exec_verbs": ["provision", "deploy", "roll back"],
+    "exec_verbs": ["review", "provision", "deploy", "roll back"],
     "commitment_phrases": ["sign off", "by when", "eta"]
   }
 }]
 ```
 
-Re-run the first poll after editing and confirm the `kind` on a fresh demo message moved
-the way you expected. Classification decides whether a message is treated as work to
-execute, so it is worth ten minutes. See `docs/RUNBOOK.md` for how to check its behaviour
-on your own message samples.
+`review` is in that list on purpose: the demo message is "Please review the quickstart
+demo message.", so this exact example is observable against it. (A doc test holds the
+example and the demo text together — the first adopter re-run found them drifted apart,
+which made this step unfollowable.)
+
+To watch the change you need a *fresh* demo message, and a plain re-run cannot produce
+one: `--seed-demo` re-plants the same message and your cursor is already past it, so a
+second run correctly reports `0 polled` (that is the replay safety from step 5; the
+"0 messages" entry in `docs/RUNBOOK.md` says the same). Delete the state directory you
+configured — the cursor lives in the message store inside it — then re-run the seeded
+poll command from step 5. (Pointing `engine.state_dir` somewhere new works only if your
+`store` path derives from it; the shipped example pins `store` under `state/` explicitly,
+so moving `state_dir` alone leaves the cursor behind and still reports `0 polled` —
+measured, not theory.)
+
+Under the shipped vocabulary the demo message is a QUESTION (its only cue is "please");
+with `review` in your `exec_verbs` it becomes an EXEC-REQUEST, matched `["review",
+"please"]`. Classification decides whether a message is treated as work to execute, so
+it is worth ten minutes. See `docs/RUNBOOK.md` for how to check its behaviour on your
+own message samples.
 
 ## 7. First real poll — your workspace, read-only
 

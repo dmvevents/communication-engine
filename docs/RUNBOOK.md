@@ -24,8 +24,11 @@ produced. Symptom first, because that is what you have at 2am.
 | messages exist but are filtered out | a polled message's `channel_id` did not match any configured channel | check `instances[].channels[].id` against what the platform actually reports |
 | you expected old history | a first cursor starts from the adapter's default window, not from the beginning of time | backfill is an adapter capability (`history`), not a first-poll feature |
 
-To start over from a clean slate, point `engine.state_dir` somewhere new (or delete the
-state directory you configured) — cursors live there, nowhere else.
+To start over from a clean slate, delete the state directory you configured — the cursor
+lives in the message store inside it, nowhere else. Pointing `engine.state_dir` somewhere
+new works only if your `store` path derives from it: the shipped example pins `store`
+explicitly, so moving `state_dir` alone leaves the cursor behind (measured — QUICKSTART
+step 6 hit exactly this).
 
 ## "It is not sending anything"
 

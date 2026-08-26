@@ -504,6 +504,21 @@ run_mutation "docs: two-place channel rule made vague again" \
   "('**two places**', 'the config')" \
   "test_docs"
 
+# ENH-23 — the adopter-measured drift, verbatim: step 6's example vocabulary once had no
+# word in common with the shipped demo text, so 'confirm the kind moved' was unfollowable.
+run_mutation "docs: step-6 example vocabulary drifts off the demo text again" \
+  "docs/QUICKSTART.md" \
+  "('\"exec_verbs\": [\"review\", \"provision\", \"deploy\", \"roll back\"]', '\"exec_verbs\": [\"provision\", \"deploy\", \"roll back\"]')" \
+  "test_docs"
+
+# ENH-23 — the other half of the same re-run: without fresh state there is no fresh demo
+# message ('0 polled' by construction — the RUNBOOK documents that as CORRECT), so a step 6
+# that drops the fresh-state instruction contradicts the runbook and observes nothing.
+run_mutation "docs: step-6 fresh-state instruction deleted" \
+  "docs/QUICKSTART.md" \
+  "('Delete the state directory you\nconfigured', 'Start over whenever convenient')" \
+  "test_docs"
+
 # ---------------------------------------------------------------------------
 # ENH-18 — the slack adapter is read-only BY AUTHORIZATION (operator granted the
 # token read-only, 2026-08-26). Each of these mutations, if it survived, would let a

@@ -12,13 +12,16 @@ F-2 defect class this project exists to kill — so the docs are tested like cod
 * the first-poll step (scripts/first-poll.py) is EXECUTED against a temp-dir adopter
   config — "first successful poll" is a tested behaviour, not a promise.
 """
+import importlib.util
 import inspect
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -26,7 +29,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from core.checks import Verdict, freshness_check  # noqa: E402
-from core.classify import Taxonomy, classify  # noqa: E402
+# _word_hits is the classifier's own definition of "occurs in the text" (word-boundary,
+# case-insensitive). The step-6 overlap test uses it instead of a local regex because a
+# second matcher here could drift from the real one and pass on text the classifier misses.
+from core.classify import Taxonomy, _word_hits, classify  # noqa: E402
 from core.config import discover_adapters  # noqa: E402
 from core.journal import Journal  # noqa: E402
 from core.outbox import Outbox  # noqa: E402
@@ -396,6 +402,81 @@ class RealPollDocTest(unittest.TestCase):
                       "the channel id lives in TWO places (auth env list + channels[]) "
                       "and a mismatch polls nothing, silently — the doc no longer warns "
                       "about the one quiet failure on the real-poll path")
+
+
+class TaxonomyTuningStepTest(unittest.TestCase):
+    """ENH-23: step 6's verification instruction must be followable AS WRITTEN. The
+    adopter re-run at 0447ca4 followed it literally and watched nothing move, for two
+    independent doc-side reasons: the example vocabulary (provision/deploy/roll back)
+    never occurred in the shipped demo text, so `kind` could not change; and a plain
+    re-run re-seeds the SAME ts behind a persisted cursor, so there was no fresh demo
+    message at all (`0 polled` — which the RUNBOOK's 0-messages entry correctly calls
+    working-as-designed, directly contradicting the old step 6). Both are pinned here
+    against the real demo text and the real classifier, not against copies."""
+
+    def setUp(self):
+        text = QUICKSTART.read_text()
+        m = re.search(r"^## 6\..*?$(.*?)(?=^## |\Z)", text, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(m, "the quickstart lost its step-6 classifier-tuning step")
+        self.section = m.group(0)
+
+    def step6_taxonomy(self):
+        m = re.search(r"```json\s*(.*?)```", self.section, re.DOTALL)
+        self.assertIsNotNone(m, "step 6 no longer shows a taxonomy config example")
+        # The snippet is an instance fragment, exactly as it would sit in settings.json.
+        cfg = json.loads("{" + m.group(1) + "}")
+        return cfg["instances"][0]["taxonomy"]
+
+    def demo_text(self):
+        """The shipped demo message, taken from the code that plants it. A literal copy
+        here would be a third place for the same string to drift."""
+        spec = importlib.util.spec_from_file_location("first_poll_step6_test", FIRST_POLL)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        inst = types.SimpleNamespace(adapter="fake",
+                                     channels=[types.SimpleNamespace(id="C_DEMO")])
+        return mod.demo_messages(inst)[0]["text"]
+
+    def test_step6_example_verbs_intersect_the_demo_text(self):
+        """Failure reason (b) of the adopter re-run: with no overlap between the example
+        exec_verbs and the demo text, 'confirm the kind moved' was unfollowable even
+        with fresh state."""
+        hits = _word_hits(self.demo_text(), self.step6_taxonomy()["exec_verbs"])
+        self.assertTrue(hits,
+                        "no verb in step 6's exec_verbs example occurs in the shipped "
+                        "demo message — the step's own verification ('confirm the kind "
+                        "moved') cannot be followed with the doc's example config")
+
+    def test_step6_promised_kind_move_happens_on_the_shipped_demo_message(self):
+        """The observation step 6 promises must actually happen, and the doc must name
+        both kinds so a classifier-default change forces the prose to move with it."""
+        demo = self.demo_text()
+        before = classify(demo).kind
+        after = classify(demo, Taxonomy.from_config(self.step6_taxonomy())).kind
+        self.assertNotEqual(before, after,
+                            f"the example taxonomy leaves the demo message at {before!r} "
+                            "— retuning changes nothing observable, which is exactly the "
+                            "adopter-measured defect")
+        for kind in (before, after):
+            self.assertIn(kind, self.section,
+                          f"step 6 never states the expected observation ({before} -> "
+                          f"{after}) — 'the way you expected' gives the reader nothing "
+                          "to check against")
+
+    def test_step6_says_how_to_get_a_fresh_demo_message(self):
+        """Failure reason (a): --seed-demo re-plants the same ts and the cursor is
+        already past it, so a plain re-run polls nothing. Deletion is the instruction
+        because it is the one that works with the shipped example config: the example
+        pins `store` under state/ explicitly, so moving state_dir alone leaves the
+        cursor behind (measured live, scratch/enh23-step6)."""
+        self.assertIn("Delete the state directory", self.section,
+                      "step 6 no longer tells the reader to get fresh state before "
+                      "re-polling — a plain re-run reports '0 polled' by construction, "
+                      "and the RUNBOOK even documents that as correct")
+        self.assertIn("--seed-demo", self.section,
+                      "step 6 no longer says the verification re-run needs --seed-demo "
+                      "— an unseeded fresh-state poll shows an empty channel, not a "
+                      "reclassified message")
 
 
 if __name__ == "__main__":
