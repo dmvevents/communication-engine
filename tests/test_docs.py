@@ -35,6 +35,8 @@ from core.store import Store  # noqa: E402
 
 QUICKSTART = ROOT / "docs" / "QUICKSTART.md"
 RUNBOOK = ROOT / "docs" / "RUNBOOK.md"
+README = ROOT / "README.md"
+CORE_README = ROOT / "core" / "README.md"
 FIRST_POLL = ROOT / "scripts" / "first-poll.py"
 
 # `obj.method(` citations in the docs resolve against these classes. The docs teach by
@@ -105,7 +107,11 @@ class DocCitationsTest(unittest.TestCase):
     method that is gone reads as authoritative and is worse than no doc at all."""
 
     def setUp(self):
-        self.docs = {p: p.read_text() for p in (QUICKSTART, RUNBOOK)}
+        # README.md and core/README.md joined this set for ENH-19. The non-author
+        # adoption run (2026-08-25) measured the root cause exactly: the two docs with
+        # NO citation coverage were precisely the two that had drifted — core/README.md
+        # listed six modules that never existed while the tested docs stayed accurate.
+        self.docs = {p: p.read_text() for p in (QUICKSTART, RUNBOOK, README, CORE_README)}
 
     def test_every_cited_repo_path_exists(self):
         path_like = re.compile(r"(scripts|tests|docs|channels|core)/[\w.\-/]+")
@@ -113,9 +119,34 @@ class DocCitationsTest(unittest.TestCase):
         for doc, text in self.docs.items():
             for token in re.findall(r"`([^`]+)`", text):
                 if path_like.fullmatch(token) and not (ROOT / token).exists():
-                    offenders.append(f"{doc.name}: `{token}`")
+                    # relative_to(ROOT), not .name: both READMEs are named README.md.
+                    offenders.append(f"{doc.relative_to(ROOT)}: `{token}`")
         self.assertEqual(offenders, [],
                          "docs cite repo paths that do not exist:\n" + "\n".join(offenders))
+
+    def test_core_readme_cites_no_phantom_modules(self):
+        """The adopter called core/README.md 'the single most misleading file in the
+        repo': its module table cited engine/triggers/watchdog/supervisor/probe/
+        dashboard — six files that never existed. Bare `name.py` citations there are
+        module names by convention, so they resolve against core/ itself (the
+        ROOT-relative check above cannot see them)."""
+        offenders = [t for t in re.findall(r"`([\w\-]+\.py)`", self.docs[CORE_README])
+                     if not (ROOT / "core" / t).is_file()]
+        self.assertEqual(offenders, [],
+                         "core/README.md cites modules that do not exist:\n"
+                         + "\n".join(offenders))
+
+    def test_every_core_module_appears_in_the_core_readme(self):
+        """The reverse direction: at the same adoption run the table also OMITTED the
+        implemented modules, so understating drift needs its own check. If the
+        citation extractor above ever goes inert, this fails too (missing == all)."""
+        cited = set(re.findall(r"`([\w\-]+\.py)`", self.docs[CORE_README]))
+        # __init__.py is packaging, not a module with a responsibility to document.
+        actual = {p.name for p in (ROOT / "core").glob("*.py")} - {"__init__.py"}
+        missing = sorted(actual - cited)
+        self.assertEqual(missing, [],
+                         "core/ ships modules its own README never mentions:\n"
+                         + "\n".join(missing))
 
     def test_every_cited_method_exists_on_its_class(self):
         cited, offenders = [], []
@@ -159,6 +190,45 @@ class DocCitationsTest(unittest.TestCase):
                       inspect.signature(freshness_check).parameters,
                       "runbook instructs passing action_only_log but freshness_check "
                       "no longer takes it")
+
+
+class FrontDoorTest(unittest.TestCase):
+    """ENH-19: the front door must not UNDERSTATE what ships. The adoption run found a
+    newcomer reading README.md concluded there was nothing to adopt — phases marked
+    HELD, the quickstart gated on 'once phase 1 lands' — and never opened
+    docs/QUICKSTART.md. Understating reality is the inverse of the drift this project
+    guards against everywhere else, and it costs the same: the adopter leaves."""
+
+    def setUp(self):
+        self.readme = README.read_text()
+
+    def test_front_door_links_the_quickstart(self):
+        self.assertIn("docs/QUICKSTART.md", self.readme,
+                      "README.md never points at docs/QUICKSTART.md — the measured "
+                      "78-second first-poll path is unreachable from the front door")
+
+    def test_front_door_names_every_shipped_adapter(self):
+        # Reality-coupled like the honest-limits test: when a new adapter lands, this
+        # goes red until the front door mentions it.
+        shipped = set(discover_adapters(ROOT / "channels"))
+        missing = sorted(a for a in shipped if a not in self.readme)
+        self.assertEqual(missing, [],
+                         "channels/ ships adapters README.md never names: "
+                         + ", ".join(missing))
+
+    def test_front_door_does_not_call_shipped_work_held(self):
+        """The exact framing the adopter tripped over, pinned verbatim so it cannot
+        quietly return (same pattern as the 'made vague again' doc mutations)."""
+        for phrase in ("once phase 1 lands", "HELD"):
+            self.assertNotIn(phrase, self.readme,
+                             f"README.md reverted to phase-freeze framing ({phrase!r}) "
+                             "while the code it gates is implemented and tested")
+        core_readme = CORE_README.read_text()
+        for phrase in ("HELD", "before any code exists"):
+            self.assertNotIn(phrase, core_readme,
+                             f"core/README.md claims its own contents are pending "
+                             f"({phrase!r}) while core/ ships implemented, tested "
+                             "modules")
 
 
 class FirstPollTest(unittest.TestCase):

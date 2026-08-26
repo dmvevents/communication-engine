@@ -17,7 +17,12 @@ run_mutation() {   # $1=label  $2=file  $3=python-replace-expr  $4=test-module
   local tmp; tmp="$(mktemp -d)"
   # channels/ ships code too (the fake adapter is contract-tested), and docs/ + scripts/
   # are tested like code (R21: the docs are shipped interface), so mutate against them all.
+  # The root files matter too: with settings.example.json absent, test_portability was RED
+  # in this sandbox before any mutation applied, so every mutation targeting it was
+  # vacuously "caught" (found while landing ENH-19, which needs README.md here for the
+  # same reason). A sandbox that cannot go green cannot prove a mutation turned it red.
   cp -r "$ROOT"/core "$ROOT"/tests "$ROOT"/channels "$ROOT"/docs "$ROOT"/scripts "$tmp"/ 2>/dev/null
+  cp "$ROOT"/README.md "$ROOT"/settings.example.json "$tmp"/ 2>/dev/null
 
   if ! python3 - "$tmp/$file" <<PY
 import sys, pathlib
@@ -656,6 +661,47 @@ run_mutation "parity-watch: an empty poll oracle downgraded to a clean pass" \
   "scripts/push-poll-parity.py" \
   "('        return 2', '        return 0')" \
   "test_push_poll_parity"
+
+# ---------------------------------------------------------------------------
+# ENH-19 — the front-door docs must not UNDERSTATE reality. Measured at the non-author
+# adoption run: core/README.md cited six modules that never existed while omitting the
+# ten that do, and README.md gated its quickstart on "once phase 1 lands" — so a
+# newcomer concluded there was nothing to adopt. The two docs that drifted were exactly
+# the two without citation tests.
+# ---------------------------------------------------------------------------
+
+# ENH-19 — a phantom row in the core module table must go red (the six-phantoms defect).
+run_mutation "docs: core README grows a row for a module that does not exist" \
+  "core/README.md" \
+  "('|---|---|', '|---|---|\n| \`engine.py\` | poll scheduler |')" \
+  "test_docs"
+
+# ENH-19 — the reverse direction: a shipped module must not vanish from its own README.
+run_mutation "docs: core README drops an implemented module from the table" \
+  "core/README.md" \
+  "('\`parity.py\`', '\`parity\`')" \
+  "test_docs"
+
+# ENH-19 — the quickstart must be reachable from the front door; the adoption run showed
+# a newcomer never finds docs/QUICKSTART.md unless README.md points at it. The whole
+# markdown link is replaced (label + target) so no occurrence survives the mutation.
+run_mutation "docs: front-door link to the quickstart deleted" \
+  "README.md" \
+  "('[\`docs/QUICKSTART.md\`](docs/QUICKSTART.md)', '[\`docs/RUNBOOK.md\`](docs/RUNBOOK.md)')" \
+  "test_docs"
+
+# ENH-19 — the exact false framing the adopter tripped over, reintroduced verbatim.
+run_mutation "docs: quickstart re-gated on a phase that already shipped" \
+  "README.md" \
+  "('## Quickstart', '## Quickstart (once phase 1 lands)')" \
+  "test_docs"
+
+# ENH-19 — the front door must name every shipped adapter (reality-coupled, like the
+# honest-limits claim). Relies on slack_socket being cited exactly once in README.md.
+run_mutation "docs: a shipped adapter vanishes from the front door" \
+  "README.md" \
+  "('| \`slack_socket\` |', '| \`socket\` |')" \
+  "test_docs"
 
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
