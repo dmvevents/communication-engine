@@ -47,6 +47,20 @@ Fail-closed everywhere the platform is silent: with no `served` set, every miss 
 an ERROR (an empty platform snapshot would otherwise re-label every real loss
 "unretrievable" — the vacuous-pass bug wearing a new hat).
 
+## Ordering is a capability of the id space, not an assumption (ENH-26)
+
+Email identities are Message-ID strings no float() will ever parse, and they are the
+case that turns `_fl()`'s refusal from defensive into load-bearing. The explicit rule:
+a comparison is **orderable** only when EVERY id on every side parses as a float.
+Uniformly non-orderable ids still get the full set-membership classification — telling
+a loss from a deletion needs only the served set — but the four window classes
+(NOT_YET_POLLED, BEFORE_ENGINE_START, AHEAD_OF_ORACLE, PRE_ORACLE_FLOOR), which only
+mean anything on a timeline, become UNAVAILABLE rather than guessed: extras that would
+have needed the oracle floor read ENGINE_ONLY, and asking for window placement
+(`covered_from`/`covered_through`) is refused outright — sorting an unparseable id as
+0.0 would let a real loss earn a benign class for free. A MIXED id space stays an
+ERROR: half a timeline is corruption (two id shapes in one channel), never a mode.
+
 CLI (read-only against the live oracle; never writes to it):
     python3 -m core.parity --oracle /path/to/live.db --candidate /path/to/engine.db \
         --channel C_EXAMPLE [--served-json served.json] \
@@ -130,6 +144,9 @@ class ParityReport:
     # snapshot_declaration()'s answer for the adapter feeding the candidate store;
     # printed only while the snapshot is genuinely absent (see summary()).
     snapshot_unavailable: str | None = None
+    # False when the id space is uniformly non-orderable (email Message-IDs): the
+    # window classes never fired and could not have — see the module docstring.
+    orderable: bool = True
 
     @property
     def cursor_divergent(self) -> bool:
@@ -172,7 +189,7 @@ class ParityReport:
         the operator surface fills it from core/retention.py's store. None renders as
         UNKNOWN, never as 0.
         """
-        lost = sorted(self.by_class(ENGINE_LOST), key=_fl)
+        lost = sorted(self.by_class(ENGINE_LOST), key=_fl if self.orderable else str)
         return {
             "verdict": "PARITY OK" if self.ok else "PARITY FAIL",
             "engine_lost": len(lost),
@@ -186,6 +203,7 @@ class ParityReport:
             "oracle_count": self.oracle_count,
             "candidate_count": self.candidate_count,
             "served_known": self.served_known,
+            "orderable": self.orderable,
             "snapshot_unavailable": self.snapshot_unavailable,
             "cursor_divergent": self.cursor_divergent,
             "raw": {"missed": len(self.missed), "extra": len(self.extra)},
@@ -207,6 +225,13 @@ class ParityReport:
                 lines.append("  platform snapshot: ABSENT — every miss counted as "
                              "ENGINE_LOST (fail-closed: without it, a loss and a "
                              "deletion are indistinguishable)")
+        if not self.orderable:
+            # Named, not implied: an operator who does not know the window classes
+            # CANNOT fire on this id space would read their absence as a clean bill.
+            lines.append(f"  identities not orderable (e.g. email Message-IDs) — "
+                         f"window classes {NOT_YET_POLLED}, {BEFORE_ENGINE_START}, "
+                         f"{AHEAD_OF_ORACLE}, {PRE_ORACLE_FLOOR} unavailable; "
+                         "classification is by served-set membership only")
         for cls, n in self.counts().items():
             mark = "accepted" if cls in self.accepted else "UNEXPLAINED"
             lines.append(f"  {cls}={n} [{mark}]")
@@ -237,6 +262,32 @@ def _fl(ts) -> float:
     except (TypeError, ValueError) as ex:
         raise ParityError(f"timestamp {ts!r} is not orderable — cannot place it in a "
                           "retention window, and guessing would invent a class") from ex
+
+
+def _orderable(ids, channel: str) -> bool:
+    """True when every id parses as a float, False when NONE does (email Message-IDs).
+
+    A MIXED space raises: two id shapes in one channel means corruption — an adapter
+    emitting two identity schemes, or two channels' rows in one comparison — and
+    degrading it to the unordered mode would hide that. Probing through `_fl` on
+    purpose: if its refusal is ever softened to a silent 0.0, every id reads
+    orderable and the mixed-space test goes red."""
+    unparseable = []
+    for ts in ids:
+        try:
+            _fl(ts)
+        except ParityError:
+            unparseable.append(ts)
+    if not unparseable:
+        return True
+    if len(unparseable) == len(set(ids)):
+        return False
+    bad = set(unparseable)
+    ordered_example = next(ts for ts in ids if ts not in bad)
+    raise ParityError(
+        f"channel {channel} mixes orderable and non-orderable identities "
+        f"(e.g. {ordered_example!r} vs {unparseable[0]!r}) — refusing to classify: "
+        "half a timeline is id-space corruption, not a degraded mode")
 
 
 def compare(oracle_ts, candidate_ts, channel: str,
@@ -294,7 +345,17 @@ def compare(oracle_ts, candidate_ts, channel: str,
             f"{len(oracle_ts)} messages — refusing to compare: an empty snapshot would "
             "classify every genuine loss as 'deleted upstream'")
 
-    o_lo, o_hi = min(map(_fl, oracle_ts)), max(map(_fl, oracle_ts))
+    orderable = _orderable(served | oracle_ts | candidate_ts, channel)
+    if not orderable and (covered_from is not None or covered_through is not None):
+        # The _fl() refusal made load-bearing (ENH-26): these ids have no timeline to
+        # place a window on, and sorting them as 0.0 would let a real loss earn
+        # NOT_YET_POLLED or BEFORE_ENGINE_START for free.
+        raise ParityError(
+            f"channel {channel}: covered_from/covered_through place ids on a "
+            "timeline, but these identities are not orderable — drop the window "
+            "arguments; classification falls back to served-set membership")
+    o_lo = min(map(_fl, oracle_ts)) if orderable else None
+    o_hi = max(map(_fl, oracle_ts)) if orderable else None
     through = _fl(covered_through) if covered_through is not None else None
     since = _fl(covered_from) if covered_from is not None else None
 
@@ -304,10 +365,10 @@ def compare(oracle_ts, candidate_ts, channel: str,
     # The universe is served|oracle, not just the oracle: a message the platform serves
     # and the engine lacks is a loss whether or not the incumbent happened to catch it.
     for ts in (served | oracle_ts) - candidate_ts:
-        v = _fl(ts)
-        if through is not None and v > through:
+        v = _fl(ts) if orderable else None
+        if orderable and through is not None and v > through:
             classified[ts] = NOT_YET_POLLED          # the engine never claimed this far
-        elif since is not None and v < since:
+        elif orderable and since is not None and v < since:
             classified[ts] = BEFORE_ENGINE_START     # predates this engine's first poll
         elif not served_known or ts in served:
             classified[ts] = ENGINE_LOST             # fail-closed when the platform is silent
@@ -316,10 +377,9 @@ def compare(oracle_ts, candidate_ts, channel: str,
 
     # ---- extras: the engine has it, the oracle does not ----------------------------
     for ts in candidate_ts - oracle_ts:
-        v = _fl(ts)
-        if v > o_hi:
+        if orderable and _fl(ts) > o_hi:
             classified[ts] = AHEAD_OF_ORACLE         # engine polled ahead of the incumbent
-        elif v < o_lo:
+        elif orderable and _fl(ts) < o_lo:
             classified[ts] = PRE_ORACLE_FLOOR        # deeper than the oracle's retention
         elif served_known and ts in served:
             classified[ts] = ORACLE_MISSED           # platform has it; the INCUMBENT lost it
@@ -338,6 +398,7 @@ def compare(oracle_ts, candidate_ts, channel: str,
         accepted=accepted,
         served_known=served_known,
         snapshot_unavailable=snapshot_unavailable,
+        orderable=orderable,
     )
 
 

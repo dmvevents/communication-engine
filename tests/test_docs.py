@@ -83,11 +83,11 @@ class HonestLimitsTest(unittest.TestCase):
 
     def test_the_shipped_adapter_claim_matches_the_filesystem(self):
         """The limits section claims exactly `fake` + `slack` + `slack_socket` +
-        `telegram` ship. Check the claim against reality: when another adapter lands,
-        THIS test fails, forcing the limits section (and this assertion) to be updated
-        in the same change — the doc cannot drift quietly. (It fired exactly as
-        designed when `slack` landed, again when `slack_socket` landed, and again when
-        `telegram` landed.)"""
+        `telegram` + `email` ship. Check the claim against reality: when another
+        adapter lands, THIS test fails, forcing the limits section (and this
+        assertion) to be updated in the same change — the doc cannot drift quietly.
+        (It fired exactly as designed when `slack` landed, again when `slack_socket`
+        landed, again when `telegram` landed, and again when `email` landed.)"""
         self.assertIn("fake", self.limits,
                       "the limits section no longer names the fake adapter")
         self.assertIn("slack", self.limits,
@@ -96,6 +96,8 @@ class HonestLimitsTest(unittest.TestCase):
                       "the limits section no longer names the socket-mode adapter")
         self.assertIn("telegram", self.limits,
                       "the limits section no longer names the telegram adapter")
+        self.assertIn("email", self.limits,
+                      "the limits section no longer names the email adapter")
         self.assertIn("read-only", self.limits,
                       "the adapters' defining limit — read-only, no send path — "
                       "vanished from the doc while still being true")
@@ -114,12 +116,22 @@ class HonestLimitsTest(unittest.TestCase):
             "the doc no longer says parity against a Telegram store can never go "
             "green on deleted history — the one expectation that must be set before "
             "the first parity run, not after")
+        self.assertRegex(
+            self.limits, r"(?is)identity\s+is\s+the\s+Message-ID",
+            "email's defining limit vanished: identity is a Message-ID string that "
+            "no float() parses — an adopter who assumes an orderable ts will misread "
+            "both the store's keys and parity's non-orderable verdicts")
+        self.assertRegex(
+            self.limits, r"(?is)non-orderable\s+identities",
+            "the doc no longer says parity classifies email ids WITHOUT ordering "
+            "them — the one expectation that keeps its unavailable window classes "
+            "from being read as a defect")
         shipped = set(discover_adapters(ROOT / "channels"))
         self.assertEqual(
-            shipped, {"fake", "slack", "slack_socket", "telegram"},
+            shipped, {"fake", "slack", "slack_socket", "telegram", "email"},
             f"channels/ now ships {sorted(shipped)} but docs/QUICKSTART.md's honest-limits "
-            "section still claims fake + slack (read-only) + slack_socket + telegram — "
-            "rewrite the limits section, then update this assertion")
+            "section still claims fake + slack (read-only) + slack_socket + telegram + "
+            "email — rewrite the limits section, then update this assertion")
 
     def test_the_distribution_model_limit_states_the_exemption_and_the_risk(self):
         """ENH-15: since 2025-05-29 the platform throttles conversations.history and

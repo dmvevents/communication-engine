@@ -545,5 +545,94 @@ class ReadTimestampsTest(unittest.TestCase):
             read_timestamps(str(self.db), "C_ONE", table="not_a_table")
 
 
+class NonOrderableIdentityTest(unittest.TestCase):
+    """ENH-26: email identities are Message-ID strings no float() will parse. The
+    explicit ordering rule: a comparison is ORDERABLE only when every id on every
+    side parses as a float; uniformly non-orderable ids still get the full
+    set-membership classification (loss vs deletion needs no ordering), while the
+    four window classes — which only mean anything on a timeline — become
+    unavailable rather than guessed. A MIXED id space stays a refusal: half a
+    timeline is corruption, not a mode."""
+
+    ORACLE = {"<a1@example.com>", "<a2@example.com>", "<a3@example.com>"}
+
+    def test_identical_non_orderable_sets_are_parity_ok(self):
+        r = compare(self.ORACLE, set(self.ORACLE), "INBOX",
+                    served_ts=set(self.ORACLE))
+        self.assertTrue(r.ok)
+        self.assertFalse(r.orderable)
+
+    def test_an_all_numeric_comparison_reads_orderable(self):
+        r = compare({"1.0", "2.0"}, {"1.0", "2.0"}, "C_EXAMPLE")
+        self.assertTrue(r.orderable)
+
+    def test_a_deleted_message_is_unretrievable_without_any_ordering(self):
+        r = compare(self.ORACLE, self.ORACLE - {"<a2@example.com>"}, "INBOX",
+                    served_ts=self.ORACLE - {"<a2@example.com>"},
+                    accept=(UNRETRIEVABLE,))
+        self.assertEqual(r.classified["<a2@example.com>"], UNRETRIEVABLE)
+        self.assertTrue(r.ok)
+
+    def test_a_served_miss_is_engine_lost_without_any_ordering(self):
+        r = compare(self.ORACLE, self.ORACLE - {"<a2@example.com>"}, "INBOX",
+                    served_ts=set(self.ORACLE))
+        self.assertEqual(r.classified["<a2@example.com>"], ENGINE_LOST)
+        self.assertFalse(r.ok)
+
+    def test_without_a_snapshot_every_non_orderable_miss_stays_fail_closed(self):
+        r = compare(self.ORACLE, set(), "INBOX")
+        self.assertEqual(set(r.classified.values()), {ENGINE_LOST})
+
+    def test_a_non_orderable_extra_is_oracle_missed_or_engine_only(self):
+        served = self.ORACLE | {"<extra-served@example.com>"}
+        candidate = self.ORACLE | {"<extra-served@example.com>",
+                                   "<extra-alone@example.com>"}
+        r = compare(self.ORACLE, candidate, "INBOX", served_ts=served)
+        self.assertEqual(r.classified["<extra-served@example.com>"], ORACLE_MISSED)
+        self.assertEqual(r.classified["<extra-alone@example.com>"], ENGINE_ONLY)
+
+    def test_window_placement_on_non_orderable_ids_is_refused_not_guessed(self):
+        """covered_from/covered_through place ids on a timeline that does not exist
+        here — guessing (say, sorting unparseable ids as 0.0) would let a real loss
+        earn NOT_YET_POLLED or BEFORE_ENGINE_START for free. This is the _fl()
+        refusal made load-bearing. The NUMERIC window value is the sharp case: _fl
+        would accept it happily, and without the explicit refusal it would be
+        SILENTLY IGNORED — the silent-no-op class this repo exists to kill."""
+        for kwargs in ({"covered_through": "1700000000.0"},
+                       {"covered_from": "42:1"}):
+            with self.assertRaises(ParityError, msg=kwargs) as ctx:
+                compare(self.ORACLE, set(self.ORACLE), "INBOX",
+                        served_ts=set(self.ORACLE), **kwargs)
+            self.assertIn("orderable", str(ctx.exception))
+
+    def test_a_mixed_id_space_is_still_a_refusal(self):
+        """Half-numeric ids are corruption (two channels in one comparison, an
+        adapter emitting two shapes) — never a mode to degrade into."""
+        with self.assertRaises(ParityError):
+            compare({"1.1", "<a1@example.com>"}, {"1.1"}, "INBOX",
+                    served_ts={"1.1"})
+
+    def test_the_summary_says_the_window_classes_are_unavailable(self):
+        text = compare(self.ORACLE, set(self.ORACLE), "INBOX",
+                       served_ts=set(self.ORACLE)).summary()
+        self.assertIn("not orderable", text)
+        self.assertIn(NOT_YET_POLLED, text,
+                      "the summary must NAME the unavailable verdicts — an operator "
+                      "who does not know the window classes cannot fire here will "
+                      "misread their absence")
+
+    def test_an_orderable_summary_never_mentions_the_degradation(self):
+        text = compare({"1.0"}, {"1.0"}, "C_EXAMPLE").summary()
+        self.assertNotIn("not orderable", text)
+
+    def test_the_panel_renders_a_non_orderable_loss_without_crashing(self):
+        r = compare(self.ORACLE, set(), "INBOX", served_ts=set(self.ORACLE))
+        panel = r.panel()
+        self.assertEqual(panel["verdict"], "PARITY FAIL")
+        self.assertEqual(panel["engine_lost"], 3)
+        self.assertEqual(panel["engine_lost_sample"], sorted(self.ORACLE))
+        self.assertFalse(panel["orderable"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

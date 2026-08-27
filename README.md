@@ -17,6 +17,7 @@ directions). Adapters live one directory per platform, all implementing
 | `slack` | read-only Web API polling (poll / resolve / health) — no send path at any layer |
 | `slack_socket` | Socket Mode push ingestion — read-only, legitimized by a continuous push-vs-poll parity watch |
 | `telegram` | read-only bot-API polling — the first non-Slack platform; no history API upstream, so one destructive read per poll at the committed cursor, one chat per instance, no send path at any layer |
+| `email` | read-only IMAP polling (Outlook or any RFC-3501 server) — identity is the Message-ID (a non-orderable string, which store and parity handle end to end), ordering is mailbox UID order, threading from References/In-Reply-To; every select is EXAMINE and every fetch BODY.PEEK, so polling never marks mail seen |
 
 What does NOT ship is listed where an adopter acts: the quickstart's honest-limits section.
 Notably there is no live send path (the outbox ladder is complete, but only the `fake`
@@ -44,7 +45,7 @@ python3 -m unittest discover -s tests -q # the suite is the spec
 ## Why
 
 An agent fleet already talks through multiple channels (chat workspaces, messenger bridges,
-soon email). Each grew its own poller, watchdog, send path, and staging discipline — mirrored
+email). Each grew its own poller, watchdog, send path, and staging discipline — mirrored
 copies of the same five ideas. This repo turns the mirroring into a contract:
 
 - `core/` — the engine: cursored gap-free polling into a pinned-schema store, word-boundary

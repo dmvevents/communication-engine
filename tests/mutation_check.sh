@@ -1787,7 +1787,7 @@ run_mutation "docs: step 6 loses the escalation flag's name" \
 # wearing the verdict's name.
 run_mutation "parity: the panel's lead number becomes the raw missed count" \
   "core/parity.py" \
-  "('        lost = sorted(self.by_class(ENGINE_LOST), key=_fl)', '        lost = sorted(self.missed, key=_fl)')" \
+  "('        lost = sorted(self.by_class(ENGINE_LOST), key=_fl if self.orderable else str)', '        lost = sorted(self.missed, key=_fl if self.orderable else str)')" \
   "test_parity"
 
 # The configuration that waived classes goes unnamed — a green verdict with no
@@ -1947,6 +1947,144 @@ run_mutation "docs: telegram's no-history-API limit vanishes" \
 run_mutation "docs: the permanently-fail-closed parity claim vanishes" \
   "docs/QUICKSTART.md" \
   "('**permanently fail-closed**', '**conservative at first**')" \
+  "test_docs"
+
+# ENH-26 — parity's non-orderable mode IS the email acceptance: if the orderability
+# probe hardcodes True, every Message-ID comparison dies in min(map(_fl, ...)) and the
+# parity path stops working end to end with non-numeric identity.
+run_mutation "parity: every id space is assumed orderable again" \
+  "core/parity.py" \
+  "('    orderable = _orderable(served | oracle_ts | candidate_ts, channel)', '    orderable = True')" \
+  "test_parity"
+
+# ENH-26 — a numeric covered_from/covered_through on a non-orderable id space must be
+# refused, not silently ignored: _fl accepts the number happily, so without this guard
+# the caller's window argument configures nothing (the silent-no-op class, F-2).
+run_mutation "parity: a window on non-orderable ids is silently ignored" \
+  "core/parity.py" \
+  "('    if not orderable and (covered_from is not None or covered_through is not None):', '    if False and (covered_from is not None or covered_through is not None):')" \
+  "test_parity"
+
+# ENH-26 — a MIXED id space is corruption (two id shapes in one channel), never a mode:
+# degrading it to the unordered path would hide an adapter emitting two identity schemes.
+run_mutation "parity: a mixed id space degrades to the unordered mode" \
+  "core/parity.py" \
+  "('    if len(unparseable) == len(set(ids)):\n        return False', '    if unparseable:\n        return False')" \
+  "test_parity"
+
+# ENH-26 — the degradation must be NAMED in the summary: an operator who does not know
+# the window classes cannot fire on this id space reads their absence as a clean bill.
+run_mutation "parity: the unavailable window classes go unnamed" \
+  "core/parity.py" \
+  "('        if not self.orderable:', '        if False:')" \
+  "test_parity"
+
+# ENH-26 — THE email identity property: ts is the Message-ID, never the Date header
+# (sender-controlled, whole seconds — burst messages merge into one store row).
+run_mutation "email: identity becomes the Date header" \
+  "channels/email/adapter.py" \
+  "('            \"ts\": mid,', '            \"ts\": str(msg.get(\"Date\")),')" \
+  "test_email_adapter"
+
+# ENH-26 — and never the UID: a UIDVALIDITY reset reassigns every UID, so a UID-keyed
+# store duplicates the whole mailbox after a reset.
+run_mutation "email: identity becomes the mailbox UID" \
+  "channels/email/adapter.py" \
+  "('            \"ts\": mid,', '            \"ts\": str(uid),')" \
+  "test_email_adapter"
+
+# ENH-26 — a surrogate identity derived from anything but the message bytes mints a new
+# identity per sighting: every re-poll duplicates the row (R9).
+run_mutation "email: the missing-Message-ID surrogate varies per sighting" \
+  "channels/email/adapter.py" \
+  "('        return f\"<{hashlib.sha256(raw_bytes).hexdigest()}@no-message-id.invalid>\"', '        return f\"<{hashlib.sha256(repr(object()).encode()).hexdigest()}@no-message-id.invalid>\"')" \
+  "test_email_adapter"
+
+# ENH-26 — THE ordering rule: mailbox UID (arrival) order, not whatever order the wire
+# happened to serve the SEARCH result in.
+run_mutation "email: ordering becomes the wire order of the search reply" \
+  "channels/email/adapter.py" \
+  "('        return sorted(uid for uid in map(int, found) if uid > last)', '        return [uid for uid in map(int, found) if uid > last]')" \
+  "test_email_adapter"
+
+# ENH-26 — UID SEARCH n:* returns the newest message even when n exceeds it (RFC 3501
+# range semantics); unfiltered, every idle poll re-serves the tip forever.
+run_mutation "email: the n:* quirk row is re-served on every idle poll" \
+  "channels/email/adapter.py" \
+  "('if uid > last)', 'if uid >= last)')" \
+  "test_email_adapter"
+
+# ENH-26 — threading: References is the ancestor chain and its FIRST id is the root
+# (the Slack thread_ts alignment); dropping to In-Reply-To alone re-threads deep
+# replies onto their immediate parent.
+run_mutation "email: thread derivation ignores References" \
+  "channels/email/adapter.py" \
+  "('        chain = _msgids(msg.get(\"References\")) or _msgids(msg.get(\"In-Reply-To\"))', '        chain = _msgids(msg.get(\"In-Reply-To\"))')" \
+  "test_email_adapter"
+
+run_mutation "email: the thread root becomes the immediate parent" \
+  "channels/email/adapter.py" \
+  "('        thread = chain[0] if chain else None', '        thread = chain[-1] if chain else None')" \
+  "test_email_adapter"
+
+# ENH-26 — deny-by-default at the one funnel every command passes through.
+run_mutation "email: the read allowlist stops being enforced" \
+  "channels/email/adapter.py" \
+  "('        if command not in READ_COMMANDS:', '        if False:')" \
+  "test_email_adapter"
+
+# ENH-26 — the two writes IMAP hides inside reads, forced shut at the funnel:
+# a fetch without BODY.PEEK marks the operator's unread mail \Seen...
+run_mutation "email: a fetch without PEEK reaches the wire" \
+  "channels/email/adapter.py" \
+  "('            if sub == \"FETCH\" and \"BODY.PEEK[\" not in str(args[-1]).upper():', '            if False:')" \
+  "test_email_adapter"
+
+# ...and a writable SELECT lets the server mutate mailbox state.
+run_mutation "email: mailboxes are selected writable" \
+  "channels/email/adapter.py" \
+  "('            kwargs[\"readonly\"] = True', '            kwargs.setdefault(\"readonly\", False)')" \
+  "test_email_adapter"
+
+# ENH-26 — a UIDVALIDITY reset reassigns every UID; resuming from the stale number
+# silently skips everything below it (the one direction that loses).
+run_mutation "email: a UIDVALIDITY reset resumes from the stale uid" \
+  "channels/email/adapter.py" \
+  "('            if seen_validity == validity:\n                last = seen_uid', '            last = seen_uid')" \
+  "test_email_adapter"
+
+# ENH-26 — a cursor the adapter did not mint means state corruption; guessing a window
+# from it re-shapes what gets polled without anyone deciding that.
+run_mutation "email: a junk cursor is guessed at instead of refused" \
+  "channels/email/adapter.py" \
+  "('            raise ValueError(\n                f\"email adapter: cursor is not a mailbox->', '            return {}\n            raise ValueError(\n                f\"email adapter: cursor is not a mailbox->')" \
+  "test_email_adapter"
+
+# ENH-26 — the snapshot must derive identity through the SAME path as poll(), or
+# parity classifies one row as missing AND extra in the same run.
+run_mutation "email: the snapshot derives identity its own way" \
+  "channels/email/adapter.py" \
+  "('                out.add(self._identity(self._fetch_raw(client, uid)))', '                out.add(str(uid))')" \
+  "test_email_adapter"
+
+# ENH-26 — a bounded snapshot cannot be answered exactly on Message-IDs; truncating one
+# relabels real losses as deletions (the direction that hides a defect).
+run_mutation "email: a bounded snapshot is truncated instead of refused" \
+  "channels/email/adapter.py" \
+  "('        if oldest is not None or latest is not None:', '        if False:')" \
+  "test_email_adapter"
+
+# ENH-26 — the doc's email headline: an adopter who assumes an orderable ts misreads
+# both the store's keys and parity's verdicts.
+run_mutation "docs: email's identity-is-Message-ID limit vanishes" \
+  "docs/QUICKSTART.md" \
+  "('**identity is the Message-ID string**', '**identity is the arrival timestamp**')" \
+  "test_docs"
+
+# ENH-26 — and the stated consequence: parity classifies these ids WITHOUT ordering them.
+run_mutation "docs: the non-orderable-identities claim vanishes" \
+  "docs/QUICKSTART.md" \
+  "('**non-orderable identities**', '**string identities**')" \
   "test_docs"
 
 echo

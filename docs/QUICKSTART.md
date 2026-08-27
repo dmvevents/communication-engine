@@ -283,7 +283,7 @@ is *reported* missing — never silently created, never rendered as a healthy ze
 
 ## Honest limits
 
-- Four adapters ship: **`fake`** (in-memory dry-run), **`slack`** — **read-only on purpose**
+- Five adapters ship: **`fake`** (in-memory dry-run), **`slack`** — **read-only on purpose**
   (poll/resolve/health; it exposes no send path at any layer, and `tests/test_slack_adapter.py`
   fails if one appears) — **`slack_socket`** (Socket Mode push ingestion, equally
   read-only; push is for latency only: Socket Mode can MISS events, so the socket adapter is
@@ -298,9 +298,20 @@ is *reported* missing — never silently created, never rendered as a healthy ze
   (every miss reads ENGINE_LOST), which `core/parity.py` and the doctor declare by name
   rather than leave to be misread as a read-path defect (`channels/telegram/README.md`;
   `tests/test_telegram_adapter.py` fails if a send path or a stub snapshot appears). It has
-  **not yet run against a live bot**. "Multi-channel" is now proven as a *mechanism* — a new
+  **not yet run against a live bot**. Finally **`email`** (IMAP polling, read-only —
+  Outlook or any RFC-3501 server): the platform that breaks the float-ts assumption on
+  purpose. Message **identity is the Message-ID string** — never the sender-controlled
+  Date header and never the IMAP UID — ordering is mailbox UID (arrival) order, threading
+  derives from the References/In-Reply-To headers, and `core/parity.py` classifies these
+  **non-orderable identities** by served-set membership, declaring its timeline-based
+  window classes unavailable rather than guessing an order. Every mailbox selection is
+  read-only (EXAMINE) and every fetch uses BODY.PEEK, so polling never marks the
+  operator's unread mail `\Seen`. It has **not yet run against a live mailbox**, and on
+  Outlook/M365 specifically, IMAP `LOGIN` needs an app password or a tenant that still
+  permits basic auth — OAuth2/XOAUTH2 is not implemented (`channels/email/README.md`).
+  "Multi-channel" is now proven as a *mechanism* — a new
   channel type is a directory drop with zero `core/` changes (`tests/test_extensibility.py`)
-  — plus two real platforms (three ingestion paths).
+  — plus three real platforms (four ingestion paths).
 - **Read parity against an existing system has not been demonstrated** over a long window
   (gate G1). If you are replacing an incumbent, run both and diff before trusting this one.
   The diff is shipped, not homework — `core/parity.py` opens the incumbent's own database
