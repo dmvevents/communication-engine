@@ -5,10 +5,14 @@ The Streamlit shell over core/dashboard.py: YOUR settings.json resolves YOUR
 journal.db and per-instance outboxes (config's `outbox_path_for`, the same split the
 write side uses), and everything on screen comes from that one read-only snapshot.
 
-Read-only twice over: core/outbox is never imported (tests/test_dashboard.py holds an
-AST check on this file, like the scheduler's), and every database connection is
-core/dashboard's sqlite mode=ro — so no bug here can post as anyone or touch the
-audit trail it displays.
+Read-only twice over BY DEFAULT: core/outbox is never imported by this file
+(tests/test_dashboard.py holds an AST check on it, like the scheduler's), and every
+database connection is core/dashboard's sqlite mode=ro — so no bug here can post as
+anyone or touch the audit trail it displays. The optional write surface (ENH-28) is a
+separate module, scripts/dashboard_write.py, loaded ONLY when the environment says
+COMMS_UI_WRITE_ENABLED=true — with the gate off (or unset) the send layer is not just
+unused but unreachable, and even with it on, nothing sends without a human click on
+the exact staged text (core/outbox.release is the only path).
 
 Run it through scripts/dashboard-serve.sh, which binds 127.0.0.1 ONLY; a remote
 operator tunnels in (`ssh -L 8502:127.0.0.1:8502 <host>`). Config comes from the
@@ -78,6 +82,22 @@ def badge(severity):
             f"{GLYPH[severity]}</span> <b>{LABEL[severity]}</b>")
 
 
+# ---- the write gate (ENH-28) -------------------------------------------------
+# Default READ-ONLY. The surface grows a write half ONLY when the environment says
+# exactly 'true'; 'false'/unset keeps this script the viewer it always was, with the
+# send layer never even imported (the AST check in tests/test_dashboard.py still
+# holds for this file, and tests/test_dashboard_write.py pins the one import below
+# to THIS branch). Any other value is refused BY NAME: a misspelled gate silently
+# resolving to either state is the inert-key defect (ENH-17) on an env var — the
+# operator who typed 'ture' must be told, not left believing writes are on.
+_gate_raw = os.environ.get("COMMS_UI_WRITE_ENABLED", "false").strip().lower()
+if _gate_raw not in ("true", "false", ""):
+    st.error(f"COMMS_UI_WRITE_ENABLED={_gate_raw!r} is neither 'true' nor 'false' — "
+             "refusing to guess whether the write surface should exist. Fix the "
+             "variable and reload.")
+    st.stop()
+WRITE_ENABLED = _gate_raw == "true"
+
 # ---- config: the adopter's, never a hardwired path --------------------------
 cfg_path = Path(os.environ.get("COMMS_SETTINGS", "settings.json"))
 if not cfg_path.is_file():
@@ -106,8 +126,13 @@ with st.sidebar:
     st.caption(f"instances: {', '.join(sorted(outbox_paths))}")
     if st.button("↻ Re-read state"):
         st.rerun()
-    st.caption(f"read {time.strftime('%H:%M:%SZ', time.gmtime())} · every connection "
-               "is read-only (sqlite mode=ro); this surface cannot send or edit")
+    if WRITE_ENABLED:
+        st.caption(f"read {time.strftime('%H:%M:%SZ', time.gmtime())} · write surface "
+                   "ENABLED (COMMS_UI_WRITE_ENABLED=true): composing stages a draft; "
+                   "nothing sends without your click on that exact text")
+    else:
+        st.caption(f"read {time.strftime('%H:%M:%SZ', time.gmtime())} · every connection "
+                   "is read-only (sqlite mode=ro); this surface cannot send or edit")
 
 st.title("operator dashboard")
 st.caption("What needs a human, from your journal and outbox — severity first, "
@@ -235,3 +260,13 @@ with parity_tab:
             st.markdown(raw_note, unsafe_allow_html=True)
     st.caption(f"source: `{cfg.state_dir / 'parity'}` · tombstones: "
                f"`{cfg.state_dir / 'tombstones.db'}`")
+
+# ---- the write surface (ENH-28) — loaded ONLY behind the gate ------------------
+# The import lives INSIDE the branch on purpose: with the gate off, the send layer
+# is not merely unused, it is unreachable — never imported into this process.
+# tests/test_dashboard_write.py pins that placement with an AST check, and the
+# gate-off AppTest proves it at runtime via sys.modules.
+if WRITE_ENABLED:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import dashboard_write  # noqa: E402
+    dashboard_write.render(cfg)

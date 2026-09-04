@@ -20,7 +20,10 @@ That yields at-most-once delivery with at-least-once *attempt*, i.e. exactly one
 
 Reply policy is CONFIG, not code: `never` (default) / `staged` / `direct`. A `never` target
 raises; a `staged` target writes a draft for an operator to gate and never calls the adapter.
-No caller may reach `adapter.send()` except through `Outbox.send()`.
+The gate itself is `release()` (ENH-28): an explicit human action on the exact staged text,
+which flips STAGED -> INTENT durably and then runs this same ladder; `discard()` is the
+terminal rejection. No caller may reach `adapter.send()` except through `Outbox.send()` or
+`Outbox.release()` — and both funnel through the one `_deliver()` seam.
 
 Policy is resolvable PER SCOPE (ENH-3): a target's policy may be a plain string (both
 scopes) or `{"channel": ..., "thread": ...}`, because "answer in thread, never the main
@@ -38,6 +41,9 @@ from pathlib import Path
 
 INTENT, SENT, VERIFIED, COMMITTED, STAGED = (
     "INTENT", "SENT", "VERIFIED", "COMMITTED", "STAGED")
+# ENH-28: a draft a human looked at and rejected. Terminal, and KEPT — deleting the
+# row would erase the record that this exact text reached the gate and was refused.
+DISCARDED = "DISCARDED"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS outbox (
@@ -89,6 +95,11 @@ class PolicyError(PermissionError):
 
 class SendBlocked(RuntimeError):
     """The adapter refused or the read-back could not prove delivery."""
+
+
+class ReleaseError(RuntimeError):
+    """The row release()/discard() was pointed at cannot take that transition —
+    the caller named a draft that does not exist, or one that is not a draft."""
 
 
 def idempotency_key(target: str, trigger_ts: str, text: str,
@@ -263,6 +274,15 @@ class Outbox:
             # Draft only. The operator gates the actual send; the adapter is never called.
             return {"key": key, "receipt": None, "state": STAGED, "staged": True}
 
+        return self._finish(key, target, text, thread_id, _crash_at)
+
+    def _finish(self, key, target, text, thread_id, _crash_at=None):
+        """INTENT -> COMMITTED: the back half of the ladder, shared by the live send
+        and an operator release (ENH-28). Extracted so release() runs the IDENTICAL
+        pacing / delivery / durable-SENT / read-back / COMMITTED sequence a direct
+        send runs — a parallel ladder would drift, and the seams here are exactly
+        where drift double-messages someone. The caller must already hold the claim:
+        an INTENT row it inserted (send) or one it flipped from STAGED (release)."""
         if _crash_at == "after_intent":
             raise _Crash("crash after INTENT, before adapter.send")
 
@@ -333,6 +353,112 @@ class Outbox:
         rows = self.conn.execute(
             "SELECT * FROM outbox WHERE state=?", (STAGED,)).fetchall()
         return [dict(r) for r in rows]
+
+    def delivered(self) -> list:
+        """Rows PROVEN on the target (VERIFIED/COMMITTED), newest first, as plain
+        dicts (the ENH-22 lesson, same as staged()). This is the 'sent' half of the
+        operator surface's staged-vs-sent distinction (ENH-28): a draft is a promise,
+        a row here is a read-back-proven fact, and the two must never render alike."""
+        rows = self.conn.execute(
+            "SELECT * FROM outbox WHERE state IN (?,?) ORDER BY updated_at DESC",
+            (VERIFIED, COMMITTED)).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---- the operator write path (ENH-28) -----------------------------------
+    def stage(self, target: str, trigger_ts: str, text: str,
+              thread_id: str | None = None) -> dict:
+        """Write a draft at the operator gate. The adapter is NEVER called here.
+
+        This is the compose path of the write surface: whatever the target's policy
+        allows, a message composed by a human stops at STAGED, and only release() —
+        an explicit second human action on the exact staged text — can move it
+        further. Two properties are deliberate:
+
+        * **Default deny holds for composing too.** A 'never' target refuses the
+          draft outright — staging to it would imply someone could later approve a
+          send the policy forbids.
+        * **'direct' does not skip the gate.** A direct policy authorizes the ENGINE
+          to answer without a human; a human composing on the operator surface is
+          asking for a reviewed send, and the review is the point.
+        """
+        scope = "thread" if thread_id is not None else "channel"
+        if self.policy_for(target, scope) == "never":
+            raise PolicyError(
+                f"reply policy for {target} ({scope} scope) is 'never' — refusing "
+                "to stage. Composing requires a policy of 'staged' or 'direct'.")
+        key = idempotency_key(target, trigger_ts, text, thread_id)
+        # Same INSERT-is-the-claim shape as send(): concurrent stagers of the same
+        # draft collapse to one row, and re-staging an already-delivered reply must
+        # report the delivery, not mint a second visible message.
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO outbox (key, target, trigger_ts, text, state, "
+            "policy, scope, thread_id, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (key, target, str(trigger_ts), text, STAGED,
+             self.policy_for(target, scope), scope, thread_id,
+             time.time(), time.time()))
+        self.conn.commit()
+        if cur.rowcount == 0:
+            row = self.get(key)
+            return {"key": key, "receipt": row["receipt"], "state": row["state"],
+                    "deduped": True}
+        return {"key": key, "receipt": None, "state": STAGED, "staged": True,
+                "deduped": False}
+
+    def release(self, key: str, _crash_at: str | None = None) -> dict:
+        """The human click — deliver ONE staged draft through the full ladder.
+
+        The STAGED -> INTENT flip is written durably BEFORE the adapter is touched:
+        that write IS the record of the approval, so a process death one instruction
+        later is resumed by recover() and the approved send completes, instead of
+        silently reverting to a draft nobody remembers approving. Everything after
+        the flip is _finish() — the same code path a direct send runs.
+
+        `_crash_at` is the fault-injection hook, as on send(); production callers
+        never pass it.
+        """
+        row = self.get(key)
+        if row is None:
+            raise ReleaseError(
+                f"no outbox row {key!r} — release() sends an explicitly staged "
+                "draft and never mints one; stage() first")
+        if row["state"] in (VERIFIED, COMMITTED):
+            # Already proven on the target: return the receipt, never re-send.
+            return {"key": key, "receipt": row["receipt"], "state": row["state"],
+                    "deduped": True}
+        if row["state"] in (INTENT, SENT):
+            # A claim in flight, or one that died mid-flight. Only recover()'s
+            # read-back can tell 'sent, unrecorded' from 'never sent' — a second
+            # live delivery here is the double-message bug.
+            return {"key": key, "receipt": None, "state": row["state"],
+                    "in_flight": True}
+        if row["state"] == DISCARDED:
+            raise ReleaseError(
+                f"draft {key!r} was DISCARDED — a rejected draft never sends; "
+                "stage it again if it should")
+        # Policy is re-resolved at the CLICK, not inherited from staging time: a
+        # channel demoted to 'never' since the draft was written must refuse the
+        # send, however long the draft sat at the gate.
+        if self.policy_for(row["target"], row["scope"]) == "never":
+            raise PolicyError(
+                f"reply policy for {row['target']} ({row['scope']} scope) is now "
+                "'never' — the draft stays staged; nothing was sent")
+        self._write(key, state=INTENT)
+        return self._finish(key, row["target"], row["text"], row["thread_id"],
+                            _crash_at)
+
+    def discard(self, key: str) -> dict:
+        """Reject a draft. Terminal, and only FROM staged: an in-flight or delivered
+        row is not a draft, and 'discarding' one would misrecord what has already
+        reached the platform. The row is kept (see DISCARDED above)."""
+        row = self.get(key)
+        if row is None:
+            raise ReleaseError(f"no outbox row {key!r} to discard")
+        if row["state"] != STAGED:
+            raise ReleaseError(
+                f"only a STAGED draft can be discarded; {key!r} is {row['state']}")
+        self._write(key, state=DISCARDED)
+        return {"key": key, "receipt": None, "state": DISCARDED}
 
     def close(self):
         self.conn.close()

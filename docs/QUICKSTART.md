@@ -265,8 +265,23 @@ waiting at the operator gate with their exact text, then the unanswered backlog 
 all read from YOUR `journal.db` and one outbox per instance, as resolved by YOUR
 `settings.json`. It is a viewer by construction: every database connection is
 read-only (`core/dashboard.py` opens sqlite `mode=ro`), the send layer is never even
-imported (same AST-enforced rule as the scheduler), and state that does not exist yet
-is *reported* missing — never silently created, never rendered as a healthy zero.
+imported while the write gate below is off (same AST-enforced rule as the scheduler),
+and state that does not exist yet is *reported* missing — never silently created,
+never rendered as a healthy zero.
+
+The dashboard is read-only **by default**. Setting `COMMS_UI_WRITE_ENABLED=true` in
+the environment adds a write surface (`scripts/dashboard_write.py` — the one module
+allowed to import the send layer; with the gate off, or unset, it is never even
+imported, and any value other than true/false is refused by name): composing there
+**stages** a draft into the outbox, and only your click on that exact staged text
+sends it — `outbox.release(key)` under the hood, so the approved send is durable,
+deduped, paced, and read-back-proven like any other; Discard is terminal and kept.
+The agent never auto-sends: there is no compose path that skips the gate, and
+`tests/mutation_check.sh` removes the gate one piece at a time to prove a test goes
+red each time. Deny-by-default still binds — a channel at `reply_policy: never` (the
+default) is not composable even with the gate on — and of the shipped adapters only
+`fake` declares send capability, so the whole write cycle is provable offline and no
+live platform gains a send path by flipping the gate.
 
 ## What to expect next
 
