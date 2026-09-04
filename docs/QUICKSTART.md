@@ -283,6 +283,25 @@ default) is not composable even with the gate on — and of the shipped adapters
 `fake` declares send capability, so the whole write cycle is provable offline and no
 live platform gains a send path by flipping the gate.
 
+The same gate covers **configuration** (`scripts/dashboard_config.py`, over
+`core/reconfig.py`): with it on, the dashboard can also add, edit and remove
+connections (`instances[]` — the adapter is picked from the discovered `channels/`
+set, never typed free-form) and monitored channels (`channels[]`). Editing **stages**
+an exact `settings.json` diff; nothing touches the file until your click on that exact
+diff, and Discard is terminal and kept. Every candidate is validated with the engine's
+own loader *before* it can be staged, so a mistake (an unknown key, an undiscovered
+adapter, a missing env var) is refused at the gate instead of at the next startup. A
+new channel defaults to `reply_policy: never` (deny) **by omission** — the loader's own
+default is the single copy of that rule — and any change that **widens** a reply policy
+(toward `staged` or `direct`, on either placement scope) is flagged in red on the card
+you click, never bundled silently into an unrelated apply. Auth is configured as
+environment-variable NAMES only (`env:NAME`); the surface shows whether the named
+variable is set, never its value, and a pasted secret is refused unstored and unechoed.
+Applying tells the truth about reload semantics: the dashboard re-reads `settings.json`
+on every rerun, but a **running scheduler or watcher loads settings only at startup and
+must be restarted to pick the change up** — there is no hot-reload path, and the
+surface says so instead of implying one.
+
 ## What to expect next
 
 - `state/journal.db` — one row per distinct inbound message, with its classification and
