@@ -81,7 +81,12 @@ outbox.policy_for("C_YOUR_CHANNEL", "thread")   # the SAME channel, inside a thr
 ```
 
 - `never` → `PolicyError` on send, adapter never called. Working as intended.
-- `staged` → look in the outbox for drafts: `outbox.staged()`. A human is meant to gate these.
+- `staged` → look in the outbox for drafts: `outbox.staged()`. A human is meant to gate these:
+  approve one with `outbox.release(key)` — the same INTENT → COMMITTED ladder as a direct
+  send, on the exact staged text, with the policy re-checked at the click — or reject it with
+  `outbox.discard(key)` (terminal; the row is KEPT as the record that a human refused this
+  text). The dashboard's gated write surface (ENH-28) is these two calls with buttons on
+  them, plus `outbox.stage(...)` behind its compose form.
 - `direct` → if it still is not sending, see the next section.
 
 **Ask about the placement that was actually refused.** The one-argument call answers for the

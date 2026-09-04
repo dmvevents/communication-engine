@@ -2087,6 +2087,105 @@ run_mutation "docs: the non-orderable-identities claim vanishes" \
   "('**non-orderable identities**', '**string identities**')" \
   "test_docs"
 
+# ---------------------------------------------------------------------------
+# ENH-28 — the write surface: composing stages, only a human click sends. Every
+# mutation below removes one half of that gate; a survivor is an agent that can
+# post in the operator's name without a human in the loop — the one behaviour
+# this feature's design bound forbids outright.
+# ---------------------------------------------------------------------------
+
+# ENH-28 — THE gate, outbox side: a compose that reaches the adapter is an auto-send.
+run_mutation "outbox: stage() falls through to the adapter (compose auto-sends)" \
+  "core/outbox.py" \
+  "('        return {\"key\": key, \"receipt\": None, \"state\": STAGED, \"staged\": True,\n                \"deduped\": False}', '        self._write(key, state=INTENT)\n        return self._finish(key, target, text, thread_id, None)')" \
+  "test_outbox_write"
+
+# ENH-28 — default deny must hold for composing too: staging to a 'never' channel
+# implies someone could later approve a send the policy forbids.
+run_mutation "outbox: stage() accepts a never-policy target" \
+  "core/outbox.py" \
+  "('        if self.policy_for(target, scope) == \"never\":', '        if False:')" \
+  "test_outbox_write"
+
+# ENH-28 — the approval must be durable BEFORE the adapter: without the flip, a
+# release that crashes mid-send evaporates (recover() ignores STAGED rows) and the
+# operator's click silently never happened.
+run_mutation "outbox: release() skips the durable STAGED->INTENT flip" \
+  "core/outbox.py" \
+  "('        self._write(key, state=INTENT)', '        pass')" \
+  "test_outbox_write"
+
+# ENH-28 — an INTENT/SENT row belongs to recover(); a second live delivery from the
+# gate is the double-message bug entered by click.
+run_mutation "outbox: release() re-sends a row that is already in flight" \
+  "core/outbox.py" \
+  "('        if row[\"state\"] in (INTENT, SENT):', '        if False:')" \
+  "test_outbox_write"
+
+# ENH-28 — a double-click must dedupe against the recorded delivery, never re-send.
+run_mutation "outbox: release() delivers an already-delivered draft again" \
+  "core/outbox.py" \
+  "('        if row[\"state\"] in (VERIFIED, COMMITTED):\n            # Already proven on the target: return the receipt, never re-send.', '        if False:\n            # Already proven on the target: return the receipt, never re-send.')" \
+  "test_outbox_write"
+
+# ENH-28 — DISCARDED is terminal: a rejected draft that can still be released makes
+# the human 'no' advisory.
+run_mutation "outbox: a DISCARDED draft can still be released" \
+  "core/outbox.py" \
+  "('        if row[\"state\"] == DISCARDED:', '        if False:')" \
+  "test_outbox_write"
+
+# ENH-28 — policy is re-resolved at the CLICK: a channel demoted to 'never' since
+# staging must refuse, however long the draft sat at the gate.
+run_mutation "outbox: release() honours the policy from staging time, not the click" \
+  "core/outbox.py" \
+  "('        if self.policy_for(row[\"target\"], row[\"scope\"]) == \"never\":', '        if False:')" \
+  "test_outbox_write"
+
+# ENH-28 — discard() must refuse anything that is not a draft: 'discarding' a
+# delivered row misrecords what is already on the platform.
+run_mutation "outbox: discard() rewrites the record of a delivered send" \
+  "core/outbox.py" \
+  "('        if row[\"state\"] != STAGED:', '        if False:')" \
+  "test_outbox_write"
+
+# ENH-28 — THE gate, shell side: the write surface must not exist for a read-only
+# operator. Caught statically (the import's guard stops being the gate) and at
+# runtime (the send layer appears in sys.modules with the gate off).
+run_mutation "dashboard.py (shell): the write surface renders with the gate off" \
+  "scripts/dashboard.py" \
+  "('if WRITE_ENABLED:\n    sys.path.insert', 'if True:\n    sys.path.insert')" \
+  "test_dashboard_write"
+
+# ENH-28 — the default is READ-ONLY; a default-true gate turns every existing
+# deployment into a write surface on upgrade.
+run_mutation "dashboard.py (shell): the write gate defaults to enabled" \
+  "scripts/dashboard.py" \
+  "('os.environ.get(\"COMMS_UI_WRITE_ENABLED\", \"false\")', 'os.environ.get(\"COMMS_UI_WRITE_ENABLED\", \"true\")')" \
+  "test_dashboard_write"
+
+# ENH-28 — a junk gate value silently resolving to read-only is the ENH-17 inert-key
+# defect on an env var: the operator who typed 'ture' believes writes are on.
+run_mutation "dashboard.py (shell): a junk gate value is silently accepted" \
+  "scripts/dashboard.py" \
+  "('if _gate_raw not in (\"true\", \"false\", \"\"):', 'if False:')" \
+  "test_dashboard_write"
+
+# ENH-28 — the UI's compose handler must stage, never send: this is the same gate as
+# the outbox mutation above, removed at the caller boundary instead (the seam where
+# the R22 cues and the ENH-9 signal once died).
+run_mutation "dashboard_write: the compose form sends instead of staging" \
+  "scripts/dashboard_write.py" \
+  "('                    res = outbox.stage(ch.id, f\"ui-compose-{time.time():.6f}\", text)', '                    res = outbox.release(outbox.stage(ch.id, f\"ui-compose-{time.time():.6f}\", text)[\"key\"])')" \
+  "test_dashboard_write"
+
+# ENH-28 — rendering reads, actions write: a missing outbox is the normal fresh
+# state and must read as no rows, not crash the surface (or worse, mint the file).
+run_mutation "dashboard_write: a fresh outbox is refused instead of read as empty" \
+  "scripts/dashboard_write.py" \
+  "('    if not Path(outbox_path).is_file():\n        return []', '    if False:\n        return []')" \
+  "test_dashboard_write"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }

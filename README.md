@@ -27,7 +27,10 @@ loop you run under your own supervisor. An operator dashboard ships too
 (`scripts/dashboard.py` over `core/dashboard.py`): a read-only, loopback-only Streamlit
 surface over YOUR journal and outboxes — severity-ordered attention (crashed sends,
 answers invalidated by edits, drafts at the gate, the unanswered backlog); streamlit is
-the one optional extra it needs, and the engine core never imports it.
+the one optional extra it needs, and the engine core never imports it. The gate itself
+is on the surface now, OFF by default: `COMMS_UI_WRITE_ENABLED=true` adds a write half
+(`scripts/dashboard_write.py`) where composing stages a draft and only a human click on
+that exact text releases it through the outbox ladder — the engine never auto-sends.
 
 ## Quickstart
 
