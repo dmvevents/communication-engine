@@ -270,3 +270,8 @@ if WRITE_ENABLED:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import dashboard_write  # noqa: E402
     dashboard_write.render(cfg)
+    # ENH-29: the CONFIG half of the write surface — connections and monitored
+    # channels — same gate, same trust shape: an edit stages an exact settings
+    # diff, only a human click on that diff writes the file.
+    import dashboard_config  # noqa: E402
+    dashboard_config.render(cfg, cfg_path)

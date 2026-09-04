@@ -2186,6 +2186,143 @@ run_mutation "dashboard_write: a fresh outbox is refused instead of read as empt
   "('    if not Path(outbox_path).is_file():\n        return []', '    if False:\n        return []')" \
   "test_dashboard_write"
 
+# ---------------------------------------------------------------------------
+# ENH-29 — the CONFIG write surface: an edit stages an exact settings diff, only a
+# human click on that diff writes the file. Every mutation below removes one half of
+# that gate; a survivor is an agent that can rewrite reply policies — the rules that
+# decide where the engine may post in the operator's name — without a human in the
+# loop, or a UI that leaks the secret it promised never to hold.
+# ---------------------------------------------------------------------------
+
+# ENH-29 — THE gate, data side: a stage that writes the file is an auto-apply.
+run_mutation "reconfig: stage() writes the settings file (config auto-applies)" \
+  "core/reconfig.py" \
+  "('        return {\"key\": key, \"state\": STAGED, \"staged\": True, \"deduped\": False,', '        self.apply(key)\n        return {\"key\": key, \"state\": STAGED, \"staged\": True, \"deduped\": False,')" \
+  "test_reconfig"
+
+# ENH-29 — the engine's own loader is the validator; skipping it stages exactly the
+# candidates the adopter would meet as a startup refusal (the planted top-level
+# taxonomy, the misspelled adapter).
+run_mutation "reconfig: candidates stop being validated at stage time" \
+  "core/reconfig.py" \
+  "('        self._validate(new_raw)', '        pass')" \
+  "test_reconfig"
+
+# ENH-29 — the ENH-28 rule on config: the environment is re-checked when the human
+# ACTS. Unchecked, an env var that vanished since staging writes a half-configured
+# file the engine refuses at its next startup — the worst time to learn it.
+run_mutation "reconfig: the click stops re-validating against the current environment" \
+  "core/reconfig.py" \
+  "('        self._validate(json.loads(row[\"new_text\"]))', '        pass')" \
+  "test_reconfig"
+
+# ENH-29 — a diff staged against yesterday's file describes nothing; applying it
+# silently destroys whatever was edited since.
+run_mutation "reconfig: the stale-file check is skipped at the click" \
+  "core/reconfig.py" \
+  "('        if current != row[\"old_text\"]:', '        if False:')" \
+  "test_reconfig"
+
+# ENH-29 — DISCARDED is terminal: a refused diff that can still be applied makes the
+# human 'no' advisory (the outbox's discarded-draft rule, on config).
+run_mutation "reconfig: a DISCARDED diff can still be applied" \
+  "core/reconfig.py" \
+  "('        if row[\"state\"] == DISCARDED:', '        if False:')" \
+  "test_reconfig"
+
+# ENH-29 — 'discarding' an applied diff rewrites the record of a change that is on
+# the file.
+run_mutation "reconfig: an applied diff can be discarded (the record rewritten)" \
+  "core/reconfig.py" \
+  "('        if row[\"state\"] != STAGED:', '        if False:')" \
+  "test_reconfig"
+
+# ENH-29 — THE widening property: a policy rising toward 'direct' must be detected,
+# or the loud flag the surface promises is rendered from an always-empty list.
+run_mutation "reconfig: widening detection goes inert" \
+  "core/reconfig.py" \
+  "('        if _POLICY_RANK.get(after, 0) > _POLICY_RANK.get(before, 0):', '        if False:')" \
+  "test_reconfig"
+
+# ENH-29 — deny-by-omission: a UI-created channel with no stated policy must carry NO
+# policy key, so the loader's own DEFAULT DENY is the single copy of that rule.
+run_mutation "reconfig: a new channel defaults to direct instead of omitted-deny" \
+  "core/reconfig.py" \
+  "('    if reply_policy is not None:\n        ch[\"reply_policy\"] = reply_policy', '    ch[\"reply_policy\"] = reply_policy or \"direct\"')" \
+  "test_reconfig"
+
+# ENH-29 — the env-NAME guard: with it gone, a pasted token walks through the ops
+# into the candidate, and the loader's refusal echoes a prefix of it to the surface.
+run_mutation "reconfig: the pasted-secret guard admits any string as an env name" \
+  "core/reconfig.py" \
+  "('    if isinstance(var, str) and _ENV_NAME.fullmatch(var):', '    if isinstance(var, str):')" \
+  "test_reconfig"
+
+# ENH-29 — the sweep's env:-prefix refusal is the other half: an identifier-shaped
+# literal slips the NAME check, so removing THIS check must fail on its own.
+run_mutation "reconfig: the candidate sweep stops refusing literal auth values" \
+  "core/reconfig.py" \
+  "('            if not (isinstance(value, str) and value.startswith(\"env:\")):', '            if False:')" \
+  "test_reconfig"
+
+# ENH-29 — the reload truth: 'applied' without the restart caveat reads as 'live
+# everywhere', which is false for a running scheduler/watcher (no hot-reload exists).
+run_mutation "reconfig: RELOAD_TRUTH stops stating the restart requirement" \
+  "core/reconfig.py" \
+  "('loads settings only at startup: restart it', 'applies live: nothing')" \
+  "test_reconfig"
+
+# ENH-29 — THE gate, shell side: the config surface must not exist for a read-only
+# operator. Dedented out of the WRITE_ENABLED branch it loads (or crashes) with the
+# gate off; the AST placement check catches it with no streamlit installed.
+run_mutation "dashboard.py (shell): the config surface escapes the gate branch" \
+  "scripts/dashboard.py" \
+  "('    import dashboard_config  # noqa: E402\n    dashboard_config.render(cfg, cfg_path)', 'import dashboard_config  # noqa: E402\ndashboard_config.render(cfg, cfg_path)')" \
+  "test_dashboard_config"
+
+# ENH-29 — THE gate, UI side: a form submit that also applies is the click gate
+# deleted at the caller boundary (the seam where the R22 cues and the ENH-9 signal
+# once died).
+run_mutation "dashboard_config: an edit applies without staging (the UI click gate deleted)" \
+  "scripts/dashboard_config.py" \
+  "('            res = stage.stage(candidate, summary=summary)', '            res = stage.stage(candidate, summary=summary)\n            if not res.get(\"deduped\"):\n                stage.apply(res[\"key\"])')" \
+  "test_dashboard_config"
+
+# ENH-29 — the widening flag must reach the card the human clicks; silent, the
+# promised loud review point never happens.
+run_mutation "dashboard_config: the widening banner goes silent" \
+  "scripts/dashboard_config.py" \
+  "('    if wide:', '    if False:')" \
+  "test_dashboard_config"
+
+# ENH-29 — set/NOT-SET is the whole disclosure: one .get() turns the indicator into
+# an echo of the secret it promised never to show.
+run_mutation "dashboard_config: the env indicator echoes the value" \
+  "scripts/dashboard_config.py" \
+  "('    return \"set\" if name in os.environ else \"NOT SET\"', '    return os.environ.get(name, \"NOT SET\")')" \
+  "test_dashboard_config"
+
+# ENH-29 — rendering reads, actions write: a missing stage db is the normal fresh
+# state and must read as no rows, not crash the surface.
+run_mutation "dashboard_config: a fresh stage db is refused instead of read as empty" \
+  "scripts/dashboard_config.py" \
+  "('    if not Path(db_path).is_file():\n        return []', '    if False:\n        return []')" \
+  "test_dashboard_config"
+
+# ENH-29/R21 — the doc's reload truth: an operator taught 'applied' without the
+# restart caveat debugs a live loop that is still obeying the old policy.
+run_mutation "docs: the config reload truth vanishes from the quickstart" \
+  "docs/QUICKSTART.md" \
+  "('loads settings only at startup and\nmust be restarted', 'picks the change up live and\nneeds no restart')" \
+  "test_docs"
+
+# ENH-29/R21 — the never-by-omission claim is what makes UI-created channels safe to
+# create; vague, an operator assumes a new channel can already post.
+run_mutation "docs: the never-by-omission claim vanishes from the quickstart" \
+  "docs/QUICKSTART.md" \
+  "('\`reply_policy: never\` (deny) **by omission**', '\`reply_policy: never\` (deny)')" \
+  "test_docs"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }

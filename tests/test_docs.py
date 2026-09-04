@@ -885,5 +885,39 @@ class ThreadPolicyDocTest(unittest.TestCase):
                       "adopter edits against, so most adopters never learn it exists")
 
 
+class ConfigSurfaceDocTest(unittest.TestCase):
+    """ENH-29 — the quickstart's config-management paragraph must keep stating the
+    three facts an operator acts on, and each must stay true of the code it
+    describes. Each has a mutation in tests/mutation_check.sh."""
+
+    def setUp(self):
+        self.quickstart = QUICKSTART.read_text()
+
+    def test_the_reload_truth_is_stated_and_matches_the_code(self):
+        """'Applied' without the restart caveat reads as 'live everywhere' — false
+        for a running scheduler/watcher, which loads settings once at startup. The
+        doc and core/reconfig.RELOAD_TRUTH must keep saying the same thing."""
+        self.assertIn("loads settings only at startup", self.quickstart)
+        self.assertIn("must be restarted", self.quickstart)
+        from core.reconfig import RELOAD_TRUTH
+        for word in ("restart", "startup", "hot-reload"):
+            self.assertIn(word, RELOAD_TRUTH,
+                          "the code's own reload message dropped the truth the doc "
+                          "promises it states")
+
+    def test_the_never_default_and_the_widening_flag_are_stated(self):
+        self.assertIn("`reply_policy: never` (deny) **by omission**", self.quickstart,
+                      "the doc no longer says a new channel denies by default — the "
+                      "one property that makes UI-created channels safe to create")
+        self.assertIn("flagged in red", self.quickstart,
+                      "the doc no longer promises the widening flag, so an operator "
+                      "has no reason to look for it before clicking Apply")
+
+    def test_the_secret_handling_claim_is_stated(self):
+        self.assertIn("never its value", self.quickstart,
+                      "the doc stopped stating that env values never render — the "
+                      "claim tests/test_dashboard_config.py holds the surface to")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
