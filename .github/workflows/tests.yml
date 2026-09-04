@@ -10,6 +10,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: install the documented healthy-clone hooks
+        # tests/test_docs.py holds the RUNBOOK to its healthy-clone promise (the
+        # pre-commit/pre-push hooks print for `ls`); a bare CI checkout has to take
+        # the same documented step every adopter takes, or that promise-check is
+        # permanently red here while green on every real clone.
+        run: bash scripts/install-hooks.sh
+      - name: install streamlit (the dashboard's one optional extra)
+        # Without it every AppTest skips — honestly in the unit run, but VACUOUSLY in
+        # the mutation check: a dashboard mutation whose only covering test skipped
+        # would SURVIVE and fail the teeth gate. Pinned to the version the downstream
+        # container (aws-do-agent setup/install-comms.sh) pins.
+        run: pip install streamlit==1.63.0
       - name: unit tests
         run: python3 -m unittest discover -s tests -v
       - name: mutation check (the suite must have teeth)
