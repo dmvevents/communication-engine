@@ -237,6 +237,51 @@ class WriteSurfaceAppTest(unittest.TestCase):
                       "with nothing composable the surface must explain the "
                       "deny-by-default, not render a dead form")
 
+    def test_a_half_configured_connection_is_named_not_a_crashed_page(self):
+        """A connection whose adapter __init__ refuses a half-configured instance —
+        the state the add-connection form leaves for a multi-auth adapter (slack has
+        its token but not yet its `channels` auth entry) — must NOT take the whole
+        write surface down. The page renders, the incomplete connection is NAMED so
+        the operator knows to finish it, and a healthy sibling stays composable.
+
+        Falsifiable: remove the try/except guard in composable() and the slack
+        adapter's construction error escapes render() — at.exception is set and this
+        assertFalse fails. (The identical construction call in core/doctor is already
+        guarded; this pins the same discipline on the write surface.)"""
+        base = Path(tempfile.mkdtemp())
+        for a in ("fake", "slack"):
+            shutil.copytree(ROOT / "channels" / a, base / "channels" / a,
+                            ignore=shutil.ignore_patterns("__pycache__"))
+        # A healthy fake instance (composable) AND a half-configured slack instance
+        # (token only — no `channels` auth entry yet). The loader accepts the slack
+        # instance (from_dict resolves auth refs but never constructs the adapter);
+        # only the write surface constructs it, which is where the refusal lands.
+        (base / "settings.json").write_text(
+            '{"engine": {"state_dir": "state"},\n'
+            ' "instances": [\n'
+            '   {"name": "team", "adapter": "fake",\n'
+            '    "channels": [{"id": "C_CUST", "reply_policy": "staged"}]},\n'
+            '   {"name": "half-slack", "adapter": "slack",\n'
+            '    "auth": {"token": "env:HALF_SLACK_TOKEN_T"}}]}\n')
+        self._saved.setdefault("HALF_SLACK_TOKEN_T", os.environ.get("HALF_SLACK_TOKEN_T"))
+        os.environ["HALF_SLACK_TOKEN_T"] = "placeholder-token-value-not-a-secret"
+        os.environ["COMMS_SETTINGS"] = str(base / "settings.json")
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        at = self.run_app()
+        self.assertFalse(at.exception,
+                         "a half-configured connection crashed the whole write "
+                         "surface instead of being reported")
+        warns = "\n".join(str(w.value) for w in at.warning)
+        self.assertIn("half-slack", warns,
+                      "the incomplete connection was not NAMED on the surface")
+        self.assertIn("channels", warns,
+                      "the surface did not surface the adapter's own reason")
+        # the healthy sibling is still composable — the guard skips only the broken one
+        self.assertTrue(
+            any(any("team · C_CUST" in opt for opt in s.options)
+                for s in at.selectbox if not s.key),
+            "the healthy connection lost its compose target")
+
     def test_rendering_the_write_surface_mints_no_state(self):
         """The gate ON and fresh state: LOOKING at the surface writes nothing —
         only actions do. The viewer discipline survives the write half."""

@@ -109,20 +109,38 @@ def _discard_clicked(cfg, inst, key):
 
 
 def composable(cfg):
-    """[(instance, channel, policy)] a compose can stage to: policy not 'never' AND
-    the instance's adapter declares send capability. Both halves are load-bearing:
-    default-deny is the engine's rule, and offering a compose box whose adapter
-    cannot deliver (every shipped live adapter — read-only by authorization) would
-    stage drafts no click can ever send."""
-    out = []
+    """([(instance, channel, policy)], [(instance_name, reason)]) — the compose
+    targets and the connections that could not even be constructed.
+
+    A compose target is a channel whose policy is not 'never' AND whose instance's
+    adapter declares send capability. Both halves are load-bearing: default-deny is
+    the engine's rule, and offering a compose box whose adapter cannot deliver (every
+    shipped live adapter — read-only by authorization) would stage drafts no click
+    can ever send.
+
+    Constructing the adapter can itself fail: a half-configured connection — e.g. a
+    slack instance whose token is set but whose `channels` auth entry has not been
+    added yet, the exact state the add-connection form leaves before the second auth
+    entry is staged — makes the adapter's __init__ refuse (it will not run
+    half-configured). Such an instance is not a compose target, and it must not take
+    the whole surface down: core/doctor already guards this same construction call and
+    surfaces the failure per-check; this surface does the same, skipping the instance
+    and returning it so render() can NAME what still needs configuring instead of
+    showing the operator a crashed page."""
+    out, unconfigured = [], []
     for inst in cfg.instances:
-        if not _adapter_for(cfg, inst).capabilities().get("send"):
+        try:
+            adapter = _adapter_for(cfg, inst)
+        except Exception as ex:  # noqa: BLE001 — surfaced per-instance by render()
+            unconfigured.append((inst.name, str(ex)))
+            continue
+        if not adapter.capabilities().get("send"):
             continue
         for ch in inst.channels:
             policy = _channel_scope_policy(ch)
             if policy != "never":
                 out.append((inst, ch, policy))
-    return out
+    return out, unconfigured
 
 
 def render(cfg):
@@ -135,7 +153,13 @@ def render(cfg):
         getattr(st, kind)(msg)
 
     # ---- compose: stage only, never send -----------------------------------
-    options = composable(cfg)
+    options, unconfigured = composable(cfg)
+    for name, reason in unconfigured:
+        st.warning(f"connection **{html.escape(name)}** is not fully configured yet, "
+                   f"so it cannot be watched or composed to: {html.escape(reason)} "
+                   "Finish it under “edit connection (adapter / auth)” below — add the "
+                   "missing auth entry as an env:NAME reference — then it becomes "
+                   "available. (The connection is kept; only this surface skips it.)")
     if not options:
         st.info("The write gate is on, but no channel is composable: a channel "
                 "needs `reply_policy` (or `thread_reply_policy`) of 'staged' or "
