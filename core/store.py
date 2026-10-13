@@ -55,9 +55,9 @@ CREATE TABLE IF NOT EXISTS arrivals (
 );
 CREATE TABLE IF NOT EXISTS sweep_state (
     instance     TEXT NOT NULL,
-    channel_id   TEXT NOT NULL,
+    channel      TEXT NOT NULL,
     next_start   INTEGER NOT NULL,
-    PRIMARY KEY (instance, channel_id)
+    PRIMARY KEY (instance, channel)
 );
 CREATE TABLE IF NOT EXISTS sweep_order (
     instance     TEXT NOT NULL PRIMARY KEY,
@@ -229,7 +229,7 @@ class Store:
     # ---- thread-sweep state (ENH-30; durable since review ENH-33/F1) ---------------
     def sweep_start_get(self, instance: str, channel_id: str) -> int:
         row = self.conn.execute(
-            "SELECT next_start FROM sweep_state WHERE instance=? AND channel_id=?",
+            "SELECT next_start FROM sweep_state WHERE instance=? AND channel=?",
             (instance, channel_id)).fetchone()
         return int(row[0]) if row else 0
 
@@ -239,9 +239,11 @@ class Store:
         run, and an in-memory window restarted at the newest asks on every run, so the
         asks behind them were never swept (independent review of ENH-33, F1). An index
         into a list that gains and loses asks drifts a little; it wraps modulo the list,
-        so the drift is bounded and every ask is still reached."""
+        so the drift is bounded. At capacity — one fetch per cycle while a new ask
+        arrives every cycle — an index can stick on one ask; a window keyed by ask ts
+        is the fix (COMMS-79), not a wider budget."""
         self.conn.execute(
-            "INSERT OR REPLACE INTO sweep_state (instance, channel_id, next_start) "
+            "INSERT OR REPLACE INTO sweep_state (instance, channel, next_start) "
             "VALUES (?,?,?)", (instance, channel_id, int(next_start)))
         self.conn.commit()
 
