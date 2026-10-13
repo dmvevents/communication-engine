@@ -134,11 +134,11 @@ def close_dm_asks(store, journal, channel: str, *, answerers=(), is_answer=None,
     used = journal.used_response_keys(channel, "dm-reply:")
     answered = []
     for m in store.top_level_after(channel, open_asks[0]["ts"]):
-        if f"dm-reply:{m['ts']}" in used or _is_engine_post(m):
-            # An engine delivery was tied to ITS ask by the surface when it was sent;
-            # handing it to the next older open ask would close that one unanswered
-            # (review F1 addendum).
+        if f"dm-reply:{m['ts']}" in used:
             continue
+        # (An engine delivery — tied to ITS ask by the surface when it was proven — is
+        # refused by answered_by itself, which the target loop below goes through: review
+        # F1 addendum, round 2 R2-3. One check, in the one place both rules share.)
         preceding = [a for a in open_asks if ts_order(a["ts"]) < ts_order(m["ts"])]
         # The most recent open ask this message can answer: an answerer's reply skips
         # its own clarifying question and reaches the human's ask behind it (review F10

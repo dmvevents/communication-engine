@@ -2965,7 +2965,7 @@ run_mutation "dashboard: DM closures are not counted" \
 # F6 scan classes; F7 per-row recovery; F8 canonical labels; the MISMATCH card) ----
 run_mutation "threads: a spent DM answer closes the next-older ask on the next cycle" \
   "core/threads.py" \
-  "('        if f\"dm-reply:{m[\\'ts\\']}\" in used or _is_engine_post(m):', '        if _is_engine_post(m):')" \
+  "('        if f\"dm-reply:{m[\\'ts\\']}\" in used:\\n            continue', '        pass')" \
   "test_schedule"
 
 run_mutation "slack: a thread read-back never asks for message metadata" \
@@ -2999,11 +2999,6 @@ run_mutation "dashboard_write: a MISMATCH row is shown only next to a staged dra
   "test_dashboard_write"
 
 # ---- ENH-31 review round 1, second batch (F1 addendum, F4, F5, F10, N2, N3, N4, N7, X3, X5-X7) ----
-run_mutation "threads: an engine delivery is handed to the next older open ask" \
-  "core/threads.py" \
-  "('        if f\"dm-reply:{m[\\'ts\\']}\" in used or _is_engine_post(m):', '        if f\"dm-reply:{m[\\'ts\\']}\" in used:')" \
-  "test_schedule"
-
 run_mutation "threads: an answerer's own ask can never close" \
   "core/threads.py" \
   "('    restricted = bool(answerers) and asker not in answerers', '    restricted = bool(answerers)')" \
@@ -3144,7 +3139,7 @@ run_mutation "slack: the sweep's replies never ask for message metadata" \
   "('        raw = self._replies_raw(channel, thread_ts, oldest, with_metadata=True)', '        raw = self._replies_raw(channel, thread_ts, oldest)')" \
   "test_slack_stub_e2e"
 
-run_mutation "threads: the sweep credits the engine's own post as an answer" \
+run_mutation "threads: the engine's own post is credited as an answer (sweep and DM rule)" \
   "core/threads.py" \
   "('        if _is_engine_post(r):\\n            # The engine\\'s own delivery', '        if False:\\n            # The engine\\'s own delivery')" \
   "test_threads"
