@@ -32,6 +32,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from core.dashboard import snapshot  # noqa: E402
+from core.journal import Journal  # noqa: E402
+
 SCRIPT = ROOT / "scripts" / "dashboard.py"
 WRITE_MODULE = ROOT / "scripts" / "dashboard_write.py"
 
@@ -111,9 +114,9 @@ def write_base(tmp, cust_policy='"reply_policy": "staged"'):
     return base
 
 
-@unittest.skipUnless(HAVE_STREAMLIT, "streamlit not installed — the static checks "
-                     "above and tests/test_outbox_write.py still guard the gate")
-class WriteSurfaceAppTest(unittest.TestCase):
+class _WriteSurfaceBase(unittest.TestCase):
+    """setUp + widget helpers shared by the write-surface AppTests below."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -156,6 +159,10 @@ class WriteSurfaceAppTest(unittest.TestCase):
     def buttons(self, at, prefix):
         return [b for b in at.button if b.key and b.key.startswith(prefix)]
 
+
+@unittest.skipUnless(HAVE_STREAMLIT, "streamlit not installed — the static checks "
+                     "above and tests/test_outbox_write.py still guard the gate")
+class WriteSurfaceAppTest(_WriteSurfaceBase):
     # ---- default read-only ---------------------------------------------------
     def test_gate_off_renders_no_write_surface_and_never_loads_the_send_layer(self):
         for gate in (None, "false"):
@@ -293,6 +300,121 @@ class WriteSurfaceAppTest(unittest.TestCase):
         self.assertEqual(minted, [],
                          "rendering (not acting on) the write surface created "
                          f"state: {minted}")
+
+
+
+ASK = "Please review the rollout plan before Thursday."
+
+
+@unittest.skipUnless(HAVE_STREAMLIT, "streamlit not installed — the static checks "
+                     "above and tests/test_outbox_write.py still guard the gate")
+class ReplyFromTheSurfaceTest(_WriteSurfaceBase):
+    """An answer sent from the surface must CLOSE the ask it answers (ENH-30).
+
+    Measured on the aws-do-agent integration (2026-10-12): the operator composed and
+    sent a reply to the demo question, and the question stayed UNANSWERED forever —
+    nothing tied the released draft to the journal row (`responded_at` had no caller
+    outside the tests). The surface now offers Reply on each open ask of a composable
+    channel; a reply stages with the ask's ts as its trigger (in-thread when the thread
+    policy allows), and the Send click — the moment the answer is PROVEN on the target
+    — marks the ask responded with the outbox key. Staging alone never does (a draft
+    is a promise, not an answer), and a free compose ties to nothing."""
+
+    def seed_ask(self, channel="C_CUST", ts="1.0"):
+        (self.base / "state").mkdir(exist_ok=True)
+        j = Journal(self.base / "state" / "journal.db")
+        j.record(channel, ts, sender_id="U_ASKER", text=ASK, kind="QUESTION")
+        j.close()
+
+    def journal_row(self, channel="C_CUST", ts="1.0"):
+        j = Journal(self.base / "state" / "journal.db")
+        try:
+            row = j.get(channel, ts)
+            return (row["responded_at"], row["response_key"])
+        finally:
+            j.close()
+
+    def outbox_full_rows(self):
+        db = self.base / "state" / "outbox-team.db"
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            return [dict(zip(("key", "state", "trigger_ts", "thread_id", "text"), r))
+                    for r in conn.execute(
+                        "SELECT key, state, trigger_ts, thread_id, text FROM outbox "
+                        "ORDER BY created_at")]
+        finally:
+            conn.close()
+
+    def reply_then_stage(self, at, text):
+        at = self.buttons(at, "reply-C_CUST-1.0")[0].click().run()
+        at.text_area[0].input(text)
+        submit = self.buttons(at, "FormSubmitter:compose")
+        self.assertEqual(len(submit), 1)
+        return submit[0].click().run()
+
+    def test_an_open_ask_offers_reply_only_where_composing_is_allowed(self):
+        self.seed_ask("C_CUST", "1.0")
+        self.seed_ask("C_RO", "2.0")
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        at = self.run_app()
+        self.assertFalse(at.exception)
+        self.assertEqual(len(self.buttons(at, "reply-C_CUST-1.0")), 1,
+                         "an open ask on a composable channel has no Reply")
+        self.assertEqual(self.buttons(at, "reply-C_RO-"), [],
+                         "a never-policy channel offered a Reply the gate would refuse")
+
+    def test_a_reply_sent_from_the_surface_marks_the_ask_answered(self):
+        self.seed_ask()
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        at = self.reply_then_stage(self.run_app(), "reviewed — go ahead")
+        self.assertFalse(at.exception)
+        rows = self.outbox_full_rows()
+        self.assertEqual((rows[0]["state"], rows[0]["trigger_ts"], rows[0]["thread_id"]),
+                         ("STAGED", "1.0", "1.0"),
+                         "a reply stages with the ask as its trigger, in its thread")
+        self.assertIsNone(self.journal_row()[0],
+                          "STAGING marked the ask answered — a draft is a promise")
+        at = self.buttons(at, "send-")[0].click().run()
+        self.assertFalse(at.exception)
+        self.assertEqual(self.outbox_full_rows()[0]["state"], "COMMITTED")
+        at_, key = self.journal_row()
+        self.assertIsNotNone(at_, "the ask stayed UNANSWERED after its answer was "
+                                  "proven on the target")
+        self.assertEqual(key, rows[0]["key"],
+                         "the response key must be the outbox key that answered")
+        open_asks = [i for i in snapshot(self.base / "state" / "journal.db",
+                                         {})["attention"]
+                     if i["severity"] == "unanswered"]
+        self.assertEqual(open_asks, [], "the answered ask is still in the queue")
+
+    def test_a_free_compose_ties_to_no_ask(self):
+        self.seed_ask()
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        at = self.compose(self.run_app(), DRAFT)
+        at = self.buttons(at, "send-")[0].click().run()
+        self.assertFalse(at.exception)
+        self.assertEqual(self.outbox_full_rows()[0]["state"], "COMMITTED")
+        self.assertIsNone(self.journal_row()[0],
+                          "a message composed to the channel, not in reply to the "
+                          "ask, was recorded as its answer")
+
+    def test_a_reply_where_the_thread_policy_denies_stages_top_level_and_still_ties(self):
+        base2 = write_base(tempfile.mkdtemp(),
+                           cust_policy='"reply_policy": "staged", '
+                                       '"thread_reply_policy": "never"')
+        self.base = base2
+        os.environ["COMMS_SETTINGS"] = str(base2 / "settings.json")
+        self.seed_ask()
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        at = self.reply_then_stage(self.run_app(), "answered in the channel")
+        self.assertFalse(at.exception)
+        row = self.outbox_full_rows()[0]
+        self.assertEqual((row["trigger_ts"], row["thread_id"]), ("1.0", None),
+                         "with the thread scope at never the reply must post "
+                         "top-level — not be refused, not be silently threaded")
+        at = self.buttons(at, "send-")[0].click().run()
+        self.assertFalse(at.exception)
+        self.assertIsNotNone(self.journal_row()[0])
 
 
 if __name__ == "__main__":

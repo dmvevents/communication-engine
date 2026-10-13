@@ -60,6 +60,17 @@ class SchemaError(ValueError):
     """A message did not match the pinned contract. Never swallow this."""
 
 
+def ts_order(ts):
+    """Sort key for platform message ids: numeric when they parse (Slack, Telegram, the
+    fake adapter), the string itself otherwise (an email Message-ID) — one channel's
+    ids never mix shapes (core/parity.py refuses a MIXED space), so this never raises
+    a TypeError mid-comparison."""
+    try:
+        return (0, float(ts))
+    except (TypeError, ValueError):
+        return (1, str(ts))
+
+
 def _attachments_json(atts):
     """None stays NULL and a known-empty list stays "[]" — the same None-vs-[]
     distinction the journal keeps for cues (R22): a row that predates the field must
@@ -156,6 +167,25 @@ class Store:
         """ts -> first-arrival wall-clock time, for the detection-latency SLO."""
         return {r[0]: r[1] for r in self.conn.execute(
             "SELECT ts, arrived_at FROM arrivals WHERE channel_id=?", (channel_id,))}
+
+    # ---- threads (ENH-30) --------------------------------------------------
+    def thread_root(self, channel_id: str, ts: str) -> str:
+        """The thread a message lives in: its own thread_id when it is a reply, else
+        itself. A row the store never saw answers itself, so a sweep for it still
+        looks in the one place its replies can be."""
+        row = self.conn.execute(
+            "SELECT thread_id FROM messages WHERE channel_id=? AND ts=?",
+            (channel_id, str(ts))).fetchone()
+        return row[0] if row and row[0] else str(ts)
+
+    def thread_replies(self, channel_id: str, thread_id: str) -> list:
+        """Every stored reply under one thread, oldest-first (ts, sender_id, text)."""
+        rows = self.conn.execute(
+            "SELECT ts, sender_id, text FROM messages WHERE channel_id=? AND thread_id=?",
+            (channel_id, str(thread_id))).fetchall()
+        out = [{"ts": r[0], "sender_id": r[1], "text": r[2]} for r in rows]
+        out.sort(key=lambda m: ts_order(m["ts"]))
+        return out
 
     # ---- cursors ----------------------------------------------------------
     def cursor_get(self, instance: str, channel_id: str) -> str | None:

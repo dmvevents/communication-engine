@@ -113,7 +113,8 @@ def main(argv=None):
     def report(summary):
         print(f"cycle: polled={summary['polled']} fresh={summary['fresh']} "
               f"unattended={summary['unattended']} "
-              f"next-fire<={summary['next_interval']:.0f}s", flush=True)
+              f"next-fire<={summary['next_interval']:.0f}s "
+              f"answered={summary['answered']}", flush=True)
 
     sched = Scheduler(store=store, journal=journal, owed=owed, escalator=escalator,
                       sources=sources, base_interval=base,

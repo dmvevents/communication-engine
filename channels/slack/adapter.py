@@ -51,6 +51,7 @@ READ_METHODS = frozenset({
     "conversations.history",
     "conversations.info",
     "conversations.list",
+    "conversations.replies",
     "users.info",
     "users.list",
 })
@@ -256,6 +257,42 @@ class Adapter:
         """Every message newer than `oldest` (exclusive), oldest-first, ALL pages."""
         out = [self._normalize(channel, m) for m in self._history_raw(channel, oldest)]
         out.sort(key=lambda m: float(m["ts"]))
+        return out
+
+    # ---- optional capability: thread replies (channels/CONTRACT.md, ENH-30) -----
+    def replies(self, channel, thread_ts, oldest=None):
+        """Every reply under one thread newer than `oldest` (exclusive), oldest-first,
+        ALL pages or raise — never the parent.
+
+        conversations.history does not serve thread replies (a parent arrives with a
+        reply_count and nothing else), so without this method an in-thread answer is
+        invisible to the engine. Measured on the aws-do-agent integration 2026-10-12:
+        every ask read UNANSWERED after the agent had answered each one in its thread.
+        The parent rides the first page of conversations.replies and is dropped here:
+        it is the message being answered, not an answer.
+        """
+        raw = self._replies_raw(channel, thread_ts, oldest)
+        out = [self._normalize(channel, m) for m in raw if m.get("ts") != thread_ts]
+        out.sort(key=lambda m: float(m["ts"]))
+        return out
+
+    def _replies_raw(self, channel, thread_ts, oldest=None):
+        out, page_cursor = [], None
+        while True:
+            params = {"channel": channel, "ts": thread_ts, "limit": PAGE_LIMIT}
+            if oldest is not None:
+                params["oldest"] = oldest
+            if page_cursor:
+                params["cursor"] = page_cursor
+            payload = self._api("conversations.replies", **params)
+            out.extend(payload.get("messages", []))
+            if not payload.get("has_more"):
+                break
+            page_cursor = (payload.get("response_metadata") or {}).get("next_cursor")
+            if not page_cursor:
+                raise ApiError("conversations.replies",
+                               "has_more with no next_cursor — refusing to silently "
+                               "drop the rest of the thread")
         return out
 
     # ---- optional capability: the platform snapshot (channels/CONTRACT.md) ------

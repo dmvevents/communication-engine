@@ -38,6 +38,16 @@ from dataclasses import dataclass, field
 PRECEDENCE = ("EXEC-REQUEST", "COMMITMENT-ASK", "QUESTION", "ATTACHMENT-ONLY",
               "STATEMENT")
 
+# The kinds that are ASKS: a message of one of these owes somebody a response until it
+# is tied to one, and the scheduler routes every one of them to owed work
+# (core/schedule.ROUTES — tests/test_threads.py holds the two in agreement). STATEMENT
+# is logged, not owed. The dashboard's UNANSWERED queue and the thread-reply sweep
+# (core/threads.py) both read THIS set, so "what counts as an open ask" has exactly one
+# home — found 2026-10-12 on the aws-do-agent integration, where the dashboard filtered
+# on responded_at alone and labelled every join notice "open ask — nobody has answered
+# yet".
+ACTIONABLE_KINDS = frozenset(k for k in PRECEDENCE if k != "STATEMENT")
+
 DEFAULT_EXEC_VERBS = ("run", "deploy", "test", "build", "rebuild", "launch", "start",
                       "scale", "retest", "reproduce", "apply", "restart", "merge")
 DEFAULT_ASK_PHRASES = ("can you", "could you", "would you", "please", "how do", "how can",

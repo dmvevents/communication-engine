@@ -487,5 +487,59 @@ class DashboardAppTest(unittest.TestCase):
                       "the panel must say how to point the app at a real config")
 
 
+
+class UnansweredIsAsksOnlyTest(unittest.TestCase):
+    """The attention queue's UNANSWERED list is the open ASK backlog, not every row.
+
+    Measured on the aws-do-agent integration (2026-10-12): the dashboard labelled every
+    journal row — join notices, status remarks, bot chatter — "open ask — nobody has
+    answered yet", because the query filtered on responded_at alone. A STATEMENT is
+    routed `logged` by the scheduler (core/schedule.ROUTES): it owes nobody an answer,
+    so listing it as one trains the operator to ignore the list. The one set that
+    defines an ask is core/classify.ACTIONABLE_KINDS; a row whose kind was never
+    recorded is SURFACED (unknown is not "not an ask"), never hidden."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.journal = Path(self.tmp.name) / "journal.db"
+        j = Journal(self.journal)
+        j.record("C_TEAM", "1.0", sender_id="U1", text=ASK, kind="QUESTION")
+        j.record("C_TEAM", "4.0", sender_id="U1",
+                 text="the deploy finished without errors", kind="STATEMENT")
+        j.record("C_TEAM", "4.5", sender_id="U2",
+                 text="<@U2> has joined the channel", kind="STATEMENT")
+        j.record("C_TEAM", "5.0", sender_id="U3", text="legacy row, no decision")
+        j.close()
+
+    def unanswered(self):
+        s = snapshot(self.journal, {})
+        return {(i["where"], i["ts"]): i for i in s["attention"]
+                if i["severity"] == "unanswered"}, s["journal"]
+
+    def test_a_statement_is_not_an_open_ask(self):
+        items, _ = self.unanswered()
+        self.assertIn(("C_TEAM", "1.0"), items)
+        self.assertNotIn(("C_TEAM", "4.0"), items,
+                         "a STATEMENT rendered as 'open ask — nobody has answered yet'")
+        self.assertNotIn(("C_TEAM", "4.5"), items, "a join notice is not an ask")
+
+    def test_an_unclassified_row_is_surfaced_not_hidden(self):
+        items, _ = self.unanswered()
+        self.assertIn(("C_TEAM", "5.0"), items,
+                      "a row with no recorded kind vanished — unknown must be shown")
+        self.assertIn("unclassified", items[("C_TEAM", "5.0")]["why"],
+                      "the item must say WHY it is here: no decision was recorded")
+        self.assertIn("open ask", items[("C_TEAM", "1.0")]["why"])
+
+    def test_the_counts_follow_the_same_definition(self):
+        _, counts = self.unanswered()
+        self.assertEqual(counts["unanswered"], 2,
+                         "unanswered counts open ASKS (incl. unclassified), not rows")
+        self.assertEqual(counts["answered"], 0)
+        self.assertEqual(counts["distinct"], 4, "statements still count as messages")
+        self.assertEqual(counts["by_kind"]["STATEMENT"], 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

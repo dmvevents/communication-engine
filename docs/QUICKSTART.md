@@ -269,6 +269,22 @@ imported while the write gate below is off (same AST-enforced rule as the schedu
 and state that does not exist yet is *reported* missing — never silently created,
 never rendered as a healthy zero.
 
+**What "unanswered" means, and how an ask stops being one.** The unanswered backlog is
+the open *ask* backlog: rows whose kind is one of `core/classify.ACTIONABLE_KINDS`
+(EXEC-REQUEST, COMMITMENT-ASK, QUESTION, ATTACHMENT-ONLY) with no response tied to
+them. A STATEMENT — a status remark, a join notice — owes nobody an answer and is never
+listed there (it still counts as a message, and the Journal tab's kind table shows it);
+a row with no recorded kind is shown as *unclassified* rather than hidden. An ask
+becomes answered in exactly two ways, both recorded in `journal.db` with a response key
+naming what answered: a reply **sent from the write surface** with the ask's Reply
+button (the outbox key, tied the moment the send is proven on the target — staging
+alone never ties), or a reply **inside the ask's thread from someone other than the
+asker**, which the reference scheduler sweeps every cycle through the adapter's
+optional `replies()` (`core/threads.py`; the shipped `fake` and `slack` adapters have
+it). A top-level reply in the channel cannot be attributed to the ask it answers, so
+it leaves the ask open — answer in the thread. The scheduler's cycle line reports
+`answered=N`.
+
 The dashboard is read-only **by default**. Setting `COMMS_UI_WRITE_ENABLED=true` in
 the environment adds a write surface (`scripts/dashboard_write.py` — the one module
 allowed to import the send layer; with the gate off, or unset, it is never even
@@ -317,6 +333,12 @@ surface says so instead of implying one.
 
 ## Honest limits
 
+- **Answered state is inferred from threads only.** An ask is marked answered by a send
+  from the write surface or by an in-thread reply from someone other than the asker;
+  "responded" means exactly that, not "resolved". A reply posted top-level in the
+  channel is a message the engine stores and lists, but it cannot be tied to the ask it
+  answers, and the engine never guesses. Adapters without `replies()` (the Telegram
+  and email adapters today) can only reach answered through the write surface.
 - Five adapters ship: **`fake`** (in-memory dry-run), **`slack`** — **read-only on purpose**
   (poll/resolve/health; it exposes no send path at any layer, and `tests/test_slack_adapter.py`
   fails if one appears) — **`slack_socket`** (Socket Mode push ingestion, equally

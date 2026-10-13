@@ -918,6 +918,24 @@ class ConfigSurfaceDocTest(unittest.TestCase):
                       "the doc stopped stating that env values never render — the "
                       "claim tests/test_dashboard_config.py holds the surface to")
 
+    def test_what_unanswered_means_and_how_it_closes_is_stated(self):
+        """ENH-30: the dashboard's UNANSWERED is the open ASK backlog, and an ask closes
+        in exactly two ways — a reply sent from the surface, or an in-thread reply from
+        someone else. The one limit an operator will trip over is that a TOP-LEVEL reply
+        cannot be attributed and leaves the ask open; the doc must keep saying so, or
+        "I answered and it still shows unanswered" is the next meeting note."""
+        self.assertIn("ACTIONABLE_KINDS", self.quickstart,
+                      "the doc no longer names the one definition of an ask")
+        self.assertIn("staging\nalone never ties", self.quickstart,
+                      "the doc stopped saying that staging is not answering")
+        self.assertIn("A top-level reply in the channel cannot be attributed to the ask "
+                      "it answers, so\nit leaves the ask open — answer in the thread.",
+                      self.quickstart,
+                      "the doc dropped the top-level-reply limit — the one answered-state "
+                      "surprise an operator meets on day one")
+        self.assertIn("Answered state is inferred from threads only.", self.quickstart,
+                      "the honest-limits entry for answered state is gone")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

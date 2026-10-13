@@ -629,5 +629,72 @@ class ReferenceSchedulerScriptTest(unittest.TestCase):
                          "must be read-only by construction")
 
 
+
+class HistoryOnlyFake:
+    """The shipped fake adapter with Slack's shape imposed on poll(): history serves
+    TOP-LEVEL messages only, so a thread reply can reach the engine through replies()
+    alone — exactly the gap ENH-30 closes."""
+
+    def __init__(self):
+        from core.config import load_adapter_class
+        root = Path(__file__).resolve().parent.parent
+        self.inner = load_adapter_class(root / "channels", "fake")()
+
+    def seed(self, messages):
+        self.inner.seed(messages)
+
+    def poll(self, cursor):
+        msgs, new_cursor = self.inner.poll(cursor)
+        return [m for m in msgs if not m.get("thread_id")], new_cursor
+
+    def replies(self, channel_id, thread_ts, oldest=None):
+        return self.inner.replies(channel_id, thread_ts, oldest=oldest)
+
+
+class ThreadSweepCycleTest(SchedulerHarness):
+    """Each cycle sweeps the open asks' threads (ENH-30): an in-thread reply from
+    someone else marks the ask answered, closes its owed work, and is itself
+    journaled like any other message."""
+
+    def test_an_in_thread_reply_from_someone_else_closes_the_ask(self):
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg("C1", "1.0", "where is the dashboard?")])
+        sched = self.scheduler(adapter)
+        first = sched.cycle()
+        self.assertEqual({r["id"] for r in self.owed.open_items()}, {"msg@C1@1.0"})
+        self.assertEqual(first["answered"], 0)
+        adapter.seed([msg("C1", "2.0", "http://127.0.0.1:8502", sender_id="B_AGENT",
+                          thread_id="1.0")])
+        second = sched.cycle()
+        self.assertEqual(second["answered"], 1, "the cycle summary must count answers")
+        row = self.journal.get("C1", "1.0")
+        self.assertIsNotNone(row["responded_at"],
+                             "an in-thread answer left the ask UNANSWERED")
+        self.assertEqual(row["response_key"], "thread-reply:2.0")
+        self.assertEqual({r["id"] for r in self.owed.open_items()}, set(),
+                         "the owed work stayed open after its ask was answered")
+        self.assertIsNotNone(self.journal.get("C1", "2.0"),
+                             "the reply itself was not journaled — a reply is a "
+                             "message, and an unlisted message is the bug the operator reported")
+
+    def test_the_askers_own_bump_leaves_the_ask_open(self):
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg("C1", "1.0", "where is the dashboard?")])
+        sched = self.scheduler(adapter)
+        sched.cycle()
+        # A STATEMENT bump: a question-shaped bump ("anyone?") would rightly become an
+        # owed ask of its own — that is the first test's domain, not this one's.
+        adapter.seed([msg("C1", "2.0", "still waiting on this one", thread_id="1.0")])
+        self.assertEqual(sched.cycle()["answered"], 0)
+        self.assertIsNone(self.journal.get("C1", "1.0")["responded_at"])
+        self.assertEqual({r["id"] for r in self.owed.open_items()}, {"msg@C1@1.0"})
+
+    def test_an_adapter_without_replies_leaves_the_cycle_whole(self):
+        adapter = QueueAdapter([([msg("C1", "1.0", "where is it?")], "1.0")])
+        summary = self.scheduler(adapter).cycle()
+        self.assertEqual(summary["answered"], 0)
+        self.assertEqual(summary["fresh"], 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

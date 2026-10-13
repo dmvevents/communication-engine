@@ -29,13 +29,22 @@ The attention queue is SEVERITY-ordered, the spoke UI's one validated UX lesson
     edited_after_response   we answered version N and the channel now shows version
                             N+1 — the answer may no longer hold (journal R23).
     staged                  drafts stopped at the operator gate, waiting for a human.
-    unanswered              the open ask backlog.
+    unanswered              the open ASK backlog — rows of core/classify.ACTIONABLE_KINDS
+                            with no response tied to them. A STATEMENT is routed
+                            `logged` by the scheduler (it owes nobody an answer) and is
+                            never listed here: on the aws-do-agent integration
+                            (2026-10-12) a responded_at-only filter labelled every join
+                            notice "open ask — nobody has answered yet". A row with no
+                            recorded kind is SURFACED as unclassified, never hidden —
+                            unknown is not "not an ask".
 """
 from __future__ import annotations
 
 import json
 import sqlite3
 from pathlib import Path
+
+from .classify import ACTIONABLE_KINDS
 
 SEVERITY = ("engine_lost", "in_flight", "edited_after_response", "staged",
             "unanswered")
@@ -52,6 +61,8 @@ _WHY = {
     "staged": ("draft waiting at the operator gate — nothing sends until a human "
                "approves this exact text"),
     "unanswered": "open ask — nobody has answered yet",
+    "unclassified": ("unclassified — no decision was recorded for this row, so whether "
+                     "it is an ask is unknown; shown rather than hidden"),
 }
 
 
@@ -91,17 +102,23 @@ def _journal_view(journal_path: Path):
                 "where": r["channel"], "ts": r["ts"], "text": r["text"],
                 "kind": r["kind"], "state": None,
                 "why": _WHY["edited_after_response"]})
+        # Open ASKS only (ACTIONABLE_KINDS); a NULL kind is surfaced, never hidden.
+        ask_kinds = tuple(sorted(ACTIONABLE_KINDS))
+        ask_filter = ("WHERE responded_at IS NULL AND (kind IS NULL OR kind IN ("
+                      + ",".join("?" * len(ask_kinds)) + ")) ")
         for r in conn.execute(
                 "SELECT channel, ts, text, kind FROM journal "
-                "WHERE responded_at IS NULL ORDER BY ts"):
+                + ask_filter + "ORDER BY ts", ask_kinds):
             items["unanswered"].append({
                 "severity": "unanswered", "instance": None,
                 "where": r["channel"], "ts": r["ts"], "text": r["text"],
-                "kind": r["kind"], "state": None, "why": _WHY["unanswered"]})
+                "kind": r["kind"], "state": None,
+                "why": _WHY["unanswered" if r["kind"] is not None
+                            else "unclassified"]})
         counts = {
             "distinct": conn.execute("SELECT count(*) FROM journal").fetchone()[0],
             "unanswered": conn.execute(
-                "SELECT count(*) FROM journal WHERE responded_at IS NULL"
+                "SELECT count(*) FROM journal " + ask_filter, ask_kinds
             ).fetchone()[0],
             "answered": conn.execute(
                 "SELECT count(*) FROM journal WHERE responded_at IS NOT NULL"

@@ -2176,7 +2176,7 @@ run_mutation "dashboard.py (shell): a junk gate value is silently accepted" \
 # the R22 cues and the ENH-9 signal once died).
 run_mutation "dashboard_write: the compose form sends instead of staging" \
   "scripts/dashboard_write.py" \
-  "('                    res = outbox.stage(ch.id, f\"ui-compose-{time.time():.6f}\", text)', '                    res = outbox.release(outbox.stage(ch.id, f\"ui-compose-{time.time():.6f}\", text)[\"key\"])')" \
+  "('                    res = outbox.stage(ch.id, trigger, text, thread_id=thread)', '                    res = outbox.release(outbox.stage(ch.id, trigger, text, thread_id=thread)[\"key\"])')" \
   "test_dashboard_write"
 
 # ENH-28 — rendering reads, actions write: a missing outbox is the normal fresh
@@ -2321,6 +2321,115 @@ run_mutation "docs: the config reload truth vanishes from the quickstart" \
 run_mutation "docs: the never-by-omission claim vanishes from the quickstart" \
   "docs/QUICKSTART.md" \
   "('\`reply_policy: never\` (deny) **by omission**', '\`reply_policy: never\` (deny)')" \
+  "test_docs"
+
+# ---------------------------------------------------------------------------
+# ENH-30 — in-thread answers close open asks. Measured on the aws-do-agent integration
+# (2026-10-12): responded_at had NO production caller and the Slack adapter never fetched
+# a thread reply, so every answered ask read UNANSWERED forever and every reply was an
+# unlisted message. Each mutation below removes one piece of the fix; a survivor is a
+# dashboard that lies about what still needs a human.
+# ---------------------------------------------------------------------------
+
+# ENH-30 — UNANSWERED is the open ASK backlog: list every row again (join notices,
+# remarks) and the operator is trained to ignore the list.
+run_mutation "dashboard: unanswered lists every journal row, not only asks" \
+  "core/dashboard.py" \
+  "('        ask_filter = (\"WHERE responded_at IS NULL AND (kind IS NULL OR kind IN (\"\n                      + \",\".join(\"?\" * len(ask_kinds)) + \")) \")', '        ask_filter = \"WHERE responded_at IS NULL AND (kind IS NULL OR kind IN (\" + \",\".join(\"?\" * len(ask_kinds)) + \") OR 1=1) \"')" \
+  "test_dashboard"
+
+# ENH-30 — a row with no recorded kind must be SURFACED, not hidden: unknown is not
+# "not an ask".
+run_mutation "dashboard: an unclassified row is hidden from the queue" \
+  "core/dashboard.py" \
+  "('WHERE responded_at IS NULL AND (kind IS NULL OR kind IN (', 'WHERE responded_at IS NULL AND (kind IN (')" \
+  "test_dashboard"
+
+# ENH-30 — the asker bumping their own thread is not an answer.
+run_mutation "threads: the asker's own follow-up counts as the answer" \
+  "core/threads.py" \
+  "('        if r.get(\"sender_id\") and r[\"sender_id\"] != asker:', '        if r.get(\"sender_id\"):')" \
+  "test_threads"
+
+# ENH-30 — an adapter without replies() must read as 'cannot see answers', never as
+# 'no answers' — the F-2 silent-no-op shape.
+run_mutation "threads: an adapter without replies() reads as 'nothing new'" \
+  "core/threads.py" \
+  "('    if not hasattr(adapter, \"replies\"):\n        return None', '    if not hasattr(adapter, \"replies\"):\n        return {\"swept\": 0, \"replies\": [], \"answered\": [], \"truncated\": False, \"rate_limited\": None}')" \
+  "test_threads"
+
+# ENH-30 — STATEMENTs are never swept: one platform call per remark, and remarks would be
+# marked 'answered'.
+run_mutation "threads: STATEMENTs are swept like asks" \
+  "core/threads.py" \
+  "('    open_asks = [r for r in journal.unanswered(channel) if r[\"kind\"] in ACTIONABLE_KINDS]', '    open_asks = [r for r in journal.unanswered(channel)]')" \
+  "test_threads"
+
+# ENH-30 — the sweep is bounded and SAYS when it truncated.
+run_mutation "threads: a truncated sweep reports itself complete" \
+  "core/threads.py" \
+  "('              \"truncated\": len(open_asks) > len(batch), \"rate_limited\": None}', '              \"truncated\": False, \"rate_limited\": None}')" \
+  "test_threads"
+
+# ENH-30 — a 429 must be visible in the result, never swallowed.
+run_mutation "threads: a rate limit is swallowed silently" \
+  "core/threads.py" \
+  "('            result[\"rate_limited\"] = ex.method or \"replies\"\n            break', '            break')" \
+  "test_threads"
+
+# ENH-30 — the tie itself: without mark_responded the ask stays open forever.
+run_mutation "threads: a foreign reply never marks the ask responded" \
+  "core/threads.py" \
+  "('            journal.mark_responded(channel, row[\"ts\"], f\"thread-reply:{hit[\\'ts\\']}\")', '            pass')" \
+  "test_threads"
+
+# ENH-30 — the scheduler must actually run the sweep each cycle.
+run_mutation "schedule: the cycle skips the thread sweep" \
+  "core/schedule.py" \
+  "('                swept = threads.sweep(src.adapter, self.store, self.journal, ch)', '                swept = None')" \
+  "test_schedule"
+
+# ENH-30 — the Slack adapter must drop the parent (it is the ask, not an answer).
+run_mutation "slack: replies() returns the parent as a reply" \
+  "channels/slack/adapter.py" \
+  "('        out = [self._normalize(channel, m) for m in raw if m.get(\"ts\") != thread_ts]', '        out = [self._normalize(channel, m) for m in raw]')" \
+  "test_slack_adapter"
+
+# ENH-30 — a truncated thread page must raise, never drop the tail.
+run_mutation "slack: replies() drops the rest of a truncated thread" \
+  "channels/slack/adapter.py" \
+  "('                raise ApiError(\"conversations.replies\",', '                break\n                raise ApiError(\"conversations.replies\",')" \
+  "test_slack_adapter"
+
+# ENH-30 — the fake adapter's replies() must honour the exclusive floor, or every sweep
+# re-fetches and re-stores the whole thread.
+run_mutation "fake: replies() ignores oldest" \
+  "channels/fake/adapter.py" \
+  "('               and m.get(\"thread_id\") == thread_ts and float(m[\"ts\"]) > floor]', '               and m.get(\"thread_id\") == thread_ts]')" \
+  "test_threads"
+
+# ENH-30 — the write surface: a PROVEN send from Reply must tie the ask.
+run_mutation "dashboard_write: a sent reply never marks the ask answered" \
+  "scripts/dashboard_write.py" \
+  "('        journal.mark_responded(row[\"target\"], row[\"trigger_ts\"], key)', '        pass')" \
+  "test_dashboard_write"
+
+# ENH-30 — STAGING must not tie: a draft is a promise, not an answer.
+run_mutation "dashboard_write: staging a reply already marks the ask answered" \
+  "scripts/dashboard_write.py" \
+  "('                st.session_state.pop(\"reply_to\", None)\n                if res.get(\"deduped\"):', '                st.session_state.pop(\"reply_to\", None)\n                _tie_answer(cfg, {\"target\": ch.id, \"trigger_ts\": trigger}, res[\"key\"])\n                if res.get(\"deduped\"):')" \
+  "test_dashboard_write"
+
+# ENH-30 — Reply must only be offered where composing is allowed (deny-by-default).
+run_mutation "dashboard_write: Reply offered on a never-policy channel" \
+  "scripts/dashboard_write.py" \
+  "('            if a[\"severity\"] == \"unanswered\" and a[\"where\"] in composable_ids]', '            if a[\"severity\"] == \"unanswered\"]')" \
+  "test_dashboard_write"
+
+# ENH-30/R21 — the docs must keep saying what 'unanswered' means and how it closes.
+run_mutation "docs: the answered-state explanation vanishes from the quickstart" \
+  "docs/QUICKSTART.md" \
+  "('A top-level reply in the channel cannot be attributed to the ask it answers, so\nit leaves the ask open — answer in the thread.', 'Replies close asks.')" \
   "test_docs"
 
 echo

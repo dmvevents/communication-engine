@@ -38,6 +38,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 
+from . import threads
 from .classify import Taxonomy, classify
 
 
@@ -172,7 +173,7 @@ class Scheduler:
     # ---- one cycle: probe -> classify -> journal -> route -> owed ---------
     def cycle(self) -> dict:
         now = self.clock()
-        polled = fresh = 0
+        polled = fresh = answered = 0
         for src in self.sources:
             for ch in src.channels:
                 cursor = self.store.cursor_get(src.name, ch)
@@ -187,14 +188,22 @@ class Scheduler:
                 fresh += self._journal_and_route(ch, mine, src)
                 self._commit_cursor(src.name, ch, cursor, new_cursor)
                 polled += len(mine)
+                # ENH-30: the open asks' threads. A history poll never serves a
+                # thread reply, so an in-thread answer reaches the engine only here;
+                # the fetched replies are journaled like any other message (a
+                # question asked inside a thread becomes an owed ask of its own).
+                swept = threads.sweep(src.adapter, self.store, self.journal, ch)
+                if swept is not None:
+                    fresh += self._journal_and_route(ch, swept["replies"], src)
+                    answered += len(swept["answered"])
         self._close_answered()
         unattended = self._observe_owed()
         self._last_fire = now
         self._interval = (self.base_interval if fresh
                           else min(self._interval * 2, self.max_interval))
         self._backoff_until = now + self._interval
-        return {"polled": polled, "fresh": fresh, "unattended": unattended,
-                "next_interval": self._interval}
+        return {"polled": polled, "fresh": fresh, "answered": answered,
+                "unattended": unattended, "next_interval": self._interval}
 
     def _journal_and_route(self, channel, messages, src) -> int:
         fresh = 0

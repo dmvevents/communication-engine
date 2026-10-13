@@ -41,6 +41,18 @@ class Adapter:
     def resolve(self, ref):
         return ref
 
+    def replies(self, channel_id, thread_ts, oldest=None):
+        """Optional capability (channels/CONTRACT.md, ENH-30): every reply under one
+        thread newer than `oldest` (exclusive), oldest-first, never the parent. The
+        fake holds every message in one list, so this is a filter; a real adapter
+        calls a second platform method because history never serves a reply."""
+        floor = float(oldest) if oldest is not None else float("-inf")
+        out = [m for m in self.messages
+               if m.get("channel_id") == channel_id
+               and m.get("thread_id") == thread_ts and float(m["ts"]) > floor]
+        out.sort(key=lambda m: float(m["ts"]))
+        return out
+
     def send(self, channel_id, text, key=None, thread_id=None):
         """Placement is recorded, not ignored: an adapter that accepts thread_id and
         drops it posts in the main channel while reporting success, which is the one

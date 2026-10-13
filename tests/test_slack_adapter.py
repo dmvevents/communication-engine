@@ -413,5 +413,69 @@ class RetrievableSnapshotTest(SlackAdapterTestCase):
         self.assertIn("conversations.history", self.mod.READ_METHODS)
 
 
+
+def replies_page(messages, has_more=False, next_cursor=None):
+    return history(messages, has_more=has_more, next_cursor=next_cursor)
+
+
+class ThreadRepliesTest(SlackAdapterTestCase):
+    """replies() — the optional capability that lets in-thread answers close asks
+    (ENH-30). conversations.history never serves a thread reply, so until this method
+    existed every answer the agent posted in-thread was invisible to the engine."""
+
+    def test_replies_pages_the_thread_and_never_returns_the_parent(self):
+        a = self.make([
+            replies_page([slack_msg("1.0", text="the ask", thread_ts="1.0",
+                                    reply_count=2),
+                          slack_msg("2.0", user="B_AGENT", text="answer",
+                                    thread_ts="1.0")],
+                         has_more=True, next_cursor="pg2"),
+            replies_page([slack_msg("3.0", user="U_B", text="thanks",
+                                    thread_ts="1.0")]),
+        ])
+        got = a.replies("C_ONE", "1.0")
+        self.assertEqual([m["ts"] for m in got], ["2.0", "3.0"],
+                         "the parent rides the first page of conversations.replies "
+                         "and must be dropped; both pages must be followed")
+        self.assertEqual({m["thread_id"] for m in got}, {"1.0"})
+        self.assertEqual({m["channel_id"] for m in got}, {"C_ONE"})
+        self.assertEqual(got[0]["sender_id"], "B_AGENT")
+        urls = [u for u, _ in self.http.requests]
+        self.assertTrue(all(u.endswith("/conversations.replies") for u in urls), urls)
+        first = self.http.requests[0][1]
+        self.assertEqual((first["channel"], first["ts"]), ("C_ONE", "1.0"))
+        self.assertNotIn("oldest", first, "no oldest was asked for")
+        self.assertEqual(self.http.requests[1][1]["cursor"], "pg2")
+        self.assertIn("conversations.replies", self.mod.READ_METHODS)
+
+    def test_oldest_is_passed_through_exclusively(self):
+        a = self.make([replies_page([slack_msg("3.0", user="U_B", thread_ts="1.0")])])
+        got = a.replies("C_ONE", "1.0", oldest="2.0")
+        self.assertEqual(self.http.requests[0][1]["oldest"], "2.0")
+        self.assertEqual([m["ts"] for m in got], ["3.0"])
+
+    def test_a_truncated_thread_page_raises_instead_of_dropping_the_tail(self):
+        a = self.make([replies_page([slack_msg("2.0", user="U_B", thread_ts="1.0")],
+                                    has_more=True)])
+        with self.assertRaises(self.mod.ApiError):
+            a.replies("C_ONE", "1.0")
+
+    def test_a_429_on_replies_carries_the_platforms_wait(self):
+        a = self.make([(429, {"Retry-After": "7"}, {"ok": False, "error": "ratelimited"})])
+        with self.assertRaises(RateLimited) as ctx:
+            a.replies("C_ONE", "1.0")
+        self.assertEqual(ctx.exception.retry_after, 7)
+
+    def test_history_polling_still_excludes_thread_replies(self):
+        """The reason replies() exists: a thread reply never rides history, so the
+        poll path alone can never see an in-thread answer. Pinned so a future
+        'optimisation' does not quietly make the sweep look redundant."""
+        a = self.make([history([slack_msg("1.0", text="the ask", thread_ts="1.0",
+                                          reply_count=1)])])
+        got, _ = a.poll(None)
+        self.assertEqual([m["ts"] for m in got], ["1.0"])
+        self.assertIsNone(got[0]["thread_id"], "a parent is top-level, not a reply")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
