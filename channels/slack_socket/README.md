@@ -3,8 +3,9 @@
 **Push for latency, poll for truth.** This adapter receives Slack Events API payloads
 over an outbound WebSocket (Socket Mode) — no public endpoint, no inbound firewall
 hole, sub-second detection, zero Web API rate-limit budget. It landed as a pure
-dir-drop (R11: zero `core/` changes) and is **ingestion-only**: like the polling
-`slack` adapter it exposes no send path at any layer.
+dir-drop (R11: zero `core/` changes) and is **ingestion-only**: it exposes no send path at
+any layer (the polling `slack` adapter grew one in ENH-31, reachable only through
+`core/outbox.py`; this adapter did not).
 
 ## Why it must never run alone
 

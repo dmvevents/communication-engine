@@ -26,8 +26,9 @@ cat > "$ROOT/.git/hooks/pre-push" <<'EOF'
 R="$(git rev-parse --show-toplevel)"
 set -e
 bash "$R/scripts/sanitize-gate.sh"
-python3 -m unittest discover -s "$R/tests" -q
-bash "$R/tests/mutation_check.sh"
+# the loopback-only network guard: a test that reaches a third host fails loudly
+PYTHONPATH="$R/tests/netguard" python3 -m unittest discover -s "$R/tests" -q
+PYTHONPATH="$R/tests/netguard" bash "$R/tests/mutation_check.sh"
 EOF
 
 chmod +x "$ROOT/.git/hooks/pre-commit" "$ROOT/.git/hooks/pre-push"

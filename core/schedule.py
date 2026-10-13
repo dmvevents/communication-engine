@@ -117,6 +117,12 @@ class Source:
     # only logging them. Per source, like the taxonomy: whether hedges deserve human
     # eyes depends on the channel's vocabulary and traffic, not on the engine.
     escalate_ambiguous: bool = False
+    # ENH-31: who may close an ask (empty = any non-asker whose reply is not an ask),
+    # shared by the thread rule and the DM rule; and which channels are 1:1 DMs, where
+    # a TOP-LEVEL message from an answerer closes the ask (DMs have no threads in
+    # practice: measured 535 DM messages, 0 in-thread).
+    answerers: tuple = ()
+    dm_channels: tuple = ()
 
 
 class Scheduler:
@@ -179,7 +185,7 @@ class Scheduler:
         now = self.clock()
         polled = fresh = answered = 0
         sweep_rate_limited, sweep_truncated, sweep_errors = [], [], []
-        sweep_skipped = []
+        sweep_skipped, dm_refused = [], []
         for src in self.sources:
             for ch in src.channels:
                 cursor = self.store.cursor_get(src.name, ch)
@@ -214,7 +220,10 @@ class Scheduler:
             # one-Scheduler-per-run keeps every guarantee. A 429 ends this source's
             # sweeping for the cycle; polling is already done.
             budget = threads.SWEEP_MAX
-            order = self._sweep_order_for(src)
+            # A declared DM has no threads in practice (535 DM messages, 0 in-thread) and
+            # its asks close by the DM rule below, so its asks must not spend the thread
+            # budget every cycle (review N2).
+            order = [c for c in self._sweep_order_for(src) if c not in src.dm_channels]
             swept_now, skipped_now, spent = [], [], {}
             stopped = None              # set once a 429 ends this source's sweeping
             for i, ch in enumerate(order):
@@ -234,7 +243,8 @@ class Scheduler:
                     # never the answer (review F7); the source's vocabulary decides.
                     is_answer=lambda m, _src=src: classify(
                         m.get("text") or "", _src.taxonomy,
-                        attachments=m.get("attachments")).kind not in ACTIONABLE_KINDS)
+                        attachments=m.get("attachments")).kind not in ACTIONABLE_KINDS,
+                    answerers=src.answerers)
                 if swept is not None:
                     # Charged by ATTEMPT: a refused fetch cost the platform a call too
                     # (review F2 — an all-errors channel was charged nothing, and the
@@ -258,6 +268,15 @@ class Scheduler:
                     if swept["truncated"]:
                         sweep_truncated.append(ch)
                     sweep_errors.extend((ch, ts, msg) for ts, msg in swept["errors"])
+            # ENH-31 B: a 1:1 DM has no threads to sweep; its asks close on the next
+            # top-level message by an answerer. Store-only — no platform call, no budget.
+            for ch in src.dm_channels:
+                answered += len(threads.close_dm_asks(
+                    self.store, self.journal, ch, answerers=src.answerers,
+                    is_answer=lambda m, _src=src: classify(
+                        m.get("text") or "", _src.taxonomy,
+                        attachments=m.get("attachments")).kind not in ACTIONABLE_KINDS,
+                    refusals=dm_refused))        # named, like the sweep's (round 2, R2-13)
             # The channel that took the bulk — the one that SPENT the most — goes to the
             # back (review F3: rotating position 0 let a small channel's turn hand the
             # bulk straight back to the same backlog channel); skipped ones go first.
@@ -275,7 +294,7 @@ class Scheduler:
                 "unattended": unattended, "next_interval": self._interval,
                 "sweep_rate_limited": sweep_rate_limited,
                 "sweep_truncated": sweep_truncated, "sweep_errors": sweep_errors,
-                "sweep_skipped": sweep_skipped}
+                "sweep_skipped": sweep_skipped, "dm_refused": dm_refused}
 
     def _sweep_order_for(self, src) -> list:
         """This cycle's sweep order for one source, read from the store (so it survives

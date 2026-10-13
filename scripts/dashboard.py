@@ -51,12 +51,13 @@ st.set_page_config(page_title="communication engine — operator", page_icon="�
                    layout="wide")
 
 # Glyph + word + colour per severity; the glyphs are text-font characters on purpose.
-GLYPH = {"engine_lost": "⊘", "in_flight": "✖", "edited_after_response": "▲",
-         "staged": "◔", "unanswered": "?"}
-COLOR = {"engine_lost": "#8f1d1d", "in_flight": "#d03b3b",
+GLYPH = {"engine_lost": "⊘", "in_flight": "✖", "unresolved_send": "≠",
+         "edited_after_response": "▲", "staged": "◔", "unanswered": "?"}
+COLOR = {"engine_lost": "#8f1d1d", "in_flight": "#d03b3b", "unresolved_send": "#b3261e",
          "edited_after_response": "#ec835a",
          "staged": "#fab219", "unanswered": "#898781"}
 LABEL = {"engine_lost": "ENGINE LOST", "in_flight": "IN-FLIGHT SEND",
+         "unresolved_send": "UNRESOLVED SEND",
          "edited_after_response": "EDITED AFTER ANSWER",
          "staged": "STAGED DRAFT", "unanswered": "UNANSWERED"}
 
@@ -154,8 +155,8 @@ if not attention and not snap["missing"]:
     st.markdown("<div style='border:1px solid rgba(128,128,128,.3);"
                 "border-left:3px solid #0ca30c;border-radius:8px;padding:10px 14px'>"
                 "<span style='color:#0ca30c;font-weight:700'>✓</span> <b>ALL CLEAR</b>"
-                " — no proven parity losses, no in-flight sends, no stale answers, "
-                "no drafts waiting, no open asks.</div>", unsafe_allow_html=True)
+                " — no proven parity losses, no in-flight or unresolved sends, no stale "
+                "answers, no drafts waiting, no open asks.</div>", unsafe_allow_html=True)
 for item in attention:
     where = item["where"] + (f" · instance {item['instance']}"
                              if item["instance"] else "")
@@ -187,10 +188,29 @@ with journal_tab:
         st.markdown(f"**{j['distinct']}** distinct messages · "
                     f"**{j['unanswered']}** unanswered · **{j['answered']}** answered "
                     f"({j['answered_by_thread']} closed by someone else's in-thread "
-                    "reply, not by an answer sent from here)")
+                    f"reply and {j['answered_by_dm']} by a direct-message reply, not by "
+                    "an answer sent from here — review them below)")
         dom_table(("kind", "count"),
                   [(html.escape(str(k)), n)
                    for k, n in sorted(j["by_kind"].items(), key=lambda kv: str(kv[0]))])
+        closed = snap["closed_by_others"]
+        if closed:
+            # ENH-31 B' (review S8): listed, not only counted — with no answerer list a
+            # bystander's "+1" closes an ask too, and the operator must see WHICH.
+            st.markdown("##### Closed by someone else — review")
+            st.caption("asks that left the queue on someone else's reply, listed so the "
+                       "operator sees which; there is no reopen action here — the journal "
+                       "row is the record to inspect")
+            dom_table(("channel", "ts", "kind", "closed by", "text"),
+                      [(html.escape(c["where"]), html.escape(str(c["ts"])),
+                        html.escape(str(c["kind"] or "—")),
+                        html.escape(str(c["response_key"]).replace("thread-reply:", "thread reply ")
+                                    .replace("dm-reply:", "DM reply "))
+                        + (f" <b>(also closed {c['also_closed']} other ask"
+                           f"{'s' if c['also_closed'] > 1 else ''})</b>"
+                           if c.get("also_closed") else ""),
+                        html_text(c["text"]))
+                       for c in closed])
         open_asks = [a for a in attention if a["severity"] in
                      ("unanswered", "edited_after_response")]
         if open_asks:
@@ -212,10 +232,11 @@ with outbox_tab:
             continue
         dom_table(("state", "count"), sorted(counts.items()))
         gate = [a for a in attention
-                if a["severity"] in ("staged", "in_flight") and a["instance"] == name]
+                if a["severity"] in ("staged", "in_flight", "unresolved_send")
+                and a["instance"] == name]
         if gate:
             st.markdown("**Waiting on you** — drafts to approve, crashed sends to "
-                        "recover:")
+                        "recover, unresolved sends to settle on the platform:")
             dom_table(("", "target", "trigger ts", "exact text"),
                       [(badge(a["severity"]), html.escape(a["where"]),
                         html.escape(str(a["ts"])), html_text(a["text"]))

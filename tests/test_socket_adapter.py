@@ -137,6 +137,37 @@ class SocketAdapterTestCase(unittest.TestCase):
                                 http=self.http, connect=self.connect, **kwargs)
 
 
+class ApiBaseTest(SocketAdapterTestCase):
+    """COMMS_SLACK_API_BASE (ENH-31 C), the same rule as the polling adapter's: loopback
+    stubs only, refused by name at construction before any I/O."""
+
+    def make_env(self, env, http_script=()):
+        self.http = FakeHttp(http_script)
+        return self.mod.Adapter(auth={"app_token": "app-tok", "channels": "C_ONE"},
+                                http=self.http, connect=FakeConnect(()), env=env)
+
+    def test_the_default_base_is_slack(self):
+        a = self.make_env({}, [(200, {}, {"ok": True, "url": "wss://stub"})])
+        a._connections_open()
+        self.assertEqual(self.http.requests[0][0],
+                         "https://slack.com/api/apps.connections.open")
+
+    def test_a_loopback_base_is_used(self):
+        a = self.make_env({"COMMS_SLACK_API_BASE": "http://127.0.0.1:18999"},
+                          [(200, {}, {"ok": True, "url": "wss://stub"})])
+        a._connections_open()
+        self.assertEqual(self.http.requests[0][0],
+                         "http://127.0.0.1:18999/apps.connections.open")
+
+    def test_a_non_loopback_base_is_refused_by_name_before_any_io(self):
+        for bad in ("http://10.0.0.5:8080", "https://127.0.0.1:18999", "http://evil.example",
+                    "http://127.0.0.1:1/api"):
+            with self.assertRaises(ValueError, msg=bad) as ctx:
+                self.make_env({"COMMS_SLACK_API_BASE": bad})
+            self.assertIn("COMMS_SLACK_API_BASE", str(ctx.exception))
+            self.assertEqual(self.http.requests, [])
+
+
 class ContractSurfaceTest(SocketAdapterTestCase):
     def test_slack_socket_is_discovered_from_the_shipped_tree(self):
         """R11 discovery is the landing mechanism — a dir-drop, zero core/ changes."""

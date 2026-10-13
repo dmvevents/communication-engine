@@ -934,7 +934,7 @@ class ConfigSurfaceDocTest(unittest.TestCase):
                       self.quickstart,
                       "the doc dropped the top-level-reply limit — the one answered-state "
                       "surprise an operator meets on day one")
-        self.assertIn("Answered state has exactly two routes.", self.quickstart,
+        self.assertIn("Answered state has exactly three routes.", self.quickstart,
                       "the honest-limits entry for answered state is gone")
 
     def test_the_adapters_with_no_route_to_answered_are_named_from_the_code(self):
@@ -948,12 +948,104 @@ class ConfigSurfaceDocTest(unittest.TestCase):
             if not hasattr(load_adapter_class(ROOT / "channels", name), "replies")
             and not hasattr(load_adapter_class(ROOT / "channels", name), "send"))
         self.assertTrue(stranded, "the derivation found nothing — it is broken, not the docs")
-        section = self.quickstart.split("Answered state has exactly two routes.", 1)[1]
+        section = self.quickstart.split("Answered state has exactly three routes.", 1)[1]
         section = section.split("\n- **", 1)[0]
         named = sorted(set(re.findall(r"`([a-z_]+)`", section)) - {"replies", "SWEEP_MAX"})
         self.assertEqual(named, stranded,
                          f"the doc names {named} as having no route to answered; the code "
                          f"says {stranded}")
+
+
+class SendPathDocsTest(unittest.TestCase):
+    """ENH-31 review F11: QUICKSTART step 7 told the adopter the Slack adapter "has no send
+    method" after it had one, the write-surface paragraph counted six pre-flip guards where
+    the code has five refusals and a post-send proof, `localhost` was documented as an
+    accepted stub host after N5 refused it, and the three new config keys were documented
+    nowhere an adopter edits. Each claim below is checked against the code it describes."""
+
+    def setUp(self):
+        self.text = QUICKSTART.read_text()
+
+    def _step(self, number):
+        m = re.search(rf"^## {number}\.[^\n]*$(.*?)(?=^## |\Z)", self.text,
+                      re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(m, f"QUICKSTART has no step {number}")
+        return m.group(0)
+
+    def test_step_7_no_longer_claims_the_slack_adapter_has_no_send_path(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "slack_adapter_for_docs", ROOT / "channels" / "slack" / "adapter.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertTrue(callable(getattr(mod.Adapter, "send", None)),
+                        "the premise moved: the Slack adapter has no send() again — "
+                        "rewrite step 7 the other way")
+        step7 = self._step(7)
+        for stale in ("no send method", "read-only at every layer",
+                      "refuses any non-read Web API method"):
+            self.assertNotIn(stale, step7,
+                             f"step 7 still says {stale!r} of an adapter that has send()")
+        self.assertIn("chat.postMessage", step7)
+        self.assertIn("`staged`", step7)
+        self.assertIn("xoxb-", step7, "the bot-token-only rule is not stated where the "
+                                      "adopter grants the token")
+
+    def test_the_guard_count_matches_the_code(self):
+        from core.outbox import MISMATCH
+        self.assertNotIn("six guards", self.text,
+                         "the read-back runs AFTER the post and placement is the surface's "
+                         "routing rule — there are five pre-flip refusals, not six guards")
+        self.assertIn("five refusals", self.text)
+        self.assertIn(f"`{MISMATCH}`", self.text, "the third read-back answer is undocumented")
+
+    def test_the_answered_state_claims_are_scoped_to_the_rule_they_hold_for(self):
+        """Review round 2 (R2-9, R2-6): "a message closes at most one ask, ever" is true of
+        the DM rule and false of the thread sweep (one reply closes every open ask under its
+        root, by design); recovery's bound and the UNPROVEN state must be stated where the
+        adopter reads about recovery."""
+        from core.outbox import SETTLED, UNPROVEN
+        flat = " ".join(self.text.split())
+        self.assertNotIn("A message closes at most one ask, ever", flat)
+        self.assertIn("In a direct message a message closes at most one ask, ever", flat)
+        self.assertIn("one reply can close several people's asks", flat)
+        self.assertIn(f"`{UNPROVEN}`", flat, "recovery's terminal state is undocumented")
+        self.assertIn("at most once per completed run", flat,
+                      "recovery's re-send bound is overstated or undocumented (round 3: a crash "
+                      "between the re-send and its record can add one)")
+        self.assertIn(f"`{SETTLED}`", flat, "the human's terminal action on a parked row is undocumented")
+        self.assertIn("ambiguous answer", flat, "the post's ambiguous answers (internal_error, 5xx) "
+                                               "must be stated as left in flight")
+
+    def test_the_suite_is_documented_as_running_under_the_network_guard(self):
+        """Round 3 (R3-1): 'nothing in the suite reaches slack.com' was a promise one test
+        broke silently; the guard in tests/netguard enforces it, and the docs, CI and the
+        pre-push hook must all run the suite under it."""
+        self.assertTrue((ROOT / "tests" / "netguard" / "sitecustomize.py").is_file())
+        self.assertIn("PYTHONPATH=tests/netguard", self.text)
+        for path in (ROOT / ".github" / "workflows" / "tests.yml", ROOT / "scripts" / "install-hooks.sh"):
+            self.assertIn("tests/netguard", path.read_text(), f"{path.name} runs the suite unguarded")
+
+    def test_localhost_is_not_documented_as_an_accepted_stub_host(self):
+        for doc in (QUICKSTART, ROOT / "channels" / "slack" / "README.md"):
+            self.assertNotIn("http://localhost", doc.read_text(),
+                             f"{doc.name} still offers a NAME as the stub base; the adapter "
+                             "refuses anything but the literal loopback address (review N5)")
+
+    def test_the_three_send_keys_are_listed_where_the_adopter_edits_the_file(self):
+        step2 = self._step(2)
+        for key in ("instances[].channels[].kind", "instances[].answerers",
+                    "instances[].send_marker"):
+            self.assertIn(f"`{key}`", step2, f"{key} is missing from the step-2 field table")
+        example = json.loads((ROOT / "settings.example.json").read_text())
+        doc = example.get("_send_keys_doc", {})
+        self.assertEqual(sorted(doc), ["instances[].answerers", "instances[].channels[].kind",
+                                       "instances[].send_marker"])
+        dm = [ch for inst in example["instances"] for ch in inst["channels"]
+              if ch["id"].startswith("D")]
+        self.assertEqual([ch.get("kind") for ch in dm], ["dm"],
+                         "the example DM channel does not declare its kind")
+        self.assertIn("slack adapter declares them OFF", example["_reply_policies_doc"]["direct"])
 
 
 if __name__ == "__main__":

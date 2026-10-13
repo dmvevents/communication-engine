@@ -38,7 +38,10 @@ dual-write the scheduler forbids for poll(), found by the independent review of 
 """
 from __future__ import annotations
 
+import json
+
 from .classify import ACTIONABLE_KINDS
+from .delivery import ENGINE_EVENT_TYPE
 from .ratelimit import RateLimited
 from .store import ts_order
 
@@ -59,7 +62,7 @@ SWEEP_MAX = 25
 UNATTRIBUTED_SENDERS = frozenset({"unknown"})
 
 
-def answered_by(asker: str | None, replies, is_answer=None) -> dict | None:
+def answered_by(asker: str | None, replies, is_answer=None, answerers=()) -> dict | None:
     """The earliest reply from someone OTHER than the asker that IS an answer, or None.
 
     The asker bumping their own thread is not an answer; a reply with no sender, or the
@@ -68,15 +71,110 @@ def answered_by(asker: str | None, replies, is_answer=None) -> dict | None:
     logs?") is a new question, not an answer — crediting it closed the original ask and
     its owed work (independent review F7). `is_answer` is the caller's verdict; the
     reference scheduler passes its classifier.
+
+    `answerers` (ENH-31, operator decision 2026-10-13): when the source names who may
+    close an ask — the agent's bot user, the operators — only THEIR replies close OTHER
+    people's asks, so a bystander's "+1" closes nothing (review S8). An ask posed BY a
+    listed answerer (the agent's clarifying question) is closed by any non-asker's
+    answer — the other party — or it could never close and would owe the engine an
+    answer to its own agent forever (review F10). Empty keeps the any-non-asker rule.
+    The ask-shaped filter applies to answerers too: a listed answerer's clarifying
+    question is a question, not an answer ("follow-up questions never credited").
     """
+    restricted = bool(answerers) and asker not in answerers
     for r in sorted(replies, key=lambda m: ts_order(m["ts"])):
         sender = r.get("sender_id")
         if not sender or sender == asker or sender in UNATTRIBUTED_SENDERS:
+            continue
+        if _is_engine_post(r):
+            # The engine's own delivery was tied to ITS ask by the surface when it was
+            # proven; only that proof ties it. Crediting it here would close another ask
+            # under the same root with one reply, or record a MISMATCH post — one the
+            # surface refused to call delivered — as an answer (review round 2, R2-3).
+            continue
+        if restricted and sender not in answerers:
             continue
         if is_answer is not None and not is_answer(r):
             continue
         return r
     return None
+
+
+def close_dm_asks(store, journal, channel: str, *, answerers=(), is_answer=None,
+                  refusals=None) -> list:
+    """The DM answered-state (ENH-31 B): in a 1:1 direct message every message is
+    top-level (measured on the aws-do-agent integration: 535 DM messages, 0 in-thread),
+    so the thread sweep can never close a DM ask. Here each later top-level message
+    that is an answer — by an answerer when the source names them, else by anyone but
+    the asker (the other DM party) — closes the MOST RECENT still-open ask that precedes
+    it AND that it can answer (never its own sender's: an answerer's reply skips its own
+    clarifying question, review F10), and only that one, ever (review F1): a reply
+    addresses the question just asked; an older question stays visibly open for a human to
+    judge. The engine's own deliveries, recognised by the metadata the poll stores, are
+    never credited — only the surface's proof ties them. No platform call: the candidates
+    are the polled store. A non-orderable id space is refused by name into `refusals`.
+    Returns [(ask_ts, message_ts), ...] for the ties made.
+    """
+    open_asks = sorted(open_asks_for(journal, channel), key=lambda r: ts_order(r["ts"]))
+    if not open_asks:
+        return []
+    if any(ts_order(a["ts"])[0] != 0 for a in open_asks):
+        # A non-numeric id space (an email Message-ID) cannot be ordered; the sweep refuses
+        # it by name and so does this rule — "later than the ask" would be a guess (N3).
+        # NAMED to the caller (round 2, R2-13): the scheduler reports it, as it reports
+        # the sweep's refusals, instead of an empty list that reads as "nothing to do".
+        if refusals is not None:
+            refusals.append((channel, "non-orderable id space — the DM rule cannot tell a "
+                                      "later message from an earlier one; declare the "
+                                      "channel kind 'channel', or use numeric ids"))
+        return []
+    arrivals = store.arrivals(channel)
+    # One message closes at most ONE ask, ever: an answer already spent on an ask must
+    # not close the next-older open ask on the next cycle (review F1).
+    used = journal.used_response_keys(channel, "dm-reply:")
+    answered = []
+    for m in store.top_level_after(channel, open_asks[0]["ts"]):
+        if f"dm-reply:{m['ts']}" in used:
+            continue
+        # (An engine delivery — tied to ITS ask by the surface when it was proven — is
+        # refused by answered_by itself, which the target loop below goes through: review
+        # F1 addendum, round 2 R2-3. One check, in the one place both rules share.)
+        preceding = [a for a in open_asks if ts_order(a["ts"]) < ts_order(m["ts"])]
+        # The most recent open ask this message can answer: an answerer's reply skips
+        # its own clarifying question and reaches the human's ask behind it (review F10
+        # — before, the bot's answer "answered" the bot's own question and was dropped).
+        target = None
+        for a in reversed(preceding):
+            if answered_by(a["sender_id"], [m], is_answer, answerers) is not None:
+                target = a
+                break
+        if target is None:
+            continue
+        journal.mark_responded(channel, target["ts"], f"dm-reply:{m['ts']}",
+                               at=arrivals.get(str(m["ts"])))
+        used.add(f"dm-reply:{m['ts']}")
+        answered.append((str(target["ts"]), str(m["ts"])))
+        open_asks.remove(target)
+    return answered
+
+
+def _is_engine_post(m) -> bool:
+    """Does this stored message carry the engine's own delivery marker? Adapters that can
+    carry metadata (Slack) attach ENGINE_EVENT_TYPE to every post; it rides the stored
+    raw payload. Anything unparseable is not an engine post."""
+    raw = m.get("raw")
+    if not raw:
+        return False
+    try:
+        payload = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return False
+    if not isinstance(payload, dict):          # a raw that parses to 123, a list, true
+        return False
+    meta = payload.get("metadata")
+    if not isinstance(meta, dict):             # "metadata": "x" is not the marker either
+        return False
+    return meta.get("event_type") == ENGINE_EVENT_TYPE
 
 
 def open_asks_for(journal, channel: str) -> list:
@@ -89,7 +187,8 @@ def open_asks_for(journal, channel: str) -> list:
 
 
 def sweep(adapter, store, journal, channel: str, *,
-          max_threads: int = SWEEP_MAX, start: int = 0, is_answer=None) -> dict | None:
+          max_threads: int = SWEEP_MAX, start: int = 0, is_answer=None,
+          answerers=()) -> dict | None:
     """Fetch new replies under this channel's open asks and tie answers to them.
 
     Returns None when the adapter has no `replies()` — the capability is absent and the
@@ -166,7 +265,7 @@ def sweep(adapter, store, journal, channel: str, *,
         arrivals = store.arrivals(channel)
         for row in rows:
             later = [m for m in in_thread if ts_order(m["ts"]) > ts_order(row["ts"])]
-            hit = answered_by(row["sender_id"], later, is_answer)
+            hit = answered_by(row["sender_id"], later, is_answer, answerers)
             if hit is not None:
                 # Stamped at the reply's first ARRIVAL (engine clock, comparable with
                 # revision.recorded_at), never at sweep time: an edit sighted between

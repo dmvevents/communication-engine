@@ -29,7 +29,8 @@ set -uo pipefail
 # false-positive-prone to scan generically (epoch timestamps are 10 digits).
 # They MUST be covered by the local denylist on any host that has them.
 CLASSES=(
-  "slack-token|xox[abprs]-[0-9A-Za-z-]{8,}"
+  "slack-token|xox[a-z]-[0-9A-Za-z-]{8,}"
+  "bearer-token|Bearer [A-Za-z0-9+/=_.-]{16,}"
   "slack-app-token|xapp-[0-9]-[0-9A-Za-z-]{8,}"
   "slack-id|\b[CDGUWT][0-9][0-9A-Z]{8,10}\b"
   "telegram-bot-token|\b[0-9]{8,10}:AA[0-9A-Za-z_-]{30,}\b"
@@ -128,10 +129,12 @@ self_test() {
   printf '{%s%s}\n' "$a" "$b" > "$tmp/p9.txt"
   a="203.0."; b="113.7"
   printf 'host %s%s\n' "$a" "$b" > "$tmp/p10.txt"
+  a="Authorization: Bea"; b="rer abcdefghijklmnop1234"
+  printf '%s%s\n' "$a" "$b" > "$tmp/p11.txt"
 
   local out planted_classes=(slack-token slack-app-token slack-id telegram-bot-token \
                              aws-access-key aws-account-id private-key assigned-secret \
-                             json-secret ipv4)
+                             json-secret ipv4 bearer-token)
   out="$(scan "$tmp" 2>/dev/null)"
   local rc=$? missing=0
   if [ "$rc" -eq 0 ]; then

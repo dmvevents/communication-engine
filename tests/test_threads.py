@@ -34,7 +34,7 @@ from core.journal import Journal  # noqa: E402
 from core.ratelimit import RateLimited  # noqa: E402
 from core.schedule import ROUTES  # noqa: E402
 from core.store import Store  # noqa: E402
-from core.threads import SWEEP_MAX, answered_by, sweep  # noqa: E402
+from core.threads import SWEEP_MAX, _is_engine_post, answered_by, close_dm_asks, sweep  # noqa: E402
 
 FakeAdapter = load_adapter_class(ROOT / "channels", "fake")
 
@@ -113,6 +113,36 @@ class AnsweredByTest(unittest.TestCase):
     def test_only_the_askers_own_replies_is_no_answer(self):
         replies = [msg("C1", "2.0", "bump", sender="U_ASKER", thread="1.0")]
         self.assertIsNone(answered_by("U_ASKER", replies))
+
+    def test_an_answerer_list_restricts_who_closes_other_peoples_asks_only(self):
+        """Review F10: with answerers = the bot, a bystander's reply closes nothing on the
+        human's ask (review S8) — but the bot's OWN clarifying question is closed by the
+        human's answer, the other party, or the engine would owe its own agent an answer
+        forever (and in a DM the bot's open question shadowed the human's ask)."""
+        bot, human, bystander = "U_BOT", "U_HUMAN", "U_X"
+        answers = lambda frm, ts: [{"sender_id": frm, "ts": ts, "text": "here"}]
+        self.assertIsNone(answered_by(human, answers(bystander, "2.0"), answerers=(bot,)))
+        self.assertEqual(answered_by(human, answers(bot, "2.0"), answerers=(bot,))["ts"], "2.0")
+        self.assertEqual(answered_by(bot, answers(human, "3.0"), answerers=(bot,))["ts"], "3.0",
+                         "the human cannot close the bot's own question")
+        self.assertIsNone(answered_by(bot, answers(bot, "3.0"), answerers=(bot,)),
+                          "nobody answers their own question")
+        # the ask-shaped filter still applies to the other party's reply to an answerer's ask
+        is_answer = lambda r: not r["text"].endswith("?")
+        self.assertIsNone(answered_by(bot, [{"sender_id": human, "ts": "3.0", "text": "which?"}],
+                                      is_answer, (bot,)))
+
+    def test_the_engines_own_post_never_answers(self):
+        """Review round 2 (R2-3): the engine's delivery is tied to ITS ask by the surface's
+        proof; the sweep crediting it would close another ask under the same root with one
+        reply — or record a MISMATCH post as an answer."""
+        import json
+        meta = {"event_type": "comms_engine_reply", "event_payload": {"key": "k1"}}
+        engine = {"sender_id": "U_BOT", "ts": "2.0", "text": "[AGENT] here",
+                  "raw": json.dumps({"ts": "2.0", "metadata": meta})}
+        plain = {"sender_id": "U_BOT", "ts": "3.0", "text": "here", "raw": json.dumps({"ts": "3.0"})}
+        self.assertIsNone(answered_by("U_HUMAN", [engine]))
+        self.assertEqual(answered_by("U_HUMAN", [engine, plain])["ts"], "3.0")
 
     def test_a_reply_without_a_sender_cannot_answer(self):
         replies = [dict(msg("C1", "2.0", "x", thread="1.0"), sender_id=None)]
@@ -342,6 +372,41 @@ class SweepTest(SweepHarness):
             start = res["next_start"]
         self.assertEqual(seen, {f"{i}.0" for i in range(1, 8)},
                          "three windows of three over seven asks must have swept them all")
+
+    def test_the_dm_rule_refuses_a_non_orderable_id_space(self):
+        """Review N3: an email Message-ID cannot be ordered, so "later than the ask" is a
+        guess; the sweep refuses such a channel by name and the DM rule must too. Without
+        the refusal sqlite CASTs '9@mail' to 9.0 and '1@mail' to 1.0 and a reply "after"
+        the ask closes it on an ordering that means nothing."""
+        ch, ask_id, reply_id = "INBOX", "1@mail.example", "9@mail.example"
+        self.ask(ts=ask_id, channel=ch, sender="U_HUMAN")
+        self.store.upsert_messages([msg(ch, reply_id, "here you go", sender="U_OTHER")])
+        self.assertEqual(close_dm_asks(self.store, self.journal, ch), [])
+        self.assertEqual(self.responded(ask_id, channel=ch), (None, None))
+        # ...and the refusal is NAMED to the caller (review R2-13), as the sweep's are
+        refusals = []
+        self.assertEqual(close_dm_asks(self.store, self.journal, ch, refusals=refusals), [])
+        self.assertEqual(len(refusals), 1)
+        self.assertEqual(refusals[0][0], ch)
+        self.assertIn("non-orderable", refusals[0][1])
+
+    def test_an_engine_post_is_recognised_by_its_stored_metadata_only(self):
+        """The DM rule skips a message the engine itself delivered (review F1 addendum);
+        the marker rides the stored raw payload, and anything unparseable is not one."""
+        import json
+        meta = {"event_type": "comms_engine_reply", "event_payload": {"key": "k1"}}
+        self.assertTrue(_is_engine_post({"raw": json.dumps({"ts": "3.0", "metadata": meta})}))
+        self.assertTrue(_is_engine_post({"raw": {"metadata": meta}}))
+        self.assertFalse(_is_engine_post({"raw": json.dumps({"ts": "3.0"})}))
+        self.assertFalse(_is_engine_post({"raw": json.dumps(
+            {"metadata": {"event_type": "someone_elses_event"}})}))
+        self.assertFalse(_is_engine_post({"raw": "not json"}))
+        self.assertFalse(_is_engine_post({"raw": None}))
+        self.assertFalse(_is_engine_post({}))
+        # a raw that parses to a non-object, or a non-object metadata, is not one either —
+        # and must not crash the cycle (review R2-14)
+        for raw in ("123", "[1, 2]", "true", '{"metadata": "x"}', '{"metadata": [1]}'):
+            self.assertFalse(_is_engine_post({"raw": raw}), raw)
 
     def test_a_non_orderable_id_space_is_refused_by_name(self):
         """Email Message-IDs are strings; ts_order's string fallback is lexicographic,

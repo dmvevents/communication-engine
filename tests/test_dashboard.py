@@ -151,6 +151,7 @@ class SnapshotTest(unittest.TestCase):
         constant must fail here, not re-derive the expectation."""
         sevs = [i["severity"] for i in self.snap()["attention"]]
         self.assertEqual(sevs, sorted(sevs, key=["engine_lost", "in_flight",
+                                                 "unresolved_send",
                                                  "edited_after_response",
                                                  "staged", "unanswered"].index))
         self.assertEqual(sevs[0], "in_flight",
@@ -158,6 +159,38 @@ class SnapshotTest(unittest.TestCase):
                          "mid-flight can double-message someone — nothing else "
                          "outranks it")
         self.assertEqual(sevs[-1], "unanswered")
+
+    def test_a_mismatch_or_unproven_row_is_triage_not_a_side_count(self):
+        """Review round 2 (R2-3): a MISMATCH or UNPROVEN row can double-message someone like
+        an in-flight row, yet the page read ALL CLEAR over one — it was only a count in the
+        outbox tab. It ranks right after in_flight and names its state."""
+        conn = sqlite3.connect(self.outbox)
+        done = conn.execute("SELECT key FROM outbox WHERE state='COMMITTED'").fetchone()[0]
+        draft = conn.execute("SELECT key FROM outbox WHERE state='STAGED'").fetchone()[0]
+        conn.execute("UPDATE outbox SET state='MISMATCH' WHERE key=?", (done,))
+        conn.execute("UPDATE outbox SET state='UNPROVEN' WHERE key=?", (draft,))
+        conn.commit()
+        conn.close()
+        s = self.snap()
+        items = self.by_severity(s, "unresolved_send")
+        self.assertEqual(sorted(i["state"] for i in items), ["MISMATCH", "UNPROVEN"])
+        for i in items:
+            self.assertEqual(i["instance"], "team")
+            self.assertIn("settle it there", i["why"])
+        sevs = [i["severity"] for i in s["attention"]]
+        self.assertLess(sevs.index("in_flight"), sevs.index("unresolved_send"))
+        for later in ("edited_after_response", "staged", "unanswered"):
+            if later in sevs:
+                self.assertLess(sevs.index("unresolved_send"), sevs.index(later), later)
+        self.assertEqual(s["outbox"]["team"]["MISMATCH"], 1)
+        # settled by a human (round 3): kept, counted, no longer triage
+        conn = sqlite3.connect(self.outbox)
+        conn.execute("UPDATE outbox SET state='SETTLED' WHERE key=?", (draft,))
+        conn.commit()
+        conn.close()
+        s = self.snap()
+        self.assertEqual([i["state"] for i in self.by_severity(s, "unresolved_send")], ["MISMATCH"])
+        self.assertEqual(s["outbox"]["team"]["SETTLED"], 1)
 
     def test_in_flight_is_exactly_the_intent_and_sent_rows(self):
         """COMMITTED is done and STAGED is a different queue; surfacing either as a
@@ -252,6 +285,7 @@ class ParityViewTest(unittest.TestCase):
                          "it takes the top of the queue")
         self.assertIn("in_flight", sevs)
         self.assertEqual(sevs, sorted(sevs, key=["engine_lost", "in_flight",
+                                                 "unresolved_send",
                                                  "edited_after_response",
                                                  "staged", "unanswered"].index))
 
@@ -511,6 +545,56 @@ class HtmlTextTest(unittest.TestCase):
         self.assertEqual(out, "a[](https://x)<br>b")
 
 
+class ClosedByOthersTest(unittest.TestCase):
+    """ENH-31 B' (review S8): an ask closed by someone else's reply — in its thread, or
+    the next top-level message in a DM — is LISTED for a human to confirm, newest first,
+    and counted apart from answers sent from the surface; with no answerer list a
+    bystander's "+1" closes an ask too, so the operator must see which."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.journal = Path(self.tmp.name) / "journal.db"
+        j = Journal(self.journal)
+        j.record("C_TEAM", "1.0", sender_id="U1", text=ASK, kind="QUESTION")
+        j.record("D_SOMEONE", "2.0", sender_id="U1", text="is it up?", kind="QUESTION")
+        j.record("C_TEAM", "3.0", sender_id="U1", text="and the logs?", kind="QUESTION")
+        j.record("C_TEAM", "4.0", sender_id="U1", text="still open?", kind="QUESTION")
+        j.mark_responded("C_TEAM", "1.0", "thread-reply:1.5", at=10.0)
+        j.mark_responded("D_SOMEONE", "2.0", "dm-reply:2.5", at=20.0)
+        j.mark_responded("C_TEAM", "3.0", "ui:abcdef", at=30.0)         # sent from here
+        j.close()
+
+    def test_thread_and_dm_closures_are_listed_newest_first_and_counted_apart(self):
+        s = snapshot(self.journal, {})
+        self.assertEqual([(c["where"], c["ts"], c["response_key"]) for c in s["closed_by_others"]],
+                         [("D_SOMEONE", "2.0", "dm-reply:2.5"), ("C_TEAM", "1.0", "thread-reply:1.5")],
+                         "a Send from the surface is not 'someone else'; order is newest first")
+        self.assertEqual((s["journal"]["answered_by_thread"], s["journal"]["answered_by_dm"],
+                          s["journal"]["answered"]), (1, 1, 3))
+        self.assertEqual([a["ts"] for a in s["attention"] if a["severity"] == "unanswered"],
+                         ["4.0"])
+
+    def test_one_reply_closing_several_asks_is_flagged(self):
+        """Review N9: the F1 signature — and the sweep's by-design behaviour under one root
+        — is one response_key on several asks; the list must say so, counted over the
+        whole journal."""
+        j = Journal(self.journal)
+        j.record("C_TEAM", "5.0", sender_id="U2", text="me too — where?", kind="QUESTION")
+        j.mark_responded("C_TEAM", "5.0", "thread-reply:1.5", at=40.0)
+        j.close()
+        s = snapshot(self.journal, {})
+        by_ts = {c["ts"]: c for c in s["closed_by_others"]}
+        self.assertEqual(by_ts["5.0"]["also_closed"], 1)
+        self.assertEqual(by_ts["1.0"]["also_closed"], 1)
+        self.assertEqual(by_ts["2.0"]["also_closed"], 0)
+
+    def test_a_missing_journal_lists_nothing_and_stays_unknown(self):
+        s = snapshot(Path(self.tmp.name) / "absent.db", {})
+        self.assertEqual(s["closed_by_others"], [])
+        self.assertIsNone(s["journal"])
+
+
 class UnansweredIsAsksOnlyTest(unittest.TestCase):
     """The attention queue's UNANSWERED list is the open ASK backlog, not every row.
 
@@ -577,6 +661,26 @@ class UnansweredIsAsksOnlyTest(unittest.TestCase):
         _, counts = self.unanswered()
         self.assertEqual(counts["answered"], 2)
         self.assertEqual(counts["answered_by_thread"], 1)
+
+
+class NoDeployMenuTest(unittest.TestCase):
+    """The operator dashboard holds Slack credentials and renders journal text; Streamlit's
+    default toolbar offers "Deploy" to Community Cloud ("unlimited public apps") from inside
+    it — a public-publishing path (aws-do-agent UI review, CO-Deploy, 2026-10-13). The serve
+    script and the repo's Streamlit config both switch the toolbar to viewer mode, so a
+    deployment inherits one or the other. Configuration-level checks: the toolbar is rendered
+    client-side and never appears in the served HTML."""
+
+    def test_the_serve_script_and_the_config_disable_the_deploy_toolbar(self):
+        serve = (ROOT / "scripts" / "dashboard-serve.sh").read_text()
+        # the flag as an ARGUMENT line, not the comment that explains it
+        self.assertRegex(serve, r"(?m)^\s+--client\.toolbarMode viewer \\$",
+                         "the serve script leaves Streamlit's Deploy menu on")
+        config = (ROOT / ".streamlit" / "config.toml").read_text()
+        self.assertRegex(config, r'(?m)^\[client\]\ntoolbarMode = "viewer"$',
+                         "the repo config leaves Streamlit's Deploy menu on")
+        self.assertRegex(config, r"(?m)^gatherUsageStats = false$")
+        self.assertIn("--server.address 127.0.0.1", serve)
 
 
 if __name__ == "__main__":

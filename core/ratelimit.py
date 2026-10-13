@@ -38,7 +38,8 @@ class RateLimited(Exception):
         self.retry_after = _seconds(retry_after)
         self.instance = instance
         self.method = method
-        where = f" on {instance}/{method}" if instance or method else ""
+        bits = [str(b) for b in (instance, method) if b]
+        where = f" on {'/'.join(bits)}" if bits else ""      # never "None/method" (N4)
         super().__init__(f"rate limited{where}: retry after {self.retry_after}s")
 
 

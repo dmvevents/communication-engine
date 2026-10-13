@@ -65,10 +65,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.config import ConfigError, ensure_dirs, load, load_adapter_class  # noqa: E402
 from core.dashboard import html_text, open_ro, snapshot  # noqa: E402
+from core.delivery import NotPosted  # noqa: E402
 from core.journal import Journal  # noqa: E402
+from core.classify import ACTIONABLE_KINDS  # noqa: E402
 from core.outbox import (COMMITTED, DISCARDED, Outbox, PolicyError,  # noqa: E402
-                         ReleaseError, SENT, SendBlocked, STAGED, VERIFIED,
-                         thread_block_reason)
+                         MISMATCH, ReleaseError, SENT, SendBlocked, SETTLED, STAGED,
+                         UNPROVEN, VERIFIED, thread_block_reason)
 
 
 # ---- config, fresh at every action --------------------------------------------
@@ -110,6 +112,13 @@ def _placement_for(ch, adapter):
     an adapter that cannot thread, and the banner and the flash repeat it; (None, why)
     when neither placement is open, so no Reply is offered and the row says why."""
     tpol, cpol = _thread_scope_policy(ch), _channel_scope_policy(ch)
+    if ch.is_dm:
+        # ENH-31 guard 6: placement follows the human. A 1:1 DM is answered in the
+        # conversation, top-level — a thread inside a DM is where nobody looks
+        # (measured: 535 DM messages, 0 in-thread).
+        if cpol != "never":
+            return "top-level", "a direct message — replies post in the conversation, top-level"
+        return None, f"{ch.id} is a direct message whose reply_policy is 'never'"
     blocked = thread_block_reason(adapter)
     if tpol != "never" and blocked is None:
         return "thread", None
@@ -118,6 +127,36 @@ def _placement_for(ch, adapter):
     if cpol != "never":
         return "top-level", why
     return None, f"{ch.id} answers only in threads, and {why}"
+
+
+def _seen_ts_for(cfg, channel_id, thread, ask_ts=None):
+    """Guard 2's baseline: the newest platform ts this page SHOWED the human for the
+    conversation they are answering (review round 2, R2-5: the outbox's own fallback is
+    the platform's newest at staging time, which may be a message no page displayed).
+
+    A Reply is baselined on the ASK BEING ANSWERED, and nothing later: the page lists open
+    asks, never statements, so a "never mind" after the ask is unseen whether or not a newer
+    ask follows it (round 3 R3-4, round 4 R4-3 — taking the newest listed ask as the baseline
+    let a statement between two asks pass); a thread reply likewise on the ask itself, not
+    its root (round 3, R3-8). The click then refuses once, naming the newest later message,
+    and the acknowledgement covers exactly that. A free compose has no ask: the newest open
+    ask the page lists for the channel is the baseline, or None (the outbox falls back to the
+    platform) with no journal yet."""
+    if ask_ts is not None:
+        return str(ask_ts)
+    if thread is not None:
+        return str(thread)
+    if not Path(cfg.journal_path).is_file():
+        return None
+    conn = open_ro(cfg.journal_path)
+    try:
+        marks = ",".join("?" * len(ACTIONABLE_KINDS))
+        row = conn.execute(
+            f"SELECT ts FROM journal WHERE channel=? AND responded_at IS NULL AND kind IN ({marks}) "
+            "ORDER BY CAST(ts AS REAL) DESC LIMIT 1", (channel_id, *ACTIONABLE_KINDS)).fetchone()
+    finally:
+        conn.close()
+    return str(row[0]) if row else None
 
 
 def _adapter_for(cfg, inst):
@@ -149,7 +188,10 @@ def _outbox_for(cfg, inst, adapter):
     create the state it writes, so this is also where the config's directories are
     ensured (the same ensure_dirs the scheduler runs before its first write)."""
     ensure_dirs(cfg)
-    return Outbox(cfg.outbox_path_for(inst.name), adapter, inst.policies())
+    # ENH-31: the instance's marker travels with the outbox, so every guard the
+    # outbox runs (marker, size, redaction, re-read) runs on this surface's sends too.
+    return Outbox(cfg.outbox_path_for(inst.name), adapter, inst.policies(),
+                  marker=inst.send_marker)
 
 
 def _rows(outbox_path, states):
@@ -315,10 +357,10 @@ def _cancel_reply_clicked():
 def _stage_clicked():
     """Form submit — runs before the rerun, so the page the operator sees next shows
     the staged draft at the gate and no leftover reply banner."""
-    text = st.session_state.get("compose_text", "") or ""
+    text = (st.session_state.get("compose_text", "") or "").strip()
     where = st.session_state.get("compose_where")
     reply_to = st.session_state.get("reply_to")
-    if not text.strip():
+    if not text:
         _push_flash("error", "an empty draft stages nothing")
         return
     try:
@@ -355,6 +397,10 @@ def _stage_clicked():
         # draft the adapter cannot place (review D1) — the backstop for a connection
         # edited between that decision and this write.
         adapter = _adapter_for(cfg, inst)
+        # ENH-31 guard 1: the connection's marker is PART of the draft the human will
+        # approve — prepended here, shown on the card, verified again at the click.
+        if inst.send_marker and not text.startswith(inst.send_marker):
+            text = f"{inst.send_marker} {text}"
         if reply_to is not None:
             placement, why = _placement_for(ch, adapter)
             if placement is None:
@@ -364,7 +410,9 @@ def _stage_clicked():
                 return
             thread = _thread_root(cfg, ch.id, trigger) if placement == "thread" else None
         outbox = _outbox_for(cfg, inst, adapter)
-        res = outbox.stage(ch.id, trigger, text, thread_id=thread)
+        ask_ts = reply_to["ts"] if reply_to is not None else None
+        res = outbox.stage(ch.id, trigger, text, thread_id=thread,
+                           seen_ts=_seen_ts_for(cfg, ch.id, thread, ask_ts))
     except PolicyError as ex:
         _push_flash("error", f"refused: {ex}")
         return
@@ -386,6 +434,10 @@ def _stage_clicked():
             _tie_or_warn(cfg, proven.get(res["key"]), res["key"])
         finally:
             proven.close()
+    if res.get("re_read"):
+        _push_flash("success", f"re-read acknowledged: draft `{res['key'][:12]}…` is "
+                               "current again — the same text waits for your click below")
+        return
     if res.get("deduped"):
         _push_flash("warning", f"already known: `{res['key'][:12]}…` is {res['state']}")
         return
@@ -425,6 +477,14 @@ def _release_clicked(inst_name, key):
                                 f"`{res['receipt']}`; nothing was re-sent")
             _tie_or_warn(cfg, outbox.get(key), key)
             return
+        if res.get("unresolved"):
+            # A Send drawn while the row was STAGED, clicked after a recovery run parked
+            # it: nothing was sent, and saying "sent and proven" here would be the reverse
+            # of the truth (round 3, R3-6). The card below has the actions.
+            _push_flash("warning", f"nothing sent — this draft is parked as {res['state']}; "
+                                   "see its card below (settle it, or send again once you "
+                                   "have looked at the platform)")
+            return
         _push_flash("success", f"sent and proven: state {res['state']}, receipt "
                                f"`{res['receipt']}`")
         if res.get("receipt") and res["state"] in (COMMITTED, VERIFIED):
@@ -435,11 +495,23 @@ def _release_clicked(inst_name, key):
         # After SENT is durable a failed read-back is NOT a refusal: the message may
         # well be on the platform, and "refused" would invite a second one.
         state = outbox.get(key)["state"] if outbox is not None else "?"
-        if state in (SENT, VERIFIED):
+        if state == MISMATCH:
+            # ENH-31 guard 3: the message is on the platform with text that is not the
+            # approved text. Nothing more will be sent; a human must look.
+            _push_flash("error", f"delivered with DIFFERENT text (state {state}): {ex} — "
+                                 "nothing more will be sent; the card below needs a human")
+        elif state in (SENT, VERIFIED):
             _push_flash("warning", f"SENT but delivery unproven (state {state}): {ex} — "
                                    "do NOT re-send; run Outbox.recover()")
         else:
             _push_flash("error", f"refused: {ex}")
+    except NotPosted as ex:
+        # The platform ANSWERED the post with a refusal (the bot is not in the channel,
+        # the channel is archived, the text is too long for it): nothing was posted, and
+        # the outbox handed the draft back to the gate (review round 2, R2-8).
+        state = outbox.get(key)["state"] if outbox is not None else "?"
+        _push_flash("error", f"the platform refused the post — {ex}; nothing was posted, "
+                             f"the draft is {state} again: fix the cause, then Send or Discard")
     except Exception as ex:  # noqa: BLE001 — the page must say what the row is now
         state = "?"
         if outbox is not None:
@@ -447,6 +519,82 @@ def _release_clicked(inst_name, key):
             state = row["state"] if row is not None else "?"
         _push_flash("error", f"{type(ex).__name__}: {ex} — row state is now {state}; "
                              "nothing else changed")
+    finally:
+        if outbox is not None:
+            outbox.close()
+
+
+def _reapprove_clicked(inst_name, key):
+    """The card's "send again" on an UNPROVEN row: the human has looked at the platform and
+    the reply is not there. One more post, through the same guards — an explicit second
+    approval, never a stale Send (round 3, R3-5 / R3-7)."""
+    try:
+        cfg = _fresh_cfg()
+    except ConfigError as ex:
+        _push_flash("error", f"settings refused: {ex} — nothing sent")
+        return
+    inst = _instance(cfg, inst_name)
+    if inst is None:
+        _push_flash("error", f"connection {inst_name} no longer exists in settings.json "
+                             "— nothing sent")
+        return
+    outbox = None
+    try:
+        outbox = _outbox_for(cfg, inst, _adapter_for(cfg, inst))
+        res = outbox.release(key, reapprove=True)
+        if res.get("unresolved") or res.get("in_flight"):
+            _push_flash("warning", f"nothing sent — the row is {res['state']} now")
+            return
+        _push_flash("success", f"sent again and proven: state {res['state']}, receipt "
+                               f"`{res['receipt']}`")
+        if res.get("receipt") and res["state"] in (COMMITTED, VERIFIED):
+            _tie_or_warn(cfg, outbox.get(key), key)
+    except (PolicyError, ReleaseError) as ex:
+        _push_flash("error", f"refused: {ex}")
+    except Exception as ex:  # noqa: BLE001 — the page must say what the row is now
+        state = "?"
+        if outbox is not None:
+            row = outbox.get(key)
+            state = row["state"] if row is not None else "?"
+        _push_flash("error", f"{type(ex).__name__}: {ex} — row state is now {state}")
+    finally:
+        if outbox is not None:
+            outbox.close()
+
+
+def _settle_clicked(inst_name, key, delivered):
+    """The card's two "settled" buttons: the human looked at the platform and either found
+    the reply THERE (`delivered`: the ask is tied to this row, as a proven send would have
+    tied it) or decided it is NOT needed (the ask is closed as such, under a key that says
+    so). Either way the row is kept as SETTLED and leaves triage, and the ask leaves the
+    unanswered queue on the human's decision — settling the row alone left the ask open,
+    its owed work escalating and its Reply still offered (round 3 R3-7, round 4 R4-5). Needs
+    no adapter."""
+    try:
+        cfg = _fresh_cfg()
+    except ConfigError as ex:
+        _push_flash("error", f"settings refused: {ex} — nothing changed")
+        return
+    inst = _instance(cfg, inst_name)
+    if inst is None:
+        _push_flash("error", f"connection {inst_name} no longer exists in settings.json "
+                             "— nothing changed")
+        return
+    outbox = None
+    try:
+        outbox = _outbox_for(cfg, inst, _NoAdapter())
+        res = outbox.settle(key, delivered=delivered)
+        row = outbox.get(key)
+        tied = _tie_or_warn(cfg, row, key if delivered else f"settled-not-needed:{key}")
+        what = ("the reply is on the platform — the ask is recorded as answered by it"
+                if delivered else "not needed — the ask is closed as such")
+        _push_flash("success", f"settled ({what}); kept in the outbox as {res['state']}, no "
+                               f"longer listed; nothing was sent"
+                               + ("" if tied is None else f"; ask {tied} closed"))
+    except ReleaseError as ex:
+        _push_flash("error", f"refused: {ex}")
+    except Exception as ex:  # noqa: BLE001
+        _push_flash("error", f"{type(ex).__name__}: {ex} — nothing changed")
     finally:
         if outbox is not None:
             outbox.close()
@@ -573,6 +721,11 @@ def render(cfg):
                 st.caption(f"stage to: **{html.escape(reply_to['channel'])}** — in reply "
                            f"to ts {html.escape(reply_to['ts'])}")
             st.text_area("message", height=100, key="compose_text")
+            markers = sorted({inst.send_marker for inst in cfg.instances if inst.send_marker})
+            if markers:
+                st.caption("messages from a connection with a `send_marker` are prefixed "
+                           f"with it when staged ({', '.join(f'`{m}`' for m in markers)}) — "
+                           "the card below shows the exact text a Send would post")
             st.form_submit_button("Stage draft", on_click=_stage_clicked)
 
     # ---- the gate: staged drafts, one click each ----------------------------
@@ -581,7 +734,8 @@ def render(cfg):
     for inst in cfg.instances:
         outbox_path = cfg.outbox_path_for(inst.name)
         drafts = _rows(outbox_path, (STAGED,))
-        if not drafts:
+        mismatched = _rows(outbox_path, (MISMATCH, UNPROVEN))
+        if not drafts and not mismatched:
             continue
         # Send is offered only where the adapter can deliver: a click on a draft whose
         # adapter has no send() used to flip the row to INTENT and crash — a wedge no
@@ -629,6 +783,45 @@ def render(cfg):
                                on_click=_release_clicked, args=(inst.name, row["key"]))
             reject.button("Discard", key=f"discard-{row['key']}",
                           on_click=_discard_clicked, args=(inst.name, row["key"]))
+        # ENH-31 guard 3: rows the platform holds with text that is not the approved
+        # text (MISMATCH), and rows recovery could not settle — re-sent once and still
+        # unprovable, or a read-back that keeps failing (UNPROVEN, round 2 R2-6). Terminal
+        # until a human acts — no Send, no Discard; the card says what to do.
+        for row in mismatched:
+            any_staged = True
+            if row["state"] == MISMATCH:
+                why = ("delivered with DIFFERENT text — the platform shows a message carrying "
+                       "this draft's key whose text is not the text above. Nothing more will "
+                       "be sent and nothing is recorded as answered; compare the two on the "
+                       "platform, then edit or delete there. Needs a human.")
+            else:
+                why = ("UNPROVEN — recovery could not settle this approved text: the platform "
+                       "showed no message carrying its key on the run after its one re-send, "
+                       "or the target is gone, or an unproven post could not be re-sent. "
+                       "Nothing more is sent by itself and nothing is recorded as answered. "
+                       "Look for the text above on the platform: if it is there, settle it as "
+                       "delivered (the ask is then answered by it); if it is not needed, settle "
+                       "it as not needed (the ask is closed); if it is not there and still "
+                       "needed, send it again — that click counts as your re-read. Needs a "
+                       "human.")
+            st.markdown(
+                "<div style='border:1px solid rgba(128,128,128,.3);border-left:"
+                "3px solid #8f1d1d;border-radius:8px;padding:10px 14px;margin:2px 0'>"
+                f"<b>{html.escape(row['state'])}</b> · {html.escape(row['target'])} · instance "
+                f"{html.escape(inst.name)} · key <code>{html.escape(row['key'][:12])}…</code>"
+                "<div style='font-size:.9rem;margin-top:4px'>approved text: "
+                f"{html_text(row['text'])}</div>"
+                f"<div style='color:#8f1d1d;font-size:.85rem;margin-top:4px'>{why}</div></div>",
+                unsafe_allow_html=True)
+            again, there, gone = st.columns([1, 1, 1])
+            if row["state"] == UNPROVEN and inst_no_send is None:
+                again.button("Send again (I looked; it is not there)",
+                             key=f"reapprove-{row['key']}", on_click=_reapprove_clicked,
+                             args=(inst.name, row["key"]))
+            there.button("Settled: the reply is there", key=f"settle-delivered-{row['key']}",
+                         on_click=_settle_clicked, args=(inst.name, row["key"], True))
+            gone.button("Settled: not needed", key=f"settle-notneeded-{row['key']}",
+                        on_click=_settle_clicked, args=(inst.name, row["key"], False))
     if not any_staged:
         st.markdown("_no drafts at the gate_")
 

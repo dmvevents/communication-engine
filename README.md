@@ -14,14 +14,15 @@ directions). Adapters live one directory per platform, all implementing
 | Adapter | State |
 |---|---|
 | `fake` | in-memory contract adapter — drives the quickstart dry-run and the fault-injection tests |
-| `slack` | read-only Web API polling (poll / replies / resolve / health) — thread replies are fetched for open asks so an in-thread answer closes them; no send path at any layer |
+| `slack` | Web API polling (poll / replies / resolve / health) — thread replies are fetched for open asks so an in-thread answer closes them; since ENH-31 a send path too, `chat.postMessage` only, reachable only through `core/outbox.py` at policy `staged` (a human click; `direct` is refused), behind the marker / re-read / read-back / size / redaction guards, and authorized for the aws-do-agent harness's bot token only — a token granted read-only still never writes, because its channels' policy stays `never` |
 | `slack_socket` | Socket Mode push ingestion — read-only, legitimized by a continuous push-vs-poll parity watch |
 | `telegram` | read-only bot-API polling — the first non-Slack platform; no history API upstream, so one destructive read per poll at the committed cursor, one chat per instance, no send path at any layer |
 | `email` | read-only IMAP polling (Outlook or any RFC-3501 server) — identity is the Message-ID (a non-orderable string, which store and parity handle end to end), ordering is mailbox UID order, threading from References/In-Reply-To; every select is EXAMINE and every fetch BODY.PEEK, so polling never marks mail seen |
 
 What does NOT ship is listed where an adopter acts: the quickstart's honest-limits section.
-Notably there is no live send path (the outbox ladder is complete, but only the `fake`
-adapter exposes `send()`) and `watchers/` is a stub. A reference scheduler ships
+The one live send path is the Slack adapter's `chat.postMessage`, behind `core/outbox.py` at
+policy `staged` — a human click on the write surface (ENH-31) — for a bot token only; every
+other adapter is read-only, and `watchers/` is a stub. A reference scheduler ships
 (`scripts/scheduler.py`): a guarded, read-only probe → classify → journal → route → owed
 loop you run under your own supervisor. An operator dashboard ships too
 (`scripts/dashboard.py` over `core/dashboard.py`): a read-only, loopback-only Streamlit

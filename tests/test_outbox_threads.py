@@ -133,8 +133,9 @@ class ThreadSendTest(Harness):
         with self.assertRaises(_Crash):
             self.box().send(TARGET, TS, TEXT, thread_id=THREAD, _crash_at="after_intent")
         v1 = V1Adapter()
-        with self.assertRaises(SendBlocked):
-            self.box(adapter=v1).recover()
+        counts = self.box(adapter=v1).recover()        # per-row isolation (ENH-31 F7):
+        self.assertEqual(len(counts["errors"]), 1)     # recorded, the run goes on
+        self.assertIn("cannot place a reply in thread", counts["errors"][0][1])
         self.assertEqual(v1.delivered, [],
                          "recovery flattened a thread reply into the main channel")
         row = self.box(adapter=v1).get(idempotency_key(TARGET, TS, TEXT, THREAD))
