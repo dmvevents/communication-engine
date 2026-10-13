@@ -384,7 +384,8 @@ class ThreadPlacementRefusalTest(unittest.TestCase):
         box = self.box()
         with self.assertRaises(ReleaseError) as cm:
             box.release(key)
-        self.assertIn("cannot place a reply in thread", str(cm.exception))
+        self.assertIn("adapter NoThreadsAdapter cannot place a reply in thread",
+                      str(cm.exception), "a test double is named by its class")
         self.assertEqual(box.get(key)["state"], STAGED,
                          "the refused thread draft left STAGED — wedged in INTENT, "
                          "undiscardable, and unrecoverable with the same adapter")

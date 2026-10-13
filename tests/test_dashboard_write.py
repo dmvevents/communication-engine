@@ -706,6 +706,31 @@ class WriteSurfaceReviewTest(_WriteSurfaceBase):
         self.assertIsNotNone(self.journal_row("C_BOTH", "3.0")[0],
                              "the top-level reply did not tie the ask")
 
+    def test_a_thread_draft_whose_adapter_was_swapped_is_refused_at_the_click_by_name(self):
+        """Send was rendered while the connection's adapter could thread; the adapter was
+        edited to one that cannot before the click. The click re-decides on fresh config
+        (B2) and refuses BEFORE the flip, naming the adapter by its channels/ directory —
+        "adapter nothread", not "adapter Adapter" (review F10/R2-9)."""
+        self.use_nothread_base()
+        settings = self.base / "settings.json"
+        nothread = settings.read_text()
+        settings.write_text(nothread.replace('"adapter": "nothread"', '"adapter": "fake"'))
+        (self.base / "state").mkdir(exist_ok=True)
+        capable = load_adapter_class(self.base / "channels", "fake")()
+        ob = Outbox(self.base / "state" / "outbox-team.db", capable, {"C_BOTH": "staged"})
+        ob.stage("C_BOTH", "1.0", "staged while the connection could thread", thread_id="1.0")
+        ob.close()
+        at = self.run_app()
+        send = self.buttons(at, "send-")
+        self.assertEqual(len(send), 1, "Send must be offered while the adapter can thread")
+        settings.write_text(nothread)                   # the connection cannot thread now
+        at = send[0].click().run()
+        self.assertFalse(at.exception)
+        errors = "\n".join(str(e.value) for e in at.error)
+        self.assertIn("adapter nothread cannot place a reply in thread 1.0", errors)
+        self.assertIn("the draft stays STAGED", errors)
+        self.assertEqual(self.rows()[0]["state"], "STAGED")
+
     def test_send_is_not_offered_on_a_thread_draft_the_adapter_cannot_place(self):
         """A thread draft staged while the connection could thread, before its adapter
         was edited (ENH-29 allows that): B3's rule on the thread dimension — Send is

@@ -2715,6 +2715,22 @@ run_mutation "schedule: the sweep window commits before the fetched replies are 
   "('                    fresh += self._journal_and_route(ch, swept[\"replies\"], src)\n                    self.store.sweep_start_set(src.name, ch, swept[\"next_start\"])', '                    self.store.sweep_start_set(src.name, ch, swept[\"next_start\"])\n                    fresh += self._journal_and_route(ch, swept[\"replies\"], src)')" \
   "test_schedule"
 
+# round 2 delta review, R2-8/R2-9: the durable order under a config edit, and the adapter's name.
+run_mutation "schedule: a channel added to the config never joins the saved sweep order" \
+  "core/schedule.py" \
+  "('                + [c for c in src.channels if c not in saved])', '                + [])')" \
+  "test_schedule"
+
+run_mutation "schedule: a channel removed from the config stays in the saved sweep order" \
+  "core/schedule.py" \
+  "('        return ([c for c in saved if c in src.channels]', '        return (list(saved)')" \
+  "test_schedule"
+
+run_mutation "outbox: the refusal names the adapter class, not its channels/ directory" \
+  "core/outbox.py" \
+  "('    return module[len(prefix):] if module.startswith(prefix) else type(adapter).__name__', '    return type(adapter).__name__')" \
+  "test_dashboard_write"
+
 run_mutation "scheduler: the SKIPPED line is never printed" \
   "scripts/scheduler.py" \
   "('    for ch, why in summary[\"sweep_skipped\"]:', '    for ch, why in []:')" \

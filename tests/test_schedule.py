@@ -969,6 +969,26 @@ class ThreadSweepCycleTest(SchedulerHarness):
         self.assertEqual(self.store.sweep_start_get("inst", "C1"), before,
                          "the window moved past a reply that never reached the journal")
 
+    def test_a_config_edit_between_runs_adds_the_new_channel_and_drops_the_removed_one(self):
+        """The order is durable now, so editing settings.json between `--once` runs is a
+        routine path (ENH-29 makes it a click). A channel added to the config must join
+        the saved order — or its in-thread answers never close its asks, silently — and
+        a channel removed from it must leave — or the engine keeps calling the platform
+        for a channel it was told to stop watching (review R2-8)."""
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg("A", f"{i}.0", f"item {i}?") for i in range(1, 31)]
+                     + [msg("B", f"{i}.0", f"ticket {i}?") for i in range(101, 131)]
+                     + [msg("N", "500.0", "where is the dashboard?")])
+        self.scheduler(adapter, channels=("A", "B")).cycle()        # run 1 watched A, B
+        self.assertEqual(self.store.sweep_order_get("inst"), ["B", "A"])
+        before = len(adapter.sweep_log)
+        for _ in range(3):                                           # settings.json edited
+            self.scheduler(adapter, channels=("B", "N")).cycle()
+        swept = {c for c, _ in adapter.sweep_log[before:]}
+        self.assertIn("N", swept, "a channel added to the config was never swept")
+        self.assertNotIn("A", swept, "a channel removed from the config was still swept")
+        self.assertEqual(set(self.store.sweep_order_get("inst")), {"B", "N"})
+
     def test_a_channel_with_nothing_to_sweep_is_not_named_skipped(self):
         """SKIPPED names a channel left behind. One with no open ask owes no sweep, so a
         429 that stops the sweep before it is not its story (review F4)."""
