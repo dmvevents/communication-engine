@@ -306,6 +306,27 @@ class SendTest(SlackAdapterTestCase):
                     a.send("C_ONE", "[AGENT] x", key="k1")
                 self.assertNotIsInstance(cm.exception, NotPosted)
 
+    def test_a_5xx_with_a_json_body_or_no_error_code_may_have_landed(self):
+        """Review round 5 (R5-2): a 502 whose body is JSON ({"message": "Bad Gateway"}) reads
+        as the ok:false default "unknown_error"; judged by the error string alone it looked
+        like a definite refusal, and recovery handed a landed re-send back to the gate. The
+        HTTP status rides the error, and any 5xx or missing error code may have landed."""
+        from core.delivery import NotPosted
+        cases = (((502, {}, {"message": "Bad Gateway"}), True),
+                 ((503, {}, {"ok": False, "error": "service_unavailable"}), True),
+                 ((200, {}, {"ok": False}), True),                       # no error code at all
+                 ((200, {}, {"ok": False, "error": "org_login_required"}), False),
+                 ((500, {}, "<html>oops</html>"), True))
+        for answer, expected in cases:
+            with self.subTest(answer=answer):
+                a = self.make([answer])
+                with self.assertRaises(self.mod.ApiError) as cm:
+                    a.send("C_ONE", "[AGENT] x", key="k1")
+                self.assertNotIsInstance(cm.exception, NotPosted)
+                self.assertEqual(cm.exception.status, answer[0])
+                self.assertEqual(getattr(cm.exception, "may_have_landed", None), expected,
+                                 f"{answer[0]} {answer[2]!r}")
+
     def test_a_gone_target_on_read_back_is_target_gone_and_an_outage_is_not(self):
         """Review round 3 (R3-5): thread_not_found / is_archived mean the reply can never be
         placed — recovery parks on them; anything else is transient, channel_not_found

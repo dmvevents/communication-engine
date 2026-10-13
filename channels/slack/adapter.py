@@ -136,11 +136,14 @@ _USER_ID = re.compile(r"[UW][A-Z0-9]{6,}")
 
 class ApiError(RuntimeError):
     """Slack answered but the call failed (ok:false, or an unusable response body).
-    Carries method + error code and never the token."""
+    Carries method + error code + the HTTP status (round 5, R5-2: a 5xx whose body happens
+    to be JSON read as the ok:false default "unknown_error", and the error STRING alone
+    cannot tell that from a definite refusal) and never the token."""
 
-    def __init__(self, method: str, error: str):
+    def __init__(self, method: str, error: str, status: int | None = None):
         self.method = method
         self.error = error
+        self.status = status
         super().__init__(f"{method} failed: {error}")
 
 
@@ -268,8 +271,13 @@ class Adapter:
             # that recovery, once a read-back has proven the key absent, can hand the row
             # back instead of retrying it forever (round 4, R4-1); at the CLICK, where
             # nothing is known yet, it still stays in flight.
+            # A 5xx of any body shape, a non-JSON answer, or an ok:false carrying no error
+            # code at all ("unknown_error") says nothing about whether the post landed
+            # (round 5, R5-2: a 502 with a JSON body read as a definite refusal).
             ex.may_have_landed = (ex.error in AMBIGUOUS_POST_ANSWERS
-                                  or ex.error.startswith("HTTP "))
+                                  or ex.error.startswith("HTTP ")
+                                  or ex.error == "unknown_error"
+                                  or (ex.status or 0) >= 500)
             raise
         ts = payload.get("ts")
         if not ts:
@@ -432,9 +440,9 @@ class Adapter:
             self._holds[method] = self._clock() + ex.retry_after
             raise ex
         if not payload:
-            raise ApiError(method, f"HTTP {status} with a non-JSON body")
+            raise ApiError(method, f"HTTP {status} with a non-JSON body", status=status)
         if not payload.get("ok"):
-            raise ApiError(method, payload.get("error", "unknown_error"))
+            raise ApiError(method, payload.get("error", "unknown_error"), status=status)
         return payload
 
     def _urllib_http(self, url, form, timeout):

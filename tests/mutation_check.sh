@@ -43,8 +43,12 @@ PY
     FAIL=$((FAIL+1)); rm -rf "$tmp"; return
   fi
 
-  # The suite MUST fail now. Inverted logic on purpose.
-  if (cd "$tmp" && python3 -m unittest "tests.$mod" >/dev/null 2>&1); then
+  # The suite MUST fail now. Inverted logic on purpose. The sandbox's own copy of the
+  # loopback-only network guard is loaded for every run, so the gate's verdict does not
+  # depend on the caller's environment (review round 5, R5-3: the guard's entries were
+  # caught only under the documented PYTHONPATH).
+  if (cd "$tmp" && PYTHONPATH="$tmp/tests/netguard${PYTHONPATH:+:$PYTHONPATH}" \
+        python3 -m unittest "tests.$mod" >/dev/null 2>&1); then
     echo "  [SURVIVED] $label — suite still GREEN with the property removed. Test has no teeth."
     FAIL=$((FAIL+1))
   else
@@ -3390,7 +3394,7 @@ run_mutation "outbox: a refusal the allowlist did not know is retried forever af
 
 run_mutation "slack: an unlisted refusal of the post is marked as possibly landed" \
   "channels/slack/adapter.py" \
-  "('            ex.may_have_landed = (ex.error in AMBIGUOUS_POST_ANSWERS\\n                                  or ex.error.startswith(\"HTTP \"))', '            ex.may_have_landed = True')" \
+  "('            ex.may_have_landed = (ex.error in AMBIGUOUS_POST_ANSWERS\\n                                  or ex.error.startswith(\"HTTP \")\\n                                  or ex.error == \"unknown_error\"\\n                                  or (ex.status or 0) >= 500)', '            ex.may_have_landed = True')" \
   "test_slack_send"
 
 run_mutation "outbox: send again runs the re-read that can only name our own post" \
@@ -3427,6 +3431,17 @@ run_mutation "netguard: an empty host on bind (every interface) is loopback agai
   "tests/netguard/sitecustomize.py" \
   "('LOOPBACK = {\"127.0.0.1\", \"::1\", \"localhost\"}', 'LOOPBACK = {\"127.0.0.1\", \"::1\", \"localhost\", \"\"}')" \
   "test_netguard"
+
+# ---- ENH-31 review round 5 (R5-2) ----
+run_mutation "slack: a 5xx with a JSON body reads as a definite refusal again" \
+  "channels/slack/adapter.py" \
+  "('                                  or ex.error == \"unknown_error\"\\n                                  or (ex.status or 0) >= 500)', '                                  )')" \
+  "test_slack_adapter"
+
+run_mutation "slack: the HTTP status is dropped from an ok:false error" \
+  "channels/slack/adapter.py" \
+  "('            raise ApiError(method, payload.get(\"error\", \"unknown_error\"), status=status)', '            raise ApiError(method, payload.get(\"error\", \"unknown_error\"))')" \
+  "test_slack_adapter"
 
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
