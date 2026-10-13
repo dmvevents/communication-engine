@@ -640,9 +640,11 @@ class HistoryOnlyFake:
         root = Path(__file__).resolve().parent.parent
         self.inner = load_adapter_class(root / "channels", "fake")()
         self.explode_on = None          # a platform error for this thread
+        self.dead = set()               # roots the platform refuses (deleted asks)
         self.rate_limit_after = None    # RateLimited after N replies() calls
         self.calls = 0
         self.roots_swept = set()
+        self.sweep_log = []             # (channel, root) in call order
 
     def seed(self, messages):
         self.inner.seed(messages)
@@ -654,10 +656,12 @@ class HistoryOnlyFake:
     def replies(self, channel_id, thread_ts, oldest=None):
         self.calls += 1
         self.roots_swept.add(thread_ts)
+        self.sweep_log.append((channel_id, thread_ts))
         if self.rate_limit_after is not None and self.calls > self.rate_limit_after:
             from core.ratelimit import RateLimited
             raise RateLimited("5", method="conversations.replies")
-        if self.explode_on is not None and thread_ts == self.explode_on:
+        if thread_ts in self.dead or (
+                self.explode_on is not None and thread_ts == self.explode_on):
             raise RuntimeError("conversations.replies failed: thread_not_found")
         return self.inner.replies(channel_id, thread_ts, oldest=oldest)
 
@@ -744,10 +748,17 @@ class ThreadSweepCycleTest(SchedulerHarness):
         adapter.seed([msg("C1", "1.0", "q1?"), msg("C1", "2.0", "q2?"),
                       msg("C2", "3.0", "q3?")])
         adapter.rate_limit_after = 1
-        summary = self.scheduler(adapter, channels=("C1", "C2")).cycle()
+        sched = self.scheduler(adapter, channels=("C1", "C2"))
+        summary = sched.cycle()
         self.assertEqual(adapter.calls, 2, "after a 429 the same method was called again "
                                            "in the same cycle")
         self.assertEqual(summary["polled"], 3, "polling must go on after a sweep 429")
+        self.assertEqual(summary["sweep_skipped"], [("C2", "rate-limited")],
+                         "the channel the 429 left unswept was not named, with its cause")
+        adapter.rate_limit_after = None
+        sched.cycle()
+        self.assertEqual(adapter.sweep_log[2][0], "C2",
+                         "the channel skipped last cycle must be swept FIRST this cycle")
 
     def test_older_asks_are_swept_on_later_cycles(self):
         from core.threads import SWEEP_MAX
@@ -777,6 +788,232 @@ class ThreadSweepCycleTest(SchedulerHarness):
         summary = self.scheduler(adapter).cycle()
         self.assertEqual(summary["answered"], 0)
         self.assertEqual(summary["fresh"], 1)
+
+    def test_a_backlog_in_the_first_channel_does_not_starve_the_second(self):
+        """Review D2: the source's one budget was spent in CONFIG order, so a first
+        channel with 25 open roots (a normal support backlog) left every later channel
+        unswept, every cycle, with nothing in the summary — the ENH-30 symptom itself
+        for channel 2 onward. One call is now reserved for every channel still
+        waiting: the backlog channel takes the bulk, never the whole budget."""
+        from core.threads import SWEEP_MAX
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg("C1", f"{i}.0", f"can you check item {i}?")
+                      for i in range(1, SWEEP_MAX + 2)]
+                     + [msg("C2", "100.0", "where is the dashboard?")])
+        sched = self.scheduler(adapter, channels=("C1", "C2"))
+        first = sched.cycle()
+        self.assertEqual(first["sweep_skipped"], [],
+                         "a channel went unswept although a call could be reserved for it")
+        adapter.seed([msg("C2", "101.0", "here: http://127.0.0.1:8502",
+                          sender_id="B_AGENT", thread_id="100.0")])
+        summary = sched.cycle()
+        self.assertEqual(summary["sweep_skipped"], [])
+        self.assertIsNotNone(self.journal.get("C2", "100.0")["responded_at"],
+                             "C2's in-thread answer never closed its ask: the first "
+                             "channel's backlog ate the whole budget")
+        self.assertEqual(summary["sweep_truncated"], ["C1"],
+                         "the backlog channel still takes the bulk, and still says it is "
+                         "not finished")
+
+    def test_two_backlog_channels_take_turns_and_a_small_third_is_swept_every_cycle(self):
+        """The reservation alone would hand ONE backlog channel the bulk forever (23 of
+        25 calls, the other getting 1): the channel swept first moves to the back of
+        the order, so the bulk alternates — and a small channel behind both backlogs
+        is still swept every cycle."""
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg("C1", f"{i}.0", f"item {i}?") for i in range(1, 31)]
+                     + [msg("C2", f"{i}.0", f"ticket {i}?") for i in range(101, 131)]
+                     + [msg("C3", "500.0", "where is the dashboard?")])
+        sched = self.scheduler(adapter, channels=("C1", "C2", "C3"))
+        sched.cycle()
+        adapter.seed([msg("C3", "501.0", "here: http://127.0.0.1:8502",
+                          sender_id="B_AGENT", thread_id="500.0")])
+        second = sched.cycle()
+        self.assertIsNotNone(self.journal.get("C3", "500.0")["responded_at"],
+                             "the small channel behind two backlogs was never swept")
+        self.assertEqual(second["sweep_skipped"], [])
+        sched.cycle()
+        c1 = {r for r in adapter.roots_swept if float(r) < 100}
+        c2 = {r for r in adapter.roots_swept if 100 < float(r) < 500}
+        self.assertGreaterEqual(len(c1), 20, f"C1 never had the bulk: {len(c1)} roots")
+        self.assertGreaterEqual(len(c2), 20, f"C2 never had the bulk: {len(c2)} roots")
+
+    def test_the_bulk_alternates_even_with_a_small_channel_in_the_rotation(self):
+        """Rotating position 0 let a small channel's turn hand the bulk straight back to
+        the same backlog channel (A 94 calls vs B 50 over 6 cycles, review F3). The
+        channel that SPENT the most goes to the back, so two backlogs share the bulk."""
+        from collections import Counter
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg("A", f"{i}.0", f"item {i}?") for i in range(1, 41)]
+                     + [msg("B", f"{i}.0", f"ticket {i}?") for i in range(101, 141)]
+                     + [msg("S", "501.0", "where is the dashboard?")])
+        sched = self.scheduler(adapter, channels=("A", "B", "S"))
+        for _ in range(6):
+            sched.cycle()
+        calls = Counter(c for c, _ in adapter.sweep_log)
+        self.assertLessEqual(abs(calls["A"] - calls["B"]), 2,
+                             f"the bulk is not shared: A={calls['A']} B={calls['B']}")
+        self.assertEqual(calls["S"], 6, "the small channel was not swept every cycle")
+
+    def test_the_sweep_window_and_order_survive_a_restart_the_cron_deployment(self):
+        """`scheduler.py --once` (the documented cron mode) builds a NEW Scheduler per
+        run over the same state. An in-memory window restarted at the newest asks on
+        every run: a backlog channel took the bulk, the one call reserved for the next
+        channel always went to its NEWEST ask, and the asks behind it were never swept
+        (independent review F1). The window and the order live in the store now."""
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg("A", f"{i}.0", f"item {i}?") for i in range(1, 31)]
+                     + [msg("B", f"{i}.0", f"ticket {i}?") for i in range(101, 106)])
+        self.scheduler(adapter, channels=("A", "B")).cycle()            # run 1
+        adapter.seed([msg("B", "200.0", "done, see the runbook", sender_id="B_AGENT",
+                          thread_id="101.0")])                           # B's OLDEST ask
+        for _ in range(6):                                               # six more runs
+            self.scheduler(adapter, channels=("A", "B")).cycle()
+        self.assertIsNotNone(self.journal.get("B", "101.0")["responded_at"],
+                             "B's oldest ask was never swept across runs: the window "
+                             "restarted at B's newest ask every run")
+
+    def test_more_channels_than_calls_the_tail_is_swept_next_run_even_across_a_restart(self):
+        """27 channels, one open ask each, 25 calls: the last two cannot be reached in one
+        cycle. They are named SKIPPED (budget), swept FIRST next cycle — also when that
+        cycle is a new process (durable order) — and every ask is swept within two
+        cycles, so the floor of one call per channel is load-bearing (review G3/G4/G7)."""
+        from core.threads import SWEEP_MAX
+        chans = tuple(f"K{i:02d}" for i in range(SWEEP_MAX + 2))
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg(c, f"{1000 * (i + 1)}.0", f"item {i}?")
+                      for i, c in enumerate(chans)])
+        first = self.scheduler(adapter, channels=chans).cycle()
+        self.assertEqual(first["sweep_skipped"],
+                         [(chans[-2], "budget"), (chans[-1], "budget")])
+        adapter.seed([msg(c, f"{1000 * (i + 1) + 1}.0", "answered", sender_id="B_AGENT",
+                          thread_id=f"{1000 * (i + 1)}.0") for i, c in enumerate(chans)])
+        before = len(adapter.sweep_log)
+        self.scheduler(adapter, channels=chans).cycle()                  # a new process
+        self.assertEqual([c for c, _ in adapter.sweep_log[before:before + 2]],
+                         [chans[-2], chans[-1]],
+                         "the channels skipped last run were not swept first this run")
+        self.scheduler(adapter, channels=chans).cycle()
+        still_open = [c for i, c in enumerate(chans)
+                      if self.journal.get(c, f"{1000 * (i + 1)}.0")["responded_at"] is None]
+        self.assertEqual(still_open, [], "asks left unswept after two full cycles")
+
+    def test_errored_thread_fetches_are_charged_against_the_budget(self):
+        """A refused fetch (a deleted ask: thread_not_found, forever) costs the platform
+        a call like any other. Charged nothing, an all-errors channel let the next one
+        spend a second full budget: 49 calls on one adapter in one cycle (review F2)."""
+        from core.threads import SWEEP_MAX
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg("A", f"{i}.0", f"item {i}?") for i in range(1, 31)]
+                     + [msg("B", f"{i}.0", f"ticket {i}?") for i in range(101, 131)])
+        adapter.dead = {f"{i}.0" for i in range(1, 31)}
+        summary = self.scheduler(adapter, channels=("A", "B")).cycle()
+        self.assertLessEqual(adapter.calls, SWEEP_MAX,
+                             f"{adapter.calls} replies() calls in one cycle on one adapter")
+        self.assertTrue(summary["sweep_errors"], "the refused fetches were not reported")
+
+    def test_sweep_reports_every_attempted_call(self):
+        from core import threads
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg("C1", "1.0", "q1?"), msg("C1", "2.0", "q2?"),
+                      msg("C1", "3.0", "q3?")])
+        self.scheduler(adapter).cycle()                 # journals the asks
+        adapter.dead = {"2.0"}
+        res = threads.sweep(adapter, self.store, self.journal, "C1")
+        self.assertEqual((res["swept"], res["calls"]), (2, 3),
+                         "a refused fetch was not counted as the call it was")
+
+    def test_a_429_mid_batch_does_not_advance_the_window_past_the_unfetched_asks(self):
+        """Review R2-1: next_start was computed before the fetch loop, so a 429 after the
+        first fetch left the window past every ask the batch never reached — under a
+        tier of one call per cycle the same ask was fetched forever and its siblings'
+        in-thread answers never closed them. The window advances as far as the loop
+        got, so every ask is reached in turn."""
+        from core import threads
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg("C1", f"{i}.0", f"q{i}?") for i in range(1, 6)])
+        self.scheduler(adapter).cycle()                     # journals the five asks
+        adapter.sweep_log = []
+        for _ in range(5):
+            adapter.calls, adapter.rate_limit_after = 0, 1  # one call per sweep, then 429
+            res = threads.sweep(adapter, self.store, self.journal, "C1",
+                                start=self.store.sweep_start_get("inst", "C1"))
+            self.store.sweep_start_set("inst", "C1", res["next_start"])
+        fetched = {root for _, root in adapter.sweep_log} - set()
+        self.assertEqual(fetched, {f"{i}.0" for i in range(1, 6)},
+                         f"with one call per cycle only {sorted(fetched)} were ever fetched")
+
+    def test_the_window_commits_only_after_the_fetched_replies_are_journaled(self):
+        """The poll path's rule, on the sweep: the cursor commits strictly AFTER every
+        fetched message has a journal row. Durable since round 2, the window used to be
+        written first, so a crash in journaling left the fetched replies in the store,
+        unjournaled and owed to nobody, until the window wrapped around (review R2-2)."""
+        from core.threads import SWEEP_MAX
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg("C1", f"{i}.0", f"q{i}?") for i in range(1, 31)])
+        sched = self.scheduler(adapter)
+        sched.cycle()                                         # window now at SWEEP_MAX
+        before = self.store.sweep_start_get("inst", "C1")
+        self.assertEqual(before, SWEEP_MAX)
+        adapter.seed([msg("C1", "100.0", "and where are the logs?", sender_id="U_B",
+                          thread_id="1.0")])                  # under a root of the next batch
+        real = sched._journal_and_route
+
+        def crashing(channel, messages, src):
+            if any(m.get("thread_id") for m in messages):
+                raise RuntimeError("database is locked")
+            return real(channel, messages, src)
+        sched._journal_and_route = crashing
+        with self.assertRaises(RuntimeError):
+            sched.cycle()
+        self.assertEqual(self.store.sweep_start_get("inst", "C1"), before,
+                         "the window moved past a reply that never reached the journal")
+
+    def test_a_channel_with_nothing_to_sweep_is_not_named_skipped(self):
+        """SKIPPED names a channel left behind. One with no open ask owes no sweep, so a
+        429 that stops the sweep before it is not its story (review F4)."""
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg("C1", "1.0", "q1?"), msg("C1", "2.0", "q2?"),
+                      msg("C2", "3.0", "status: all green")])
+        adapter.rate_limit_after = 1
+        summary = self.scheduler(adapter, channels=("C1", "C2")).cycle()
+        self.assertEqual(summary["sweep_rate_limited"], [("C1", "conversations.replies")])
+        self.assertEqual(summary["sweep_skipped"], [],
+                         "a channel with no open ask was named SKIPPED")
+
+
+class ReportLinesTest(unittest.TestCase):
+    """scripts/scheduler.py's cycle report: every sweep refusal has its own line, with a
+    TRUE cause — a channel skipped after a 429 was not 'out of budget' (review F4)."""
+
+    def lines(self, **over):
+        import importlib.util
+        root = Path(__file__).resolve().parent.parent
+        spec = importlib.util.spec_from_file_location(
+            "scheduler_script", root / "scripts" / "scheduler.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        summary = {"polled": 3, "fresh": 1, "unattended": 0, "next_interval": 60.0,
+                   "answered": 0, "sweep_rate_limited": [], "sweep_truncated": [],
+                   "sweep_errors": [], "sweep_skipped": []}
+        summary.update(over)
+        return mod.report_lines(summary)
+
+    def test_a_skipped_channel_gets_a_line_with_its_cause(self):
+        lines = self.lines(sweep_rate_limited=[("C1", "conversations.replies")],
+                           sweep_skipped=[("C2", "rate-limited"), ("C3", "budget")])
+        skipped = [ln for ln in lines if ln.startswith("sweep: SKIPPED")]
+        self.assertEqual(len(skipped), 2, lines)
+        self.assertIn("channel=C2", skipped[0])
+        self.assertIn("rate-limited", skipped[0])
+        self.assertNotIn("budget", skipped[0], "a 429 skip was blamed on the budget")
+        self.assertIn("channel=C3", skipped[1])
+        self.assertIn("budget was spent", skipped[1])
+
+    def test_a_healthy_cycle_prints_the_cycle_line_only(self):
+        lines = self.lines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith("cycle: polled=3 fresh=1"))
 
 
 if __name__ == "__main__":

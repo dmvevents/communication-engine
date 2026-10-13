@@ -406,6 +406,9 @@ class ReplyFromTheSurfaceTest(_WriteSurfaceBase):
         j.record("C_CUST", "1.0", sender_id="U_EVIL", kind="QUESTION",
                  text="see ![x](https://evil.example/p.png)\n\n[approve here]"
                       "(https://phish.example) <script>alert(1)</script>?")
+        # A bare CR pair is a blank line to CommonMark too (delta review, M-ESC-R).
+        j.record("C_CUST", "2.0", sender_id="U_EVIL", kind="QUESTION",
+                 text="bare\r\r![y](https://evil.example/q.png) <script>x</script>?")
         j.close()
         os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
         at = self.run_app()
@@ -419,6 +422,8 @@ class ReplyFromTheSurfaceTest(_WriteSurfaceBase):
                             f"markdown is inert: {row[:60]!r}")
             self.assertNotIn("\n\n", row, "a blank line ends the HTML block and "
                                           "re-arms markdown for everything after it")
+            self.assertNotIn("\r", row, "a carriage return survived — CR CR is a blank "
+                                       "line to the renderer")
             self.assertNotIn("<script>", row, "tags must stay escaped")
             self.assertIn("&lt;script&gt;", row)
 
@@ -456,6 +461,49 @@ class ReplyFromTheSurfaceTest(_WriteSurfaceBase):
         self.assertFalse(at.exception)
         self.assertIsNotNone(self.journal_row()[0])
 
+
+
+NOTHREAD_ADAPTER = '''\
+"""Send-capable, thread-INCAPABLE (channels/CONTRACT.md permits a send() without a
+thread_id parameter): the shipped fake with its placement argument removed."""
+import importlib.util
+from pathlib import Path
+
+_entry = Path(__file__).resolve().parent.parent / "fake" / "adapter.py"
+_spec = importlib.util.spec_from_file_location("nothread_fake_base", _entry)
+_fake = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_fake)
+
+
+class Adapter(_fake.Adapter):
+    def capabilities(self):
+        caps = dict(super().capabilities())
+        caps["threads"] = False
+        return caps
+
+    def send(self, channel_id, text, key=None):
+        return super().send(channel_id, text, key=key)
+'''
+
+
+def nothread_base(tmp):
+    """One connection whose adapter can send but cannot thread: C_T answers in-thread
+    only (a reply there has nowhere legal to go), C_CUST answers top-level only, C_BOTH
+    allows both placements (so a reply there goes top-level, visibly)."""
+    base = Path(tmp)
+    shutil.copytree(ROOT / "channels" / "fake", base / "channels" / "fake",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    (base / "channels" / "nothread").mkdir()
+    (base / "channels" / "nothread" / "adapter.py").write_text(NOTHREAD_ADAPTER)
+    (base / "settings.json").write_text(
+        '{"engine": {"state_dir": "state"},\n'
+        ' "instances": [{"name": "team", "adapter": "nothread",\n'
+        '   "channels": [{"id": "C_T", "thread_reply_policy": "staged"},\n'
+        '                {"id": "C_CUST", "reply_policy": "staged", '
+        '"thread_reply_policy": "never"},\n'
+        '                {"id": "C_BOTH", "reply_policy": "staged", '
+        '"thread_reply_policy": "staged"}]}]}\n')
+    return base
 
 
 def two_channel_base(tmp):
@@ -595,15 +643,106 @@ class WriteSurfaceReviewTest(_WriteSurfaceBase):
         self.assertEqual(self.rows("sl")[0]["state"], "DISCARDED")
 
     # ---- R5: each Send button releases its own draft only ------------------------
-    def test_the_second_card_releases_the_second_draft_only(self):
+    def test_a_send_releases_the_draft_whose_button_was_clicked_not_the_newest(self):
+        """Two drafts at the gate; the click lands on the OLDER one. Clicking the newest
+        cannot tell a correct binding from "every Send releases the newest draft" (the
+        delta review's surviving G1 mutant): the newest is what both would release."""
         os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
         at = self.compose(self.run_app(), "first draft")
         at = self.compose(at, "second draft")
-        key2 = [r["key"] for r in self.rows() if r["text"] == "second draft"][0]
-        at = [b for b in self.buttons(at, "send-") if b.key == f"send-{key2}"][0].click().run()
+        key1 = [r["key"] for r in self.rows() if r["text"] == "first draft"][0]
+        at = [b for b in self.buttons(at, "send-") if b.key == f"send-{key1}"][0].click().run()
         self.assertFalse(at.exception)
         self.assertEqual({r["text"]: r["state"] for r in self.rows()},
-                         {"first draft": "STAGED", "second draft": "COMMITTED"})
+                         {"first draft": "COMMITTED", "second draft": "STAGED"})
+
+    # ---- D1/F6: placement is decided with the ADAPTER in hand ------------------------
+    def use_nothread_base(self):
+        self.tmp2 = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp2.cleanup)
+        self.base = nothread_base(self.tmp2.name)
+        os.environ["COMMS_SETTINGS"] = str(self.base / "settings.json")
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+
+    def test_a_thread_only_channel_on_a_thread_incapable_adapter_offers_no_reply_and_says_why(self):
+        """Review D1: the Reply path staged in-thread whenever the thread policy allowed,
+        never asking whether the adapter could place it — the draft then wedged at Send
+        (INTENT, undiscardable). Where the thread scope is the ONLY open placement and
+        the adapter cannot thread, there is nowhere legal for a reply to go: no Reply is
+        offered, and the reason is on the page (review F6)."""
+        self.use_nothread_base()
+        self.seed_ask("C_T", "1.0")
+        at = self.run_app()
+        self.assertFalse(at.exception)
+        self.assertEqual(self.buttons(at, "reply|"), [],
+                         "Reply offered where no placement is open")
+        warnings = "\n".join(str(w.value) for w in at.warning)
+        self.assertIn("C_T", warnings)
+        self.assertIn("cannot place a reply in a thread", warnings)
+        self.assertEqual(self.rows(), [])
+
+    def test_a_reply_on_a_thread_incapable_adapter_posts_top_level_where_the_channel_allows_and_ties(self):
+        """Where the channel scope allows top-level, a reply through an adapter that
+        cannot thread goes top-level — VISIBLY (banner and flash say why), with the ask
+        as its trigger so the Send still ties it — exactly as a thread_reply_policy of
+        'never' already behaves. Refusing here left the ask unanswerable from the
+        surface: a free compose never ties (review F6)."""
+        self.use_nothread_base()
+        self.seed_ask("C_BOTH", "3.0")
+        at = self.run_app()
+        at = self.buttons(at, "reply|")[0].click().run()
+        banner = "\n".join(str(i.value) for i in at.info)
+        self.assertIn("top-level", banner)
+        self.assertIn("cannot place a reply in a thread", banner)
+        at = self.stage_text(at, "answered top-level, visibly")
+        self.assertFalse(at.exception)
+        self.assertEqual([(r["trigger_ts"], r["thread_id"], r["state"]) for r in self.rows()],
+                         [("3.0", None, "STAGED")])
+        successes = "\n".join(str(x.value) for x in at.success)
+        self.assertIn("top-level", successes)
+        self.assertIn("cannot place a reply in a thread", successes)
+        at = self.buttons(at, "send-")[0].click().run()
+        self.assertFalse(at.exception)
+        self.assertIsNotNone(self.journal_row("C_BOTH", "3.0")[0],
+                             "the top-level reply did not tie the ask")
+
+    def test_send_is_not_offered_on_a_thread_draft_the_adapter_cannot_place(self):
+        """A thread draft staged while the connection could thread, before its adapter
+        was edited (ENH-29 allows that): B3's rule on the thread dimension — Send is
+        offered only where the adapter can deliver, the card says why, Discard works
+        (review F7)."""
+        self.use_nothread_base()
+        (self.base / "state").mkdir(exist_ok=True)
+        capable = load_adapter_class(self.base / "channels", "fake")()
+        ob = Outbox(self.base / "state" / "outbox-team.db", capable, {"C_BOTH": "staged"})
+        ob.stage("C_BOTH", "1.0", "staged while the connection could thread", thread_id="1.0")
+        ob.close()
+        at = self.run_app()
+        self.assertFalse(at.exception)
+        self.assertEqual(self.buttons(at, "send-"), [],
+                         "Send offered on a thread draft this adapter cannot place")
+        self.assertEqual(len(self.buttons(at, "discard-")), 1)
+        cards = "\n".join(str(m.value) for m in at.markdown)
+        self.assertIn("cannot place a reply in thread 1.0", cards)
+        at = self.buttons(at, "discard-")[0].click().run()
+        self.assertFalse(at.exception)
+        self.assertEqual(self.rows()[0]["state"], "DISCARDED")
+
+    def test_a_top_level_reply_through_the_same_adapter_still_stages_and_sends(self):
+        """The refusal is about PLACEMENT, not the adapter: where the thread scope is
+        'never' the reply posts top-level, which this adapter can do."""
+        self.use_nothread_base()
+        self.seed_ask("C_CUST", "2.0")
+        at = self.run_app()
+        at = self.buttons(at, "reply|")[0].click().run()
+        at = self.stage_text(at, "answered top-level")
+        self.assertFalse(at.exception)
+        self.assertEqual([(r["trigger_ts"], r["thread_id"], r["state"]) for r in self.rows()],
+                         [("2.0", None, "STAGED")])
+        at = self.buttons(at, "send-")[0].click().run()
+        self.assertFalse(at.exception)
+        self.assertEqual(self.rows()[0]["state"], "COMMITTED")
+        self.assertIsNotNone(self.journal_row("C_CUST", "2.0")[0])
 
     # ---- the screen after a stage is the post-action truth ------------------------
     def test_after_a_reply_is_staged_the_banner_is_gone_and_the_next_draft_is_not_retargeted(self):

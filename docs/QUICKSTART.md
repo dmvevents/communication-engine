@@ -81,6 +81,12 @@ raises, exactly as a `never` channel does. Each scope is deny-by-default on its 
 one placement does not promote the other. The outbox records which placement each reply used
 (`scope` and `thread_id` columns), so a staged draft tells the approving human where it would
 land, and a crashed thread reply resumes **in its thread** instead of resurfacing top-level.
+A thread reply through an adapter that cannot place it — one declaring `threads: false`, or
+one whose `send()` takes no `thread_id` — is refused before any new row is written or claimed
+(at `stage()`, at a direct send, and again at the Send click), so the outbox never flattens it
+into the main channel and never leaves it wedged at the gate; the write surface decides a
+reply's placement with the adapter in hand, and posts top-level only where the channel policy
+allows it, saying so.
 
 ## 5. First poll — the fake adapter, but YOUR config
 
@@ -291,7 +297,10 @@ in-thread ties the sweep made that cycle; answers sent from the surface are tied
 surface and never appear in that count — and
 one line per channel whenever the sweep was rate-limited, truncated, or refused by the
 platform for one ask (a deleted ask answers `thread_not_found` forever; it is reported
-and skipped, never allowed to stop the loop).
+and skipped, never allowed to stop the loop), and one line (`sweep: SKIPPED`, with its cause)
+per channel that owes a sweep the cycle never reached (after a 429, or with more channels than
+calls) — that channel is swept first next cycle, also when the next cycle is a new `--once`
+run, because the sweep window and the channel order live in the store.
 
 The dashboard is read-only **by default**. Setting `COMMS_UI_WRITE_ENABLED=true` in
 the environment adds a write surface (`scripts/dashboard_write.py` — the one module
@@ -352,11 +361,17 @@ surface says so instead of implying one.
   `slack_socket`, `telegram` and `email` — have no route to answered at all: their asks
   stay UNANSWERED until a send-capable path exists for that platform.
 - **The thread sweep spends platform calls.** Each open ask costs one
-  `conversations.replies` call per cycle, bounded by `SWEEP_MAX` (25) per channel, newest
-  asks first; a 429 is honoured and reported, and the rest of that channel's sweep waits
-  for the next cycle. Slack's rate tier for `conversations.replies` is far lower for
-  commercially distributed non-Marketplace apps than for an internal app, so a
-  distributed app should expect asks to close more slowly, never faster.
+  `conversations.replies` call per cycle — a refused fetch (a deleted ask) counts too —
+  bounded by `SWEEP_MAX` (25) per adapter per cycle and spent across that adapter's
+  channels with one call reserved for every channel still waiting: a backlog channel takes
+  the bulk, never the whole budget, and the bulk moves between channels; a channel a cycle
+  did skip (a 429, or more channels than calls) is swept first in the next and named on
+  its own `sweep: SKIPPED` line; within a channel the window rotates through the open
+  asks. Window and order are stored, so `--once` runs keep them. A 429 is honoured and
+  reported, and the rest of that adapter's sweep waits for the next cycle. Slack's rate
+  tier for `conversations.replies` is far lower for commercially distributed
+  non-Marketplace apps than for an internal app, so a distributed app should expect asks
+  to close more slowly, never faster.
 - Five adapters ship: **`fake`** (in-memory dry-run), **`slack`** — **read-only on purpose**
   (poll / replies / resolve / health; it exposes no send path at any layer, and `tests/test_slack_adapter.py`
   fails if one appears) — **`slack_socket`** (Socket Mode push ingestion, equally

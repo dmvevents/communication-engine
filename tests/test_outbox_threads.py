@@ -27,7 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core import config  # noqa: E402
-from core.outbox import (COMMITTED, Outbox, PolicyError, STAGED,  # noqa: E402
+from core.outbox import (COMMITTED, INTENT, Outbox, PolicyError, STAGED,  # noqa: E402
                          SendBlocked, _Crash, idempotency_key)
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -123,6 +123,22 @@ class ThreadSendTest(Harness):
         self.assertEqual(v1.delivered, [],
                          "a threadless adapter was handed a thread reply and posted it "
                          "in the main channel")
+
+    def test_recovery_through_a_threadless_adapter_refuses_rather_than_flattening(self):
+        """The pre-write refusal (review D1) cannot see a row written BEFORE the adapter
+        changed: a thread reply left INTENT by a crash, then the connection swapped to
+        an adapter whose send() takes no thread_id. recover() resumes from the ROW, so
+        the guard inside _deliver() is the last line — it must refuse loudly, never
+        post the reply top-level, and the row stays INTENT for the operator."""
+        with self.assertRaises(_Crash):
+            self.box().send(TARGET, TS, TEXT, thread_id=THREAD, _crash_at="after_intent")
+        v1 = V1Adapter()
+        with self.assertRaises(SendBlocked):
+            self.box(adapter=v1).recover()
+        self.assertEqual(v1.delivered, [],
+                         "recovery flattened a thread reply into the main channel")
+        row = self.box(adapter=v1).get(idempotency_key(TARGET, TS, TEXT, THREAD))
+        self.assertEqual(row["state"], INTENT)
 
     def test_an_adapters_own_TypeError_is_not_reported_as_a_placement_failure(self):
         """Diagnosis has to stay honest: a bug INSIDE a thread-capable adapter must not

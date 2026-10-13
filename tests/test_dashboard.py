@@ -501,6 +501,15 @@ class HtmlTextTest(unittest.TestCase):
         self.assertIn("<br>", out)
         self.assertEqual(html_text(None), "")
 
+    def test_a_bare_carriage_return_cannot_end_the_block_either(self):
+        """CR is a CommonMark line ending too: `a\\r\\r[](https://x)` is a blank line to
+        the renderer. CRs are dropped outright, so a CRLF pair is still one <br>
+        (delta review 2026-10-13, M-ESC-R: no test carried a bare CR)."""
+        from core.dashboard import html_text
+        out = html_text("a\r\r[](https://x)\r\nb")
+        self.assertNotIn("\r", out, "a carriage return survived — CR CR is a blank line")
+        self.assertEqual(out, "a[](https://x)<br>b")
+
 
 class UnansweredIsAsksOnlyTest(unittest.TestCase):
     """The attention queue's UNANSWERED list is the open ASK backlog, not every row.

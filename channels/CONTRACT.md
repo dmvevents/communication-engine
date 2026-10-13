@@ -91,7 +91,11 @@ so "answer in thread, never the main channel" is expressible; each scope default
 its own. An adapter whose `capabilities()["threads"]` is true must honour the `thread_id`
 argument — accepting it and posting top-level anyway reports success while doing the one
 thing the policy forbade, so `core/outbox` refuses a thread send through an adapter whose
-`send()` has no `thread_id` parameter rather than silently flattening it.
+`send()` has no `thread_id` parameter rather than silently flattening it — and refuses it
+**before** any outbox row is written or claimed (at stage, at a direct send, and at the operator's
+click), so a draft nobody can send never wedges at the gate. The declaration counts as much as
+the signature: an adapter declaring `threads: false` is refused a thread send even when its
+`send()` would accept the argument, because the contract tells such an adapter it may ignore it.
 
 ## Rules for adapter authors
 

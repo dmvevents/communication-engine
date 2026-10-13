@@ -1026,7 +1026,7 @@ run_mutation "outbox: the thread is dropped on the way to the adapter" \
 # top-level post in a channel whose policy may be 'never'.
 run_mutation "outbox: a threadless adapter gets the reply posted top-level instead" \
   "core/outbox.py" \
-  "('        if not _accepts_thread_id(self.adapter.send):', '        if False:')" \
+  "('        if blocked is not None:', '        if False:')" \
   "test_outbox_threads"
 
 # ENH-3 — the capability question must be asked of the SIGNATURE. Interpreting a TypeError
@@ -2371,7 +2371,7 @@ run_mutation "threads: an adapter without replies() reads as 'nothing new'" \
 # marked 'answered'.
 run_mutation "threads: STATEMENTs are swept like asks" \
   "core/threads.py" \
-  "('    open_asks = [r for r in journal.unanswered(channel) if r[\"kind\"] in ACTIONABLE_KINDS]', '    open_asks = [r for r in journal.unanswered(channel)]')" \
+  "('    rows = [r for r in journal.unanswered(channel) if r[\"kind\"] in ACTIONABLE_KINDS]', '    rows = [r for r in journal.unanswered(channel)]')" \
   "test_threads"
 
 # ENH-30 — the sweep is bounded and SAYS when it truncated.
@@ -2383,7 +2383,7 @@ run_mutation "threads: a truncated sweep reports itself complete" \
 # ENH-30 — a 429 must be visible in the result, never swallowed.
 run_mutation "threads: a rate limit is swallowed silently" \
   "core/threads.py" \
-  "('            result[\"rate_limited\"] = ex.method or \"replies\"\n            break', '            break')" \
+  "('            result[\"rate_limited\"] = ex.method or \"replies\"\n            reached = min(pos[str(r[\"ts\"])] for r in rows)    # this root was not fetched\n            break', '            break')" \
   "test_threads"
 
 # ENH-30 — the tie itself: without mark_responded the ask stays open forever.
@@ -2523,13 +2523,13 @@ run_mutation "dashboard_write: a journal refusal after a proven send crashes the
 # review F4 — a reply to an in-thread ask threads under the ROOT the sweep reads.
 run_mutation "dashboard_write: a reply threads under the ask instead of the thread root" \
   "scripts/dashboard_write.py" \
-  "('        thread = _thread_root(cfg, ch.id, trigger) if in_thread else None', '        thread = trigger if in_thread else None')" \
+  "('            thread = _thread_root(cfg, ch.id, trigger) if placement == \"thread\" else None', '            thread = trigger if placement == \"thread\" else None')" \
   "test_dashboard_write"
 
 # review F5 — a thread-only channel is answerable through Reply.
 run_mutation "dashboard_write: a thread-only channel offers no Reply" \
   "scripts/dashboard_write.py" \
-  "('            if cpol != \"never\" or tpol != \"never\":\n                replyable[ch.id] = (inst, ch)', '            if cpol != \"never\":\n                replyable[ch.id] = (inst, ch)')" \
+  "('            if cpol == \"never\" and tpol == \"never\":\n                continue', '            if cpol == \"never\":\n                continue')" \
   "test_dashboard_write"
 
 # review F6/R21 — the limits entry names the stranded adapters from the code, not from memory.
@@ -2623,7 +2623,7 @@ run_mutation "threads: every ask under one root issues its own platform call" \
 
 run_mutation "schedule: the sweep budget is per channel, re-spent for every channel" \
   "core/schedule.py" \
-  "('                    budget -= swept[\"swept\"]', '                    pass')" \
+  "('                    budget -= swept[\"calls\"]', '                    pass')" \
   "test_schedule"
 
 run_mutation "schedule: a sweep 429 does not stop the rest of that source's sweeps" \
@@ -2639,7 +2639,7 @@ run_mutation "threads: the window never rotates (newest-first forever)" \
 
 run_mutation "schedule: the scheduler forgets where the sweep window stopped" \
   "core/schedule.py" \
-  "('                    self._sweep_start[ch] = swept[\"next_start\"]', '                    pass')" \
+  "('                    self.store.sweep_start_set(src.name, ch, swept[\"next_start\"])', '                    pass')" \
   "test_schedule"
 
 # review F12 — a non-orderable id space is refused, never guessed.
@@ -2653,6 +2653,131 @@ run_mutation "store: the thread lookups lose their indexes" \
   "core/store.py" \
   "('        self.conn.execute(\"CREATE INDEX IF NOT EXISTS messages_channel_thread \"\n                          \"ON messages (channel_id, thread_id)\")', '        pass')" \
   "test_store"
+
+# review D2 — one call reserved per waiting channel, the bulk position rotates, a skipped
+# channel is swept first next cycle, and every skip is named.
+run_mutation "schedule: no call is reserved for the channels still waiting (a backlog takes the whole budget)" \
+  "core/schedule.py" \
+  "('                allow = max(1, budget - (len(order) - 1 - i))', '                allow = budget')" \
+  "test_schedule"
+
+run_mutation "schedule: the bulk position never rotates (one backlog channel keeps it forever)" \
+  "core/schedule.py" \
+  "('            bulk = max(swept_now, key=lambda c: spent.get(c, 0)) if swept_now else None', '            bulk = None')" \
+  "test_schedule"
+
+run_mutation "schedule: a channel the cycle skipped is not swept first next cycle" \
+  "core/schedule.py" \
+  "('            new_order = skipped_now + rest', '            new_order = rest + skipped_now')" \
+  "test_schedule"
+
+run_mutation "schedule: a channel the cycle skipped is not named in the summary" \
+  "core/schedule.py" \
+  "('                    if threads.open_asks_for(self.journal, ch):\n                        sweep_skipped.append((ch, stopped or \"budget\"))', '                    pass')" \
+  "test_schedule"
+
+# round 2 (independent review lane on 2851289): F1 durable order, F2 charge by attempt,
+# F3 bulk by spend, F4 skip causes + the report lines.
+run_mutation "schedule: the sweep order is not persisted (every cron run restarts in config order)" \
+  "core/schedule.py" \
+  "('            self.store.sweep_order_set(src.name, new_order)', '            pass')" \
+  "test_schedule"
+
+run_mutation "schedule: refused fetches are not charged (an all-errors channel sweeps for free)" \
+  "core/schedule.py" \
+  "('                    budget -= swept[\"calls\"]', '                    budget -= swept[\"swept\"]')" \
+  "test_schedule"
+
+run_mutation "schedule: the bulk is taken to be position 0, not the channel that spent the most" \
+  "core/schedule.py" \
+  "('            bulk = max(swept_now, key=lambda c: spent.get(c, 0)) if swept_now else None', '            bulk = swept_now[0] if swept_now else None')" \
+  "test_schedule"
+
+run_mutation "schedule: a skip after a 429 is blamed on the budget" \
+  "core/schedule.py" \
+  "('                        sweep_skipped.append((ch, stopped or \"budget\"))', '                        sweep_skipped.append((ch, \"budget\"))')" \
+  "test_schedule"
+
+run_mutation "schedule: a channel with no open ask is named SKIPPED" \
+  "core/schedule.py" \
+  "('                    if threads.open_asks_for(self.journal, ch):', '                    if True:')" \
+  "test_schedule"
+
+# round 2 delta review: R2-1 the window advances only as far as the loop got; R2-2 the
+# window commits after the fetched replies are journaled.
+run_mutation "threads: a 429 mid-batch advances the window past the asks never fetched" \
+  "core/threads.py" \
+  "('            reached = min(pos[str(r[\"ts\"])] for r in rows)    # this root was not fetched', '            pass')" \
+  "test_schedule"
+
+run_mutation "schedule: the sweep window commits before the fetched replies are journaled" \
+  "core/schedule.py" \
+  "('                    fresh += self._journal_and_route(ch, swept[\"replies\"], src)\n                    self.store.sweep_start_set(src.name, ch, swept[\"next_start\"])', '                    self.store.sweep_start_set(src.name, ch, swept[\"next_start\"])\n                    fresh += self._journal_and_route(ch, swept[\"replies\"], src)')" \
+  "test_schedule"
+
+run_mutation "scheduler: the SKIPPED line is never printed" \
+  "scripts/scheduler.py" \
+  "('    for ch, why in summary[\"sweep_skipped\"]:', '    for ch, why in []:')" \
+  "test_schedule"
+
+run_mutation "scheduler: every SKIPPED line blames the budget" \
+  "scripts/scheduler.py" \
+  "('                 \"channel\" if why == \"rate-limited\" else', '                 \"channel\" if False else')" \
+  "test_schedule"
+
+# review D1 — a thread reply the adapter cannot place is refused BEFORE a row is written or claimed.
+run_mutation "outbox: release() flips to INTENT before asking whether the adapter can thread" \
+  "core/outbox.py" \
+  "('        self._check_placement(row[\"thread_id\"], ReleaseError,\n                              \" — the draft stays STAGED; it can only be discarded\")', '        pass')" \
+  "test_outbox_write"
+
+run_mutation "outbox: a direct thread send writes an INTENT row the adapter can never deliver" \
+  "core/outbox.py" \
+  "('            self._check_placement(thread_id)        # before the INSERT that is the claim', '            pass')" \
+  "test_outbox_write"
+
+run_mutation "outbox: stage() accepts a thread draft no click could ever send" \
+  "core/outbox.py" \
+  "('            self._check_placement(thread_id)        # before the draft exists at all', '            pass')" \
+  "test_outbox_write"
+
+# round 2: F5 the declaration counts, F9 replays answered from the row, F6/F7 the surface
+# decides placement with the adapter and offers Send only where the draft can be placed.
+run_mutation "outbox: the declared thread capability is ignored (a **kwargs send flattens)" \
+  "core/outbox.py" \
+  "('    if callable(caps) and not caps().get(\"threads\"):', '    if False:')" \
+  "test_outbox_write"
+
+run_mutation "outbox: send() refuses a replay of a delivered thread reply" \
+  "core/outbox.py" \
+  "('        if row is None:\n            self._check_placement(thread_id)        # before the INSERT that is the claim', '        self._check_placement(thread_id)        # before the INSERT that is the claim\n        if row is None:')" \
+  "test_outbox_write"
+
+run_mutation "outbox: stage() refuses a replay of a delivered thread reply" \
+  "core/outbox.py" \
+  "('        if self.get(key) is None:               # a new draft, not a replay (review F9)', '        if True:                                # a new draft, not a replay (review F9)')" \
+  "test_outbox_write"
+
+run_mutation "dashboard_write: placement is decided blind to the adapter" \
+  "scripts/dashboard_write.py" \
+  "('    blocked = thread_block_reason(adapter)\n    if tpol != \"never\" and blocked is None:', '    blocked = None\n    if tpol != \"never\" and blocked is None:')" \
+  "test_dashboard_write"
+
+run_mutation "dashboard_write: Send offered on a thread draft the adapter cannot place" \
+  "scripts/dashboard_write.py" \
+  "('            if no_send is None and row[\"thread_id\"]:', '            if False:')" \
+  "test_dashboard_write"
+
+# the two gap mutations that SURVIVED the delta review at 67dd804 (G1, M-ESC-R).
+run_mutation "dashboard_write: every Send releases the newest draft" \
+  "scripts/dashboard_write.py" \
+  "('on_click=_release_clicked, args=(inst.name, row[\"key\"]))', 'on_click=_release_clicked, args=(inst.name, drafts[0][\"key\"]))')" \
+  "test_dashboard_write"
+
+run_mutation "dashboard: html_text keeps a bare carriage return (CR CR is a blank line)" \
+  "core/dashboard.py" \
+  "('    return html.escape(text or \"\").replace(\"\\\\r\", \"\").replace(\"\\\\n\", \"<br>\")', '    return html.escape(text or \"\").replace(\"\\\\n\", \"<br>\")')" \
+  "test_dashboard"
 
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"

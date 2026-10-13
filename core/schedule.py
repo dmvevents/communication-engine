@@ -138,9 +138,10 @@ class Scheduler:
         self._interval = self.base_interval
         self._last_fire = None
         self._backoff_until = 0.0
-        # ENH-30: where each channel's thread-sweep window resumes next cycle, so no
-        # open ask starves behind the newest few (in-memory: a restart just rewinds).
-        self._sweep_start: dict = {}
+        # ENH-30: where each channel's thread-sweep window resumes, and the order a
+        # source's channels are swept in, live in the STORE (sweep_start_*, sweep_order_*),
+        # not here: the cron deployment builds a new Scheduler per run, and in-memory
+        # state restarted every run at the newest asks, in config order (review F1).
 
     # ---- the loop ---------------------------------------------------------
     def run(self, max_cycles: int | None = None, stop=lambda: False) -> int:
@@ -178,11 +179,8 @@ class Scheduler:
         now = self.clock()
         polled = fresh = answered = 0
         sweep_rate_limited, sweep_truncated, sweep_errors = [], [], []
+        sweep_skipped = []
         for src in self.sources:
-            # One thread-sweep budget per ADAPTER per cycle, spent across its channels:
-            # 25 calls per channel exceeded Slack's tier at two channels (review F8).
-            # A 429 ends this source's sweeping for the cycle; polling goes on.
-            budget = threads.SWEEP_MAX
             for ch in src.channels:
                 cursor = self.store.cursor_get(src.name, ch)
                 messages, new_cursor = src.adapter.poll(cursor)
@@ -196,24 +194,59 @@ class Scheduler:
                 fresh += self._journal_and_route(ch, mine, src)
                 self._commit_cursor(src.name, ch, cursor, new_cursor)
                 polled += len(mine)
-                # ENH-30: the open asks' threads. A history poll never serves a
-                # thread reply, so an in-thread answer reaches the engine only here;
-                # the fetched replies are journaled like any other message (a
-                # question asked inside a thread becomes an owed ask of its own).
+            # ENH-30: the open asks' threads. A history poll never serves a thread
+            # reply, so an in-thread answer reaches the engine only here; the fetched
+            # replies are journaled like any other message (a question asked inside a
+            # thread becomes an owed ask of its own).
+            #
+            # One thread-sweep budget per ADAPTER per cycle, spent across its channels:
+            # 25 calls per channel exceeded Slack's tier at two channels (review F8).
+            # Spent in CONFIG order it starved: a first channel with 25 open roots — a
+            # normal support backlog — took the whole budget every cycle, so no later
+            # channel was ever swept and its in-thread answers never closed their asks,
+            # silently (review D2: the ENH-30 symptom itself, for channel 2 onward).
+            # So: one call stays reserved for every channel still waiting, so a backlog
+            # channel takes the bulk but never the whole budget; the channel that took
+            # the bulk moves to the back of the order, so two backlog channels take
+            # turns; a channel a cycle did skip (a 429, or more channels than calls)
+            # goes first next cycle; and every skip is reported by name and cause. The
+            # window and the order are durable (store), so the cron deployment's
+            # one-Scheduler-per-run keeps every guarantee. A 429 ends this source's
+            # sweeping for the cycle; polling is already done.
+            budget = threads.SWEEP_MAX
+            order = self._sweep_order_for(src)
+            swept_now, skipped_now, spent = [], [], {}
+            stopped = None              # set once a 429 ends this source's sweeping
+            for i, ch in enumerate(order):
                 if budget <= 0:
+                    skipped_now.append(ch)
+                    # Named with its cause, and only when it owes a sweep (review F4): a
+                    # channel with no open ask was not left behind.
+                    if threads.open_asks_for(self.journal, ch):
+                        sweep_skipped.append((ch, stopped or "budget"))
                     continue
+                swept_now.append(ch)
+                allow = max(1, budget - (len(order) - 1 - i))
                 swept = threads.sweep(
-                    src.adapter, self.store, self.journal, ch, max_threads=budget,
-                    start=self._sweep_start.get(ch, 0),
+                    src.adapter, self.store, self.journal, ch, max_threads=allow,
+                    start=self.store.sweep_start_get(src.name, ch),
                     # A reply that classifies as an ask of its own is a new question,
                     # never the answer (review F7); the source's vocabulary decides.
                     is_answer=lambda m, _src=src: classify(
                         m.get("text") or "", _src.taxonomy,
                         attachments=m.get("attachments")).kind not in ACTIONABLE_KINDS)
                 if swept is not None:
-                    budget -= swept["swept"]
-                    self._sweep_start[ch] = swept["next_start"]
+                    # Charged by ATTEMPT: a refused fetch cost the platform a call too
+                    # (review F2 — an all-errors channel was charged nothing, and the
+                    # next channel got a second full budget).
+                    budget -= swept["calls"]
+                    spent[ch] = swept["calls"]
+                    # The same order as the poll path: every fetched reply has a journal
+                    # row BEFORE the window commits past it. Durable since round 2, the
+                    # window written first survived a crash in journaling and left the
+                    # replies in the store, owed to nobody, until it wrapped (review R2-2).
                     fresh += self._journal_and_route(ch, swept["replies"], src)
+                    self.store.sweep_start_set(src.name, ch, swept["next_start"])
                     answered += len(swept["answered"])
                     # The sweep's refusals are the operator's business (G4): a 429, a
                     # truncated sweep or a dead thread must not print the same cycle
@@ -221,9 +254,17 @@ class Scheduler:
                     if swept["rate_limited"]:
                         sweep_rate_limited.append((ch, swept["rate_limited"]))
                         budget = 0          # the platform said stop; stop for this source
+                        stopped = "rate-limited"
                     if swept["truncated"]:
                         sweep_truncated.append(ch)
                     sweep_errors.extend((ch, ts, msg) for ts, msg in swept["errors"])
+            # The channel that took the bulk — the one that SPENT the most — goes to the
+            # back (review F3: rotating position 0 let a small channel's turn hand the
+            # bulk straight back to the same backlog channel); skipped ones go first.
+            bulk = max(swept_now, key=lambda c: spent.get(c, 0)) if swept_now else None
+            rest = [c for c in swept_now if c != bulk] + ([bulk] if bulk is not None else [])
+            new_order = skipped_now + rest
+            self.store.sweep_order_set(src.name, new_order)
         self._close_answered()
         unattended = self._observe_owed()
         self._last_fire = now
@@ -233,7 +274,18 @@ class Scheduler:
         return {"polled": polled, "fresh": fresh, "answered": answered,
                 "unattended": unattended, "next_interval": self._interval,
                 "sweep_rate_limited": sweep_rate_limited,
-                "sweep_truncated": sweep_truncated, "sweep_errors": sweep_errors}
+                "sweep_truncated": sweep_truncated, "sweep_errors": sweep_errors,
+                "sweep_skipped": sweep_skipped}
+
+    def _sweep_order_for(self, src) -> list:
+        """This cycle's sweep order for one source, read from the store (so it survives
+        the cron deployment's one Scheduler per run): the channels last cycle skipped
+        first, then the ones it swept with the one that spent the most (took the bulk)
+        moved to the back; channels new to the config join at the back, removed ones
+        drop out. No saved order (a fresh state directory) is the config order."""
+        saved = self.store.sweep_order_get(src.name)
+        return ([c for c in saved if c in src.channels]
+                + [c for c in src.channels if c not in saved])
 
     def _journal_and_route(self, channel, messages, src) -> int:
         fresh = 0

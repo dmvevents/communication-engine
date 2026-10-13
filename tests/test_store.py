@@ -12,7 +12,7 @@ from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.store import SchemaError, Store  # noqa: E402
+from core.store import SCHEMA, SchemaError, Store  # noqa: E402
 
 
 def msg(ts="1700000000.000100", text="hello", **kw):
@@ -240,6 +240,40 @@ class AttachmentFieldTest(unittest.TestCase):
                               "a legacy row must read back None, never a fabricated "
                               "attachment record")
         finally:
+            s.close()
+
+
+class SweepStateTest(unittest.TestCase):
+    """The thread sweep's window and channel order are DURABLE (independent review of
+    ENH-33, F1): the cron deployment (`scheduler.py --once`) builds a new Scheduler per
+    run, and in-memory state restarted the window at the newest asks and the order at
+    the config on every run — the asks behind the newest, and the tail of the channel
+    list, were never swept."""
+
+    def test_defaults_round_trip_and_survive_a_reopen(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "messages.db"
+            s = Store(path)
+            self.assertEqual((s.sweep_start_get("inst", "C1"), s.sweep_order_get("inst")),
+                             (0, []))
+            s.sweep_start_set("inst", "C1", 7)
+            s.sweep_order_set("inst", ("C2", "C1"))
+            s.close()
+            s = Store(path)                                 # a new process
+            self.assertEqual(s.sweep_start_get("inst", "C1"), 7)
+            self.assertEqual(s.sweep_order_get("inst"), ["C2", "C1"])
+            s.close()
+
+    def test_an_existing_db_without_the_tables_gains_them(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "messages.db"
+            conn = sqlite3.connect(path)
+            conn.executescript(SCHEMA.split("CREATE TABLE IF NOT EXISTS sweep_state")[0])
+            conn.close()
+            s = Store(path)
+            self.assertEqual(s.sweep_start_get("inst", "C1"), 0)
+            s.sweep_start_set("inst", "C1", 3)
+            self.assertEqual(s.sweep_start_get("inst", "C1"), 3)
             s.close()
 
 

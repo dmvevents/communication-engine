@@ -71,6 +71,35 @@ _MIGRATIONS = (
 )
 
 
+def thread_block_reason(adapter) -> str | None:
+    """Why this adapter cannot PLACE a reply in a thread, or None when it can. PUBLIC:
+    the write surface decides a reply's placement with the same predicate the outbox
+    refuses with, so the two can never disagree (review R2-4). Two
+    sources, both consulted: the contract's declaration — an adapter whose
+    capabilities()['threads'] is false is TOLD it may ignore thread_id (CONTRACT.md),
+    so a **kwargs send() on such an adapter would flatten silently (independent review
+    of ENH-34, F5) — and the signature, because a send() without the parameter cannot
+    be handed one at all."""
+    send = getattr(adapter, "send", None)
+    if not callable(send):
+        return "it has no send() at all"
+    caps = getattr(adapter, "capabilities", None)
+    if callable(caps) and not caps().get("threads"):
+        return "it declares no thread support (capabilities()['threads'] is false)"
+    if not _accepts_thread_id(send):
+        return "its send() takes no thread_id (channels/CONTRACT.md)"
+    return None
+
+
+def _adapter_label(adapter) -> str:
+    """The adapter by its channels/ directory name when it was loaded from one (every
+    shipped adapter's class is named `Adapter`, which names nothing — review F10);
+    the class name for anything else (test doubles)."""
+    module = type(adapter).__module__ or ""
+    prefix = "channel_adapter_"
+    return module[len(prefix):] if module.startswith(prefix) else type(adapter).__name__
+
+
 def _accepts_thread_id(send) -> bool:
     """Can this adapter's send() be given a placement at all?
 
@@ -216,6 +245,26 @@ class Outbox:
                 "stage it again if it should")
         return None
 
+    def _check_placement(self, thread_id, exc=SendBlocked, tail=""):
+        """Refuse a thread reply this adapter could only fail to place — BEFORE a row
+        is written or claimed. _deliver() refuses it too, but by then release() had
+        flipped the row to INTENT: Discard refuses an INTENT row, and recover() re-ran
+        the same refusal on every restart (independent delta review 2026-10-13, D1 —
+        B3's class on the thread dimension). Top-level is NOT offered instead:
+        flattening is the one outcome a thread-scoped policy forbids. An adapter with
+        no send() at all is _can_send's business, not this check's."""
+        send = getattr(self.adapter, "send", None)
+        if thread_id is None or not callable(send):
+            return
+        blocked = thread_block_reason(self.adapter)
+        if blocked is None:
+            return
+        raise exc(
+            f"adapter {_adapter_label(self.adapter)} cannot place a reply in thread "
+            f"{thread_id}: {blocked} — the outbox never moves a reply out of its thread "
+            "on its own; a top-level answer is a different draft, allowed only where "
+            f"the channel policy allows one{tail}")
+
     def _deliver(self, target, text, key, thread_id):
         """The one place adapter.send() is called, from both the live path and recovery.
 
@@ -228,12 +277,12 @@ class Outbox:
         """
         if thread_id is None:
             return self.adapter.send(target, text, key=key)
-        if not _accepts_thread_id(self.adapter.send):
+        blocked = thread_block_reason(self.adapter)
+        if blocked is not None:
             raise SendBlocked(
-                f"adapter {type(self.adapter).__name__} cannot place a reply in thread "
-                f"{thread_id}: its send() takes no thread_id (channels/CONTRACT.md), "
-                "and posting top-level instead is the one outcome a thread-scoped "
-                "policy forbids")
+                f"adapter {_adapter_label(self.adapter)} cannot place a reply in thread "
+                f"{thread_id}: {blocked} — the outbox never moves a reply out of its "
+                "thread on its own, so nothing was posted")
         # Deliberately NOT wrapped in `except TypeError`: a TypeError raised inside a
         # thread-capable adapter is that adapter's bug, and relabelling it "cannot
         # thread" would send an operator to fix a capability that was never missing.
@@ -274,7 +323,12 @@ class Outbox:
         key = idempotency_key(target, trigger_ts, text, thread_id)
         row = self.get(key)
 
+        # Review D1: a thread reply this adapter could only fail to place is refused
+        # BEFORE the INSERT that is the claim — an INTENT row for it would wedge. Only
+        # when a NEW row would be minted (review F9): a replay of a reply already
+        # delivered is answered from its row, whatever the adapter has since become.
         if row is None:
+            self._check_placement(thread_id)        # before the INSERT that is the claim
             # This INSERT is also the CLAIM on the ladder below: concurrent senders of
             # the same reply race the SELECT above, and the primary key must arbitrate
             # to exactly one owner. OR IGNORE because the loser's insert is a clean
@@ -422,6 +476,8 @@ class Outbox:
                 f"reply policy for {target} ({scope} scope) is 'never' — refusing "
                 "to stage. Composing requires a policy of 'staged' or 'direct'.")
         key = idempotency_key(target, trigger_ts, text, thread_id)
+        if self.get(key) is None:               # a new draft, not a replay (review F9)
+            self._check_placement(thread_id)        # before the draft exists at all
         # Same INSERT-is-the-claim shape as send(): concurrent stagers of the same
         # draft collapse to one row, and re-staging an already-delivered reply must
         # report the delivery, not mint a second visible message.
@@ -467,6 +523,10 @@ class Outbox:
             raise ReleaseError(
                 f"the adapter for {row['target']} declares no send capability — the "
                 "draft stays STAGED; it can only be discarded")
+        # ...and when it cannot place THIS draft: a thread reply through a send() that
+        # takes no thread_id used to fail inside _deliver(), after the flip (review D1).
+        self._check_placement(row["thread_id"], ReleaseError,
+                              " — the draft stays STAGED; it can only be discarded")
         # Policy is re-resolved at the CLICK, not inherited from staging time: a
         # channel demoted to 'never' since the draft was written must refuse the
         # send, however long the draft sat at the gate.

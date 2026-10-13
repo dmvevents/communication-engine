@@ -11,8 +11,9 @@ answer to its ask.
 
 The contract this surface renders, in one sentence: **composing stages; only a human
 click on the exact staged text sends; discard is terminal and kept.** No handler
-here calls the adapter — stage() never touches it, and release()/discard() are
-invoked only from a button on a specific draft. There is no "send now" compose path
+here calls the adapter's send() — stage() only asks the adapter whether it can PLACE
+the draft — and release()/discard() are invoked only from a button on a specific
+draft. There is no "send now" compose path
 even for 'direct'-policy channels: a human composing on the operator surface is
 asking for a reviewed send, and the review is the point.
 
@@ -28,8 +29,10 @@ instance instead of rendering a compose box that cannot deliver.
 Answering closes the ask (ENH-30). Each open ask of a channel that accepts a reply
 (thread scope OR channel scope not 'never') offers Reply, which pre-fills the compose
 form; the reply stages with the ask's ts as its trigger — under the ask's thread ROOT
-when the thread policy allows, top-level otherwise, never refused and never silently
-threaded — and the Send click, the moment the answer is PROVEN on the target, ties the
+when the thread policy allows AND the adapter can place it there, top-level when the
+channel policy allows (the banner and the flash say which, and why), and no Reply at
+all, with the reason named, when neither placement is open — and the Send click, the
+moment the answer is PROVEN on the target, ties the
 ask to the outbox key via Journal.mark_responded. Staging never ties (a draft is a
 promise, not an answer); a free compose ties to nothing. Measured 2026-10-12 on the
 aws-do-agent integration: with no tie at all, every answered ask stayed UNANSWERED.
@@ -64,7 +67,8 @@ from core.config import ConfigError, ensure_dirs, load, load_adapter_class  # no
 from core.dashboard import html_text, open_ro, snapshot  # noqa: E402
 from core.journal import Journal  # noqa: E402
 from core.outbox import (COMMITTED, DISCARDED, Outbox, PolicyError,  # noqa: E402
-                         ReleaseError, SENT, SendBlocked, STAGED, VERIFIED)
+                         ReleaseError, SENT, SendBlocked, STAGED, VERIFIED,
+                         thread_block_reason)
 
 
 # ---- config, fresh at every action --------------------------------------------
@@ -98,6 +102,24 @@ def _thread_scope_policy(ch):
     return p if isinstance(p, str) else p.get("thread", "never")
 
 
+def _placement_for(ch, adapter):
+    """Where a reply to an ask on this channel goes, decided with the ADAPTER in hand
+    (independent review of ENH-34, F6): ("thread", None) when the thread scope allows
+    and the adapter can place it there; ("top-level", why) when the channel scope allows
+    — `why` names what keeps it out of the thread, a thread_reply_policy of 'never' or
+    an adapter that cannot thread, and the banner and the flash repeat it; (None, why)
+    when neither placement is open, so no Reply is offered and the row says why."""
+    tpol, cpol = _thread_scope_policy(ch), _channel_scope_policy(ch)
+    blocked = thread_block_reason(adapter)
+    if tpol != "never" and blocked is None:
+        return "thread", None
+    why = ("thread_reply_policy is 'never' for this channel" if tpol == "never"
+           else f"this connection's adapter cannot place a reply in a thread: {blocked}")
+    if cpol != "never":
+        return "top-level", why
+    return None, f"{ch.id} answers only in threads, and {why}"
+
+
 def _adapter_for(cfg, inst):
     return load_adapter_class(cfg.channels_dir, inst.adapter)(auth=inst.auth)
 
@@ -110,8 +132,10 @@ def _can_send(adapter):
 
 
 class _NoAdapter:
-    """Stands in where no adapter call can happen — stage() and discard() never touch
-    one — so a half-configured connection can still have its drafts discarded (S5)."""
+    """Stands in where no adapter call can happen — discard() never touches one — so
+    a half-configured connection can still have its drafts discarded (S5). Not for
+    stage(): the compose path builds the REAL adapter, because stage() asks it whether
+    a thread draft can be placed at all (review D1)."""
 
     def capabilities(self):
         return {"read": False, "history": False, "search": False, "send": False,
@@ -191,7 +215,7 @@ def _tie_or_warn(cfg, row, key):
 
 
 # ---- targets: where a draft may go ------------------------------------------------
-def _targets(cfg):
+def _targets(cfg, adapters=None):
     """(free, replyable, unconfigured).
 
     free       {label: (inst, ch)} — channels that accept a top-level compose: the
@@ -204,33 +228,47 @@ def _targets(cfg):
                constructed (a slack instance with its token but no `channels` entry
                yet, the state the add-connection form leaves). Skipped, and NAMED, so
                a half-configured connection never takes the whole surface down.
+    unanswerable  [(instance, channel_id, reason)] — channels whose policy opens a reply
+               that this adapter cannot place (thread-only on an adapter that cannot
+               thread): no Reply offered, and the reason is rendered (review F6).
+
+    `adapters`, when given, is filled with every adapter this call constructed, by
+    instance name, so one render builds each adapter once and never outside this
+    guard (review R2-3).
 
     Both maps require send capability: offering a compose or a Reply whose adapter
     cannot deliver would stage drafts no click can ever send (every shipped live
     adapter is read-only by authorization)."""
-    free, replyable, unconfigured = {}, {}, []
+    free, replyable, unconfigured, unanswerable = {}, {}, [], []
     for inst in cfg.instances:
         try:
             adapter = _adapter_for(cfg, inst)
         except Exception as ex:  # noqa: BLE001 — surfaced per-instance by render()
             unconfigured.append((inst.name, str(ex)))
             continue
+        if adapters is not None:
+            adapters[inst.name] = adapter
         if not _can_send(adapter):
             continue
         for ch in inst.channels:
             cpol, tpol = _channel_scope_policy(ch), _thread_scope_policy(ch)
             if cpol != "never":
                 free[f"{inst.name} · {ch.id} (policy: {cpol})"] = (inst, ch)
-            if cpol != "never" or tpol != "never":
+            if cpol == "never" and tpol == "never":
+                continue
+            where, why = _placement_for(ch, adapter)
+            if where is None:
+                unanswerable.append((inst.name, ch.id, why))
+            else:
                 replyable[ch.id] = (inst, ch)
-    return free, replyable, unconfigured
+    return free, replyable, unconfigured, unanswerable
 
 
 def composable(cfg):
     """([(instance, channel, policy)], [(instance_name, reason)]) — the free compose
     targets and the connections that could not be constructed (kept for callers of
     the ENH-28 shape; render() uses _targets directly)."""
-    free, _, unconfigured = _targets(cfg)
+    free, _, unconfigured, _ = _targets(cfg)
     return ([(inst, ch, _channel_scope_policy(ch)) for inst, ch in free.values()],
             unconfigured)
 
@@ -288,7 +326,8 @@ def _stage_clicked():
     except ConfigError as ex:
         _push_flash("error", f"settings refused: {ex} — nothing staged")
         return
-    free, replyable, _ = _targets(cfg)
+    free, replyable, _, _ = _targets(cfg)
+    thread = why = None
     if reply_to is not None:
         pair = replyable.get(reply_to["channel"])
         if pair is None:
@@ -299,8 +338,6 @@ def _stage_clicked():
             return
         inst, ch = pair
         trigger = reply_to["ts"]                    # the ASK is the trigger: the tie key
-        in_thread = _thread_scope_policy(ch) != "never"
-        thread = _thread_root(cfg, ch.id, trigger) if in_thread else None
     else:
         pair = free.get(where)
         if pair is None:
@@ -310,10 +347,23 @@ def _stage_clicked():
         inst, ch = pair
         # The compose moment IS the trigger: a deliberate second compose of the same
         # text is a new draft, not a dedupe of the first.
-        trigger, thread = f"ui-compose-{time.time():.6f}", None
+        trigger = f"ui-compose-{time.time():.6f}"
     outbox = None
     try:
-        outbox = _outbox_for(cfg, inst, _NoAdapter())      # stage() never calls one
+        # The REAL adapter, though stage() never calls its send(): the placement is
+        # decided with it in hand (review F6), and stage() itself refuses a thread
+        # draft the adapter cannot place (review D1) — the backstop for a connection
+        # edited between that decision and this write.
+        adapter = _adapter_for(cfg, inst)
+        if reply_to is not None:
+            placement, why = _placement_for(ch, adapter)
+            if placement is None:
+                st.session_state.pop("reply_to", None)
+                _push_flash("error", f"channel {ch.id} has no place for a reply now "
+                                     f"({why}) — nothing staged")
+                return
+            thread = _thread_root(cfg, ch.id, trigger) if placement == "thread" else None
+        outbox = _outbox_for(cfg, inst, adapter)
         res = outbox.stage(ch.id, trigger, text, thread_id=thread)
     except PolicyError as ex:
         _push_flash("error", f"refused: {ex}")
@@ -341,8 +391,7 @@ def _stage_clicked():
         return
     placement = ("" if reply_to is None else
                  (f" as a reply to ts {trigger}, in its thread" if thread
-                  else f" as a reply to ts {trigger}, top-level (thread_reply_policy "
-                       "is 'never' for this channel)"))
+                  else f" as a reply to ts {trigger}, top-level ({why})"))
     _push_flash("success", f"staged `{res['key'][:12]}…`{placement} — waiting for your "
                            "click below; nothing has been sent")
 
@@ -441,13 +490,19 @@ def render(cfg):
     for kind, msg in st.session_state.pop("write_flash", []):
         getattr(st, kind)(msg)
 
-    free, replyable, unconfigured = _targets(cfg)
+    adapters = {}
+    free, replyable, unconfigured, unanswerable = _targets(cfg, adapters)
     for name, reason in unconfigured:
         st.warning(f"connection **{html.escape(name)}** is not fully configured yet, "
                    f"so it cannot be watched or composed to: {html.escape(reason)} "
                    "Finish it under “edit connection (adapter / auth)” below — add the "
                    "missing auth entry as an env:NAME reference — then it becomes "
                    "available. (The connection is kept; only this surface skips it.)")
+    for name, ch_id, why in unanswerable:
+        st.warning(f"no Reply for **{html.escape(ch_id)}** (connection "
+                   f"**{html.escape(name)}**): {html.escape(why)} — answer it on the "
+                   "platform, or widen the channel's reply_policy, or move the connection "
+                   "to an adapter that can thread.")
     label_of = {ch.id: label for label, (inst, ch) in free.items()}
 
     # ---- open asks: Reply pre-fills the form (ENH-30) -------------------------
@@ -485,10 +540,10 @@ def render(cfg):
                 "elsewhere; nothing to reply to")
         reply_to = None
     if reply_to is not None:
-        _, reply_ch = replyable[reply_to["channel"]]
-        placement = ("in its thread" if _thread_scope_policy(reply_ch) != "never"
-                     else "top-level in the channel (thread_reply_policy is 'never' "
-                          "for this channel)")
+        reply_inst, reply_ch = replyable[reply_to["channel"]]
+        where, why = _placement_for(reply_ch, adapters[reply_inst.name])
+        placement = ("in its thread" if where == "thread"
+                     else f"top-level in the channel ({html.escape(why)})")
         st.info(f"replying to **{html.escape(reply_to['channel'])}** · ts "
                 f"{html.escape(reply_to['ts'])} — {placement}. Sending will record "
                 "that ask as answered.")
@@ -531,15 +586,27 @@ def render(cfg):
         # Send is offered only where the adapter can deliver: a click on a draft whose
         # adapter has no send() used to flip the row to INTENT and crash — a wedge no
         # Discard could clear (review B3). The reason is on the card, not hidden.
+        adapter = adapters.get(inst.name)
         try:
-            no_send = (None if _can_send(_adapter_for(cfg, inst))
-                       else "this instance's adapter cannot send (read-only by "
-                            "authorization) — Discard is the only action")
+            if adapter is None:                 # not built above: half-configured
+                adapter = _adapter_for(cfg, inst)
+            inst_no_send = (None if _can_send(adapter)
+                            else "this instance's adapter cannot send (read-only by "
+                                 "authorization) — Discard is the only action")
         except Exception as ex:  # noqa: BLE001 — half-configured connection
-            no_send = (f"this connection is not fully configured ({html.escape(str(ex))})"
-                       " — finish it or Discard")
+            inst_no_send = (f"this connection is not fully configured ({html_text(str(ex))})"
+                            " — finish it or Discard")
         for row in drafts:
             any_staged = True
+            # Per ROW too (review F7): a thread draft on an adapter that cannot place it
+            # is B3's case on the thread dimension — Discard-only, and the card says why.
+            no_send = inst_no_send
+            if no_send is None and row["thread_id"]:
+                blocked = thread_block_reason(adapter)
+                if blocked is not None:
+                    no_send = (f"this connection's adapter cannot place a reply in thread "
+                               f"{html.escape(str(row['thread_id']))}: {html.escape(blocked)}"
+                               " — Discard is the only action")
             st.markdown(
                 "<div style='border:1px solid rgba(128,128,128,.3);border-left:"
                 "3px solid #fab219;border-radius:8px;padding:10px 14px;margin:2px 0'>"

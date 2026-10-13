@@ -337,5 +337,114 @@ class ReleaseRaceTest(unittest.TestCase):
         self.assertEqual(ob.get(key)["state"], DISCARDED)
 
 
+class NoThreadsAdapter:
+    """Send-capable but thread-INCAPABLE, in a shape the contract permits: send() takes
+    no thread_id (channels/CONTRACT.md), and capabilities() says threads are off."""
+
+    def __init__(self):
+        self.delivered = []
+
+    def capabilities(self):
+        return {"read": True, "history": True, "search": False, "send": True,
+                "react": False, "threads": False}
+
+    def send(self, target, text, key=None):
+        self.delivered.append((target, text, key))
+        return {"ts": f"receipt-{len(self.delivered)}", "key": key}
+
+    def read_back(self, target, key):
+        return any(t == target and k == key for t, _, k in self.delivered)
+
+
+class ThreadPlacementRefusalTest(unittest.TestCase):
+    """A thread reply the adapter cannot place is refused BEFORE anything is written or
+    claimed (independent delta review 2026-10-13, D1 — B3's class on the thread
+    dimension).
+
+    _deliver() refused it already, but release() had flipped STAGED -> INTENT first, so
+    the row wedged: Discard refuses an INTENT row, and recover() re-ran the same refusal
+    forever. Nothing here offers top-level instead — flattening a thread reply into the
+    main channel is the one outcome a thread-scoped policy forbids. No shipped adapter
+    has this shape; any adopter's may."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Path(self.tmp.name) / "outbox.db"
+        self.adapter = NoThreadsAdapter()
+
+    def box(self, adapter=None, policy="staged"):
+        return Outbox(self.db, adapter or self.adapter, {TARGET: policy},
+                      send_interval=0.0)
+
+    def test_release_refuses_before_the_flip_and_the_draft_stays_discardable(self):
+        # Staged while the connection's adapter could thread; the adapter was then
+        # swapped for one that cannot (the connection-change shape review S3 describes).
+        key = self.box(FakeAdapter()).stage(TARGET, TS, TEXT, thread_id=TS)["key"]
+        box = self.box()
+        with self.assertRaises(ReleaseError) as cm:
+            box.release(key)
+        self.assertIn("cannot place a reply in thread", str(cm.exception))
+        self.assertEqual(box.get(key)["state"], STAGED,
+                         "the refused thread draft left STAGED — wedged in INTENT, "
+                         "undiscardable, and unrecoverable with the same adapter")
+        self.assertEqual(self.adapter.delivered, [], "the adapter was called")
+        self.assertEqual(box.discard(key)["state"], DISCARDED)
+        box.recover()                                   # nothing in flight: no raise
+        self.assertEqual(box.get(key)["state"], DISCARDED)
+
+    def test_a_direct_thread_send_writes_no_row_the_adapter_could_never_deliver(self):
+        box = self.box(policy="direct")
+        with self.assertRaises(SendBlocked):
+            box.send(TARGET, TS, TEXT, thread_id=TS)
+        self.assertIsNone(box.get(idempotency_key(TARGET, TS, TEXT, TS)),
+                          "an INTENT row was written for a send the adapter could never "
+                          "place — recover() would refuse it on every restart")
+        self.assertEqual(self.adapter.delivered, [])
+
+    def test_stage_refuses_a_thread_draft_the_adapter_could_never_place(self):
+        with self.assertRaises(SendBlocked):
+            self.box().stage(TARGET, TS, TEXT, thread_id=TS)
+        self.assertEqual(self.box().staged(), [],
+                         "a draft no click could ever send was put at the gate")
+
+    def test_top_level_replies_through_the_same_adapter_still_flow(self):
+        box = self.box()
+        key = box.stage(TARGET, TS, TEXT)["key"]
+        self.assertEqual(box.release(key)["state"], COMMITTED)
+        self.assertEqual([d[:2] for d in self.adapter.delivered], [(TARGET, TEXT)])
+
+    def test_a_declared_no_threads_adapter_is_refused_even_with_a_kwargs_send(self):
+        """CONTRACT.md obliges only an adapter DECLARING threads to honour thread_id: a
+        **kwargs send() under `threads: False` would swallow the placement and post
+        top-level, reporting success (review F5). The declaration is consulted too."""
+        class DeclaredNoThreads(NoThreadsAdapter):
+            def send(self, target, text, key=None, **opts):
+                self.delivered.append((target, text, key))
+                return {"ts": f"receipt-{len(self.delivered)}", "key": key}
+        adapter = DeclaredNoThreads()
+        key = self.box(FakeAdapter()).stage(TARGET, TS, TEXT, thread_id=TS)["key"]
+        box = self.box(adapter)
+        with self.assertRaises(ReleaseError) as cm:
+            box.release(key)
+        self.assertIn("declares no thread support", str(cm.exception))
+        self.assertEqual((box.get(key)["state"], adapter.delivered), (STAGED, []))
+        with self.assertRaises(SendBlocked):
+            box.stage(TARGET, "2.0", TEXT, thread_id="2.0")
+
+    def test_a_replay_of_a_delivered_thread_reply_is_answered_from_its_row(self):
+        """R2: the same reply sent twice returns the first receipt. The placement check
+        runs only when a NEW row would be minted, so a connection since swapped to a
+        thread-incapable adapter still answers the replay from the row (review F9)."""
+        capable = self.box(FakeAdapter())
+        key = capable.stage(TARGET, TS, TEXT, thread_id=TS)["key"]
+        self.assertEqual(capable.release(key)["state"], COMMITTED)
+        box = self.box()                                    # NoThreadsAdapter, same db
+        replay = box.send(TARGET, TS, TEXT, thread_id=TS)
+        self.assertEqual((replay["deduped"], replay["state"]), (True, COMMITTED))
+        self.assertTrue(box.stage(TARGET, TS, TEXT, thread_id=TS)["deduped"])
+        self.assertEqual(self.adapter.delivered, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

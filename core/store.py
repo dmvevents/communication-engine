@@ -53,6 +53,16 @@ CREATE TABLE IF NOT EXISTS arrivals (
     arrived_at   REAL NOT NULL,
     PRIMARY KEY (channel_type, channel_id, ts)
 );
+CREATE TABLE IF NOT EXISTS sweep_state (
+    instance     TEXT NOT NULL,
+    channel_id   TEXT NOT NULL,
+    next_start   INTEGER NOT NULL,
+    PRIMARY KEY (instance, channel_id)
+);
+CREATE TABLE IF NOT EXISTS sweep_order (
+    instance     TEXT NOT NULL PRIMARY KEY,
+    channels     TEXT NOT NULL
+);
 """
 
 
@@ -100,7 +110,7 @@ class Store:
         if "attachments" not in cols:
             self.conn.execute("ALTER TABLE messages ADD COLUMN attachments TEXT")
 
-    # ---- messages ---------------------------------------------------------        # ENH-30: the thread sweep asks two questions per open ask every cycle
+        # ENH-30: the thread sweep asks two questions per open ask every cycle
         # (thread_root, thread_replies); without these both were full table scans
         # (independent review F11). IF NOT EXISTS keeps an adopter's existing db.
         self.conn.execute("CREATE INDEX IF NOT EXISTS messages_channel_thread "
@@ -109,6 +119,7 @@ class Store:
                           "ON messages (channel_id, ts)")
         self.conn.commit()
 
+    # ---- messages ---------------------------------------------------------
     @staticmethod
     def validate(msg: dict) -> None:
         """Raise SchemaError unless msg carries exactly the pinned contract.
@@ -213,6 +224,39 @@ class Store:
         self.conn.execute(
             "INSERT OR REPLACE INTO cursors (instance, channel_id, cursor, updated_at) "
             "VALUES (?,?,?,?)", (instance, channel_id, cursor, updated_at))
+        self.conn.commit()
+
+    # ---- thread-sweep state (ENH-30; durable since review ENH-33/F1) ---------------
+    def sweep_start_get(self, instance: str, channel_id: str) -> int:
+        row = self.conn.execute(
+            "SELECT next_start FROM sweep_state WHERE instance=? AND channel_id=?",
+            (instance, channel_id)).fetchone()
+        return int(row[0]) if row else 0
+
+    def sweep_start_set(self, instance: str, channel_id: str, next_start: int) -> None:
+        """Where this channel's sweep window resumes next cycle. DURABLE on purpose: the
+        documented cron deployment (`scheduler.py --once`) builds a new Scheduler per
+        run, and an in-memory window restarted at the newest asks on every run, so the
+        asks behind them were never swept (independent review of ENH-33, F1). An index
+        into a list that gains and loses asks drifts a little; it wraps modulo the list,
+        so the drift is bounded and every ask is still reached."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO sweep_state (instance, channel_id, next_start) "
+            "VALUES (?,?,?)", (instance, channel_id, int(next_start)))
+        self.conn.commit()
+
+    def sweep_order_get(self, instance: str) -> list:
+        row = self.conn.execute(
+            "SELECT channels FROM sweep_order WHERE instance=?", (instance,)).fetchone()
+        return list(json.loads(row[0])) if row else []
+
+    def sweep_order_set(self, instance: str, channels) -> None:
+        """The order this source's channels are swept in next cycle — the same
+        durability argument as sweep_start_set: restarted in config order, every
+        `--once` run re-skipped the same tail of channels."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO sweep_order (instance, channels) VALUES (?,?)",
+            (instance, json.dumps(list(channels))))
         self.conn.commit()
 
     def close(self) -> None:

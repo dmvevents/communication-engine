@@ -66,6 +66,30 @@ def seed_demo(adapters, cfg):
                   "polling it as-is")
 
 
+def report_lines(summary) -> list:
+    """The cycle line, then one line per thread-sweep refusal (ENH-30) — a 429, a
+    truncated channel, a dead thread, a channel the budget never reached — never folded
+    into "ok" (G4). Module-level so a test can pin the wording (review ENH-33/F4)."""
+    lines = [f"cycle: polled={summary['polled']} fresh={summary['fresh']} "
+             f"unattended={summary['unattended']} "
+             f"next-fire<={summary['next_interval']:.0f}s "
+             f"answered={summary['answered']}"]
+    for ch, method in summary["sweep_rate_limited"]:
+        lines.append(f"sweep: RATE-LIMITED channel={ch} method={method} — answers not "
+                     "looked for this cycle")
+    for ch in summary["sweep_truncated"]:
+        lines.append(f"sweep: TRUNCATED channel={ch} — more open asks than one cycle "
+                     "sweeps; the oldest wait for a later cycle")
+    for ch, ts, msg in summary["sweep_errors"]:
+        lines.append(f"sweep: ERROR channel={ch} ask={ts} {msg}")
+    for ch, why in summary["sweep_skipped"]:
+        cause = ("the platform rate-limited this adapter's sweep before it reached this "
+                 "channel" if why == "rate-limited" else
+                 "this adapter's thread budget was spent before it reached this channel")
+        lines.append(f"sweep: SKIPPED channel={ch} — {cause}; it is swept first next cycle")
+    return lines
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Run the reference probe/classify/journal/route/owed loop.")
@@ -111,19 +135,7 @@ def main(argv=None):
                           notify=lambda m: print(f"OPERATOR: {m}", flush=True))
 
     def report(summary):
-        print(f"cycle: polled={summary['polled']} fresh={summary['fresh']} "
-              f"unattended={summary['unattended']} "
-              f"next-fire<={summary['next_interval']:.0f}s "
-              f"answered={summary['answered']}", flush=True)
-        # ENH-30: the thread sweep's refusals, one line each, never folded into "ok".
-        for ch, method in summary["sweep_rate_limited"]:
-            print(f"sweep: RATE-LIMITED channel={ch} method={method} — answers not "
-                  "looked for this cycle", flush=True)
-        for ch in summary["sweep_truncated"]:
-            print(f"sweep: TRUNCATED channel={ch} — more open asks than one cycle "
-                  "sweeps; the oldest wait for a later cycle", flush=True)
-        for ch, ts, msg in summary["sweep_errors"]:
-            print(f"sweep: ERROR channel={ch} ask={ts} {msg}", flush=True)
+        print("\n".join(report_lines(summary)), flush=True)
 
     sched = Scheduler(store=store, journal=journal, owed=owed, escalator=escalator,
                       sources=sources, base_interval=base,

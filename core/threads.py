@@ -75,6 +75,15 @@ def answered_by(asker: str | None, replies, is_answer=None) -> dict | None:
     return None
 
 
+def open_asks_for(journal, channel: str) -> list:
+    """This channel's open ASKS (ACTIONABLE_KINDS only), newest first — the one list the
+    sweep works from, exposed so the cycle can tell a channel the budget skipped that
+    owes nothing from one left behind (review F4)."""
+    rows = [r for r in journal.unanswered(channel) if r["kind"] in ACTIONABLE_KINDS]
+    rows.sort(key=lambda r: ts_order(r["ts"]), reverse=True)
+    return rows
+
+
 def sweep(adapter, store, journal, channel: str, *,
           max_threads: int = SWEEP_MAX, start: int = 0, is_answer=None) -> dict | None:
     """Fetch new replies under this channel's open asks and tie answers to them.
@@ -84,6 +93,9 @@ def sweep(adapter, store, journal, channel: str, *,
 
         swept         threads actually fetched this call (one call per thread ROOT,
                       however many open asks live under it)
+        calls         platform calls ATTEMPTED this call: fetched + refused + the one
+                      that answered 429 — the budget charges this, never `swept` (an
+                      all-errors channel was charged nothing; review ENH-33/F2)
         next_start    the `start` for the next call — the window rotates through the
                       open asks (newest first) so none starves behind the newest few
         replies       every reply fetched this call (re-sightings included — the
@@ -96,9 +108,8 @@ def sweep(adapter, store, journal, channel: str, *,
     """
     if not hasattr(adapter, "replies"):
         return None
-    open_asks = [r for r in journal.unanswered(channel) if r["kind"] in ACTIONABLE_KINDS]
-    open_asks.sort(key=lambda r: ts_order(r["ts"]), reverse=True)
-    result = {"swept": 0, "replies": [], "answered": [], "truncated": False,
+    open_asks = open_asks_for(journal, channel)
+    result = {"swept": 0, "calls": 0, "replies": [], "answered": [], "truncated": False,
               "rate_limited": None, "errors": [], "next_start": 0}
     if not open_asks:
         return result
@@ -109,7 +120,12 @@ def sweep(adapter, store, journal, channel: str, *,
     rotated = open_asks[start:] + open_asks[:start]
     batch = rotated[:max_threads]
     result["truncated"] = len(open_asks) > len(batch)
-    result["next_start"] = (start + len(batch)) % len(open_asks)
+    # The window advances only as far as the loop GETS. Computed up front, a 429 after
+    # the first fetch left it past every ask the batch never reached: under a tier of
+    # one call per cycle the same ask was fetched forever and its siblings' answers
+    # never closed them (independent review of ENH-33, R2-1).
+    pos = {str(r["ts"]): i for i, r in enumerate(batch)}
+    reached = len(batch)
     # One platform call per thread ROOT, however many open asks live under it.
     by_root: dict = {}
     for row in batch:
@@ -126,10 +142,12 @@ def sweep(adapter, store, journal, channel: str, *,
         # the caller, so a store-derived floor would skip a reply that is stored but
         # not journaled (the inverted dual-write).
         oldest = min((str(r["ts"]) for r in rows), key=ts_order)
+        result["calls"] += 1            # an attempt is a call, whatever it answers
         try:
             fetched = list(adapter.replies(channel, root, oldest=oldest))
         except RateLimited as ex:
             result["rate_limited"] = ex.method or "replies"
+            reached = min(pos[str(r["ts"])] for r in rows)    # this root was not fetched
             break
         except Exception as ex:  # noqa: BLE001 — recorded by ask, never swallowed
             result["errors"].extend((str(r["ts"]), f"{type(ex).__name__}: {ex}")
@@ -151,4 +169,5 @@ def sweep(adapter, store, journal, channel: str, *,
                 journal.mark_responded(channel, row["ts"], f"thread-reply:{hit['ts']}",
                                        at=arrivals.get(str(hit["ts"])))
                 result["answered"].append((str(row["ts"]), str(hit["ts"])))
+    result["next_start"] = (start + reached) % len(open_asks)
     return result
