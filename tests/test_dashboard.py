@@ -183,6 +183,14 @@ class SnapshotTest(unittest.TestCase):
             if later in sevs:
                 self.assertLess(sevs.index("unresolved_send"), sevs.index(later), later)
         self.assertEqual(s["outbox"]["team"]["MISMATCH"], 1)
+        # settled by a human (round 3): kept, counted, no longer triage
+        conn = sqlite3.connect(self.outbox)
+        conn.execute("UPDATE outbox SET state='SETTLED' WHERE key=?", (draft,))
+        conn.commit()
+        conn.close()
+        s = self.snap()
+        self.assertEqual([i["state"] for i in self.by_severity(s, "unresolved_send")], ["MISMATCH"])
+        self.assertEqual(s["outbox"]["team"]["SETTLED"], 1)
 
     def test_in_flight_is_exactly_the_intent_and_sent_rows(self):
         """COMMITTED is done and STAGED is a different queue; surfacing either as a
@@ -653,6 +661,26 @@ class UnansweredIsAsksOnlyTest(unittest.TestCase):
         _, counts = self.unanswered()
         self.assertEqual(counts["answered"], 2)
         self.assertEqual(counts["answered_by_thread"], 1)
+
+
+class NoDeployMenuTest(unittest.TestCase):
+    """The operator dashboard holds Slack credentials and renders journal text; Streamlit's
+    default toolbar offers "Deploy" to Community Cloud ("unlimited public apps") from inside
+    it — a public-publishing path (aws-do-agent UI review, CO-Deploy, 2026-10-13). The serve
+    script and the repo's Streamlit config both switch the toolbar to viewer mode, so a
+    deployment inherits one or the other. Configuration-level checks: the toolbar is rendered
+    client-side and never appears in the served HTML."""
+
+    def test_the_serve_script_and_the_config_disable_the_deploy_toolbar(self):
+        serve = (ROOT / "scripts" / "dashboard-serve.sh").read_text()
+        # the flag as an ARGUMENT line, not the comment that explains it
+        self.assertRegex(serve, r"(?m)^\s+--client\.toolbarMode viewer \\$",
+                         "the serve script leaves Streamlit's Deploy menu on")
+        config = (ROOT / ".streamlit" / "config.toml").read_text()
+        self.assertRegex(config, r'(?m)^\[client\]\ntoolbarMode = "viewer"$',
+                         "the repo config leaves Streamlit's Deploy menu on")
+        self.assertRegex(config, r"(?m)^gatherUsageStats = false$")
+        self.assertIn("--server.address 127.0.0.1", serve)
 
 
 if __name__ == "__main__":

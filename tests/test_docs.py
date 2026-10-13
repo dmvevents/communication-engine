@@ -1004,12 +1004,27 @@ class SendPathDocsTest(unittest.TestCase):
         the DM rule and false of the thread sweep (one reply closes every open ask under its
         root, by design); recovery's bound and the UNPROVEN state must be stated where the
         adopter reads about recovery."""
-        from core.outbox import UNPROVEN
-        self.assertNotIn("A message closes at most\none ask, ever", self.text)
-        self.assertIn("In a direct message a message closes at most one ask, ever", self.text)
-        self.assertIn("one reply\ncan close several people's asks", self.text)
-        self.assertIn(f"`{UNPROVEN}`", self.text, "recovery's terminal state is undocumented")
-        self.assertIn("at\nmost once", self.text, "recovery's re-send bound is undocumented")
+        from core.outbox import SETTLED, UNPROVEN
+        flat = " ".join(self.text.split())
+        self.assertNotIn("A message closes at most one ask, ever", flat)
+        self.assertIn("In a direct message a message closes at most one ask, ever", flat)
+        self.assertIn("one reply can close several people's asks", flat)
+        self.assertIn(f"`{UNPROVEN}`", flat, "recovery's terminal state is undocumented")
+        self.assertIn("at most once per completed run", flat,
+                      "recovery's re-send bound is overstated or undocumented (round 3: a crash "
+                      "between the re-send and its record can add one)")
+        self.assertIn(f"`{SETTLED}`", flat, "the human's terminal action on a parked row is undocumented")
+        self.assertIn("ambiguous answer", flat, "the post's ambiguous answers (internal_error, 5xx) "
+                                               "must be stated as left in flight")
+
+    def test_the_suite_is_documented_as_running_under_the_network_guard(self):
+        """Round 3 (R3-1): 'nothing in the suite reaches slack.com' was a promise one test
+        broke silently; the guard in tests/netguard enforces it, and the docs, CI and the
+        pre-push hook must all run the suite under it."""
+        self.assertTrue((ROOT / "tests" / "netguard" / "sitecustomize.py").is_file())
+        self.assertIn("PYTHONPATH=tests/netguard", self.text)
+        for path in (ROOT / ".github" / "workflows" / "tests.yml", ROOT / "scripts" / "install-hooks.sh"):
+            self.assertIn("tests/netguard", path.read_text(), f"{path.name} runs the suite unguarded")
 
     def test_localhost_is_not_documented_as_an_accepted_stub_host(self):
         for doc in (QUICKSTART, ROOT / "channels" / "slack" / "README.md"):

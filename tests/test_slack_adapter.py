@@ -290,6 +290,36 @@ class SendTest(SlackAdapterTestCase):
         self.assertTrue(a.read_back("C_ONE", "k9", thread_id="1.0"))
         self.assertTrue(self.http.requests[0][0].endswith("/conversations.replies"))
 
+    def test_only_a_definite_refusal_of_the_post_is_not_posted(self):
+        """Review round 3 (R3-3): NotPosted is an allowlist. internal_error, fatal_error and
+        a non-JSON 5xx may have posted; they stay ApiError so the row stays in flight."""
+        from core.delivery import NotPosted
+        a = self.make([(200, {}, {"ok": False, "error": "not_in_channel"})])
+        with self.assertRaises(NotPosted):
+            a.send("C_ONE", "[AGENT] x", key="k1")
+        for answer in ((200, {}, {"ok": False, "error": "internal_error"}),
+                       (200, {}, {"ok": False, "error": "fatal_error"}),
+                       (504, {}, "<html>gateway timeout</html>")):
+            with self.subTest(answer=answer):
+                a = self.make([answer])
+                with self.assertRaises(self.mod.ApiError) as cm:
+                    a.send("C_ONE", "[AGENT] x", key="k1")
+                self.assertNotIsInstance(cm.exception, NotPosted)
+
+    def test_a_gone_target_on_read_back_is_target_gone_and_an_outage_is_not(self):
+        """Review round 3 (R3-5): thread_not_found / channel_not_found / is_archived mean the
+        reply can never be placed — recovery parks on them; anything else is transient."""
+        from core.delivery import TargetGone
+        for error in ("thread_not_found", "channel_not_found", "is_archived"):
+            with self.subTest(error=error):
+                a = self.make([(200, {}, {"ok": False, "error": error})])
+                with self.assertRaises(TargetGone):
+                    a.read_back("C_ONE", "k9", thread_id="1.0")
+        a = self.make([(200, {}, {"ok": False, "error": "service_unavailable"})])
+        with self.assertRaises(self.mod.ApiError) as cm:
+            a.read_back("C_ONE", "k9", thread_id="1.0")
+        self.assertNotIsInstance(cm.exception, TargetGone)
+
     def test_a_thread_read_back_asks_for_message_metadata(self):
         """Review F2: conversations.replies serves metadata only when asked, exactly like
         history. Without the flag every thread read-back is 'unproven' and recovery

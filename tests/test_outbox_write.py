@@ -778,9 +778,14 @@ class SendGuardsTest(unittest.TestCase):
         box.conn.execute("UPDATE outbox SET state='INTENT' WHERE key=?", (key,))
         box.conn.commit()
         counts = box.recover()
-        self.assertEqual((counts["resent"], counts["unproven"], len(adapter.delivered)), (1, 1, 1))
-        self.assertEqual(box.get(key)["state"], UNPROVEN)
+        # run 1: the one re-send; its immediate read-back miss is not proof of absence, so
+        # the row is left SENT for the next run (round 3, R3-5 c)
+        self.assertEqual((counts["resent"], counts["unproven"], len(adapter.delivered)), (1, 0, 1))
+        self.assertEqual(box.get(key)["state"], SENT)
         self.assertIsNotNone(box.get(key)["resent_at"])
+        counts = box.recover()                                    # run 2: still no key -> parked
+        self.assertEqual((counts["resent"], counts["unproven"], box.get(key)["state"]),
+                         (0, 1, UNPROVEN))
         self.assertEqual(box.recover()["resumed"], 0, "an UNPROVEN row was touched again")
         self.assertEqual(len(adapter.delivered), 1, "recovery posted a third copy")
         res = box.send(TARGET, TS, self.MARKED)                   # a live retry of the same text
@@ -807,26 +812,102 @@ class SendGuardsTest(unittest.TestCase):
         self.assertEqual((counts["resent"], counts["unproven"], adapter.delivered), (0, 1, []))
         self.assertEqual(box.get(key)["state"], UNPROVEN)
 
-    def test_a_row_whose_read_back_keeps_failing_is_parked_after_three_runs(self):
-        """Review F7's missing half: a dead thread (replies -> thread_not_found) must not be
-        retried forever; after MAX_RECOVER_ATTEMPTS runs it is parked for a human."""
-        from core.outbox import MAX_RECOVER_ATTEMPTS, UNPROVEN
+    def test_a_gone_target_is_parked_at_once_and_a_transient_error_never_is(self):
+        """Review F7's missing half, as round 3 (R3-5 a) sharpened it: the adapter says the
+        target is GONE (core.delivery.TargetGone: the thread's parent deleted) and the row is
+        parked on the first run — nothing will ever place it; any other read-back error is
+        an outage, recorded and retried, never parked, never posted."""
+        from core.delivery import TargetGone
+        from core.outbox import UNPROVEN
 
-        class DeadThreadFake(GuardedFake):
+        class OutageFake(GuardedFake):
             def read_back(self, target, key, thread_id=None, text=None, since=None):
-                raise RuntimeError("conversations.replies failed: thread_not_found")
-        adapter = DeadThreadFake()
+                raise RuntimeError("conversations.replies failed: service_unavailable")
+        adapter = OutageFake()
         box = self.box(adapter=adapter)
-        key = box.stage(TARGET, TS, self.MARKED, thread_id="dead")["key"]
+        key = box.stage(TARGET, TS, self.MARKED, thread_id="t")["key"]
         box.conn.execute("UPDATE outbox SET state='INTENT' WHERE key=?", (key,))
         box.conn.commit()
-        for n in range(1, MAX_RECOVER_ATTEMPTS):
+        for n in range(1, 6):
             counts = box.recover()
-            self.assertEqual((box.get(key)["state"], box.get(key)["attempts"]), (INTENT, n))
-            self.assertIn("thread_not_found", counts["errors"][0][1])
+            self.assertEqual((box.get(key)["state"], box.get(key)["attempts"], counts["unproven"]),
+                             (INTENT, n, 0), "a transient error parked a never-posted reply")
+            self.assertIn("service_unavailable", counts["errors"][0][1])
+        self.assertEqual(adapter.delivered, [])
+
+        class GoneFake(GuardedFake):
+            def read_back(self, target, key, thread_id=None, text=None, since=None):
+                raise TargetGone("conversations.replies: thread_not_found")
+        gone = GoneFake()
+        box2 = Outbox(Path(self.tmp.name) / "o4.db", gone, {TARGET: "staged"},
+                      send_interval=0.0, marker="[AGENT]")
+        key2 = box2.stage(TARGET, TS, self.MARKED, thread_id="dead")["key"]
+        box2.conn.execute("UPDATE outbox SET state='INTENT' WHERE key=?", (key2,))
+        box2.conn.commit()
+        counts = box2.recover()
+        self.assertEqual((box2.get(key2)["state"], counts["unproven"]), (UNPROVEN, 1))
+        self.assertIn("gone", counts["errors"][0][1])
+        self.assertEqual(gone.delivered, [], "a dead thread was re-sent, top-level or not")
+        self.assertEqual(box2.recover()["resumed"], 0)
+
+    def test_a_read_after_write_miss_is_proven_on_the_next_run_not_parked(self):
+        """Review round 3 (R3-5 c): the re-send landed but the immediate read-back missed it
+        (eventual consistency). Parking there lost a correct delivery; the row stays SENT and
+        the next run proves and commits it."""
+        class MissOnceFake(GuardedFake):
+            def __init__(self):
+                super().__init__()
+                self.miss = 2                      # the first read-back (absent) and the one after the re-send
+
+            def read_back(self, target, key, thread_id=None, text=None, since=None):
+                if self.miss:
+                    self.miss -= 1
+                    return False
+                return super().read_back(target, key)
+        adapter = MissOnceFake()
+        box = self.box(adapter=adapter)
+        key = box.stage(TARGET, TS, self.MARKED)["key"]
+        box.conn.execute("UPDATE outbox SET state='INTENT' WHERE key=?", (key,))
+        box.conn.commit()
         counts = box.recover()
-        self.assertEqual((box.get(key)["state"], counts["unproven"]), (UNPROVEN, 1))
-        self.assertEqual(adapter.delivered, [], "a dead thread was re-sent, top-level or not")
+        self.assertEqual((counts["resent"], counts["unproven"], box.get(key)["state"]), (1, 0, SENT))
+        counts = box.recover()
+        self.assertEqual((counts["already_delivered"], box.get(key)["state"], len(adapter.delivered)),
+                         (1, COMMITTED, 1))
+
+    def test_settle_and_reapprove_are_the_human_exits_from_a_parked_row(self):
+        """Review round 3 (R3-6, R3-7): a plain click on a parked row sends nothing and says
+        'unresolved'; settle() retires it (SETTLED, kept, no longer triage) from UNPROVEN or
+        MISMATCH only; release(reapprove=True) is the human's one more post on an UNPROVEN
+        row, through the same guards; a settled row never sends again."""
+        from core.outbox import MISMATCH, SETTLED, UNPROVEN
+        box = self.box()
+        key = box.stage(TARGET, TS, self.MARKED)["key"]
+        box.conn.execute("UPDATE outbox SET state='UNPROVEN' WHERE key=?", (key,))
+        box.conn.commit()
+        plain = box.release(key)                                  # a stale Send button
+        self.assertEqual((plain.get("unresolved"), plain["state"], self.adapter.delivered),
+                         (True, UNPROVEN, []))
+        with self.assertRaises(ReleaseError):
+            box.discard(key)                                      # not a draft
+        self.assertEqual(box.release(key, reapprove=True)["state"], COMMITTED)
+        self.assertEqual(len(self.adapter.delivered), 1)
+        key2 = box.stage(TARGET, "2.0", self.MARKED)["key"]
+        with self.assertRaises(ReleaseError):
+            box.settle(key2)                                      # a draft is discarded, not settled
+        box.conn.execute("UPDATE outbox SET state='MISMATCH' WHERE key=?", (key2,))
+        box.conn.commit()
+        self.assertEqual(box.release(key2, reapprove=True).get("unresolved"), True,
+                         "a MISMATCH row was re-sent — the message IS on the platform")
+        self.assertEqual(box.settle(key2)["state"], SETTLED)
+        for kw in ({}, {"reapprove": True}):
+            with self.assertRaises(ReleaseError) as cm:
+                box.release(key2, **kw)
+            self.assertIn("SETTLED by a human", str(cm.exception),
+                          "a settled row must be refused BY NAME, not by a lost race")
+        res = box.send(TARGET, "2.0", self.MARKED)
+        self.assertEqual((res["state"], res.get("settled"), len(self.adapter.delivered)),
+                         (SETTLED, True, 1))
         self.assertEqual(box.recover()["resumed"], 0)
 
     def test_recovery_honours_the_adapters_send_capability(self):

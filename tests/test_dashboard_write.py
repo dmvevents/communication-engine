@@ -692,6 +692,58 @@ class SlackStubWriteSurfaceTest(_WriteSurfaceBase):
         self.assertIn("U_ASKER", flashes)
         self.assertEqual((self.rows()[0]["state"], self.stub.posted(self.DM)), ("STAGED", []))
 
+    def test_a_polled_statement_the_page_never_lists_still_refuses_the_click(self):
+        """Review round 3 (R3-4): the page lists open asks, never statements. A polled
+        "never mind, found it" was journaled, taken as the baseline, and the reply posted
+        after it. The baseline is the newest LISTED ask — here the ask itself — so the
+        statement refuses the click."""
+        later = self.stub.seed(self.DM, "never mind, found it", user="U_ASKER")
+        j = Journal(self.base / "state" / "journal.db")
+        j.record(self.DM, later, sender_id="U_ASKER", text="never mind, found it", kind="STATEMENT")
+        j.close()
+        at = self.reply_and_stage(self.run_app(), self.REPLY)
+        self.assertFalse(at.exception)
+        self.assertEqual(self.rows()[0]["seen_ts"], self.ASK_TS,
+                         "a journaled statement the page never showed became the baseline")
+        at = self.buttons(at, "send-")[0].click().run()
+        flashes = "\n".join(str(x.value) for x in list(at.error) + list(at.warning))
+        self.assertIn("re-read first", flashes)
+        self.assertEqual((self.rows()[0]["state"], self.stub.posted(self.DM)), ("STAGED", []))
+
+    def test_a_reply_to_an_in_thread_ask_is_baselined_on_that_ask_and_posts_first_time(self):
+        """Review round 3 (R3-8): baselining a thread reply on its ROOT refused the first
+        click naming the very in-thread question being answered. The ask the human clicked
+        Reply on is what they saw; nothing newer in the thread means the click posts."""
+        root, ask = "1700000005.000100", "1700000006.000100"
+        self.stub.seed("C_CUST", "deploy thread", user="U_ASKER", ts=root)
+        self.stub.seed("C_CUST", "which dashboard do you mean?", user="U_ASKER", ts=ask,
+                       thread_ts=root)
+        j = Journal(self.base / "state" / "journal.db")
+        j.record("C_CUST", ask, sender_id="U_ASKER", text="which dashboard do you mean?",
+                 kind="QUESTION")
+        j.close()
+        store = Store(self.base / "state" / "messages.db")
+        store.upsert_messages([
+            {"channel_type": "slack", "channel_id": "C_CUST", "sender_id": "U_ASKER", "ts": root,
+             "text": "deploy thread", "thread_id": None},
+            {"channel_type": "slack", "channel_id": "C_CUST", "sender_id": "U_ASKER", "ts": ask,
+             "text": "which dashboard do you mean?", "thread_id": root}])
+        store.close()
+        at = self.run_app()
+        reply = [b for b in self.buttons(at, "reply|") if ask in b.key]
+        self.assertEqual(len(reply), 1, [b.key for b in self.buttons(at, "reply|")])
+        at = reply[0].click().run()
+        at.text_area[0].input("the comms one")
+        at = self.buttons(at, "FormSubmitter:compose")[0].click().run()
+        self.assertFalse(at.exception)
+        row = [r for r in self.rows() if "the comms one" in r["text"]][0]
+        self.assertEqual(row["seen_ts"], ask, "the baseline was the root, not the ask answered")
+        at = self.buttons(at, f"send-{row['key']}")[0].click().run()
+        self.assertFalse(at.exception)
+        self.assertIn("sent and proven", "\n".join(str(x.value) for x in at.success))
+        (post,) = self.stub.posted("C_CUST")
+        self.assertEqual(post["thread_ts"], root)
+
     def test_a_mangled_post_is_parked_as_mismatch_on_the_surface_and_nothing_more_is_sent(self):
         """Guard 3's third answer on the shipped path (review F3): the platform holds a
         message with this draft's key and other text. The flash says so (not "unproven,
@@ -804,11 +856,22 @@ class WriteSurfaceReviewTest(_WriteSurfaceBase):
                         ignore=shutil.ignore_patterns("__pycache__"))
         (base / "settings.json").write_text(
             self.SLACK_SETTINGS if adapter == "slack" else self.SOCKET_SETTINGS)
+        # The REAL adapter is pointed at a loopback stub: since the staged send() records a
+        # baseline (newest()), an adapter left at its default base would reach slack.com
+        # from the suite (review round 3, R3-1). The guard in tests/netguard makes that a
+        # red test; this keeps the helper honest even without the guard.
+        sys.path.insert(0, str(ROOT / "tests"))
+        from slack_stub import SlackStub
+        stub = SlackStub().start()
+        self.addCleanup(stub.stop)
+        self._helper_stub = stub
         os.environ.update(WS_TEST_TOK="placeholder-not-a-token", WS_TEST_CH="C_X",
                           WS_TEST_APP="placeholder-not-a-token",
                           COMMS_SETTINGS=str(base / "settings.json"),
-                          COMMS_UI_WRITE_ENABLED="true")
-        self.addCleanup(lambda: [os.environ.pop(k, None) for k in ("WS_TEST_TOK", "WS_TEST_CH")])
+                          COMMS_UI_WRITE_ENABLED="true",
+                          COMMS_SLACK_API_BASE=stub.base)
+        self.addCleanup(lambda: [os.environ.pop(k, None)
+                                 for k in ("WS_TEST_TOK", "WS_TEST_CH", "COMMS_SLACK_API_BASE")])
         cfg = load(base / "settings.json")
         inst = cfg.instance("sl")
         (base / "state").mkdir(exist_ok=True)
@@ -1002,8 +1065,61 @@ class WriteSurfaceReviewTest(_WriteSurfaceBase):
         self.assertEqual((self.buttons(at, "send-"), self.buttons(at, "discard-")), ([], []))
         cards = "\n".join(str(m.value) for m in at.markdown)
         self.assertIn("UNPROVEN", cards)
-        self.assertIn("changed text", cards)
+        self.assertIn("send it again", cards)
+        self.assertIn("mark it settled", cards)
         self.assertIn("Needs a human", cards)
+        self.assertEqual((len(self.buttons(at, "settle-")), len(self.buttons(at, "reapprove-"))), (1, 1),
+                         "the parked row's own actions are missing")
+
+    def test_a_stale_send_on_a_parked_row_says_nothing_was_sent(self):
+        """Review round 3 (R3-6): a Send drawn while the row was STAGED, clicked after a
+        recovery run parked it, flashed a green 'sent and proven'. Nothing is sent, and the
+        flash must say so."""
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        at = self.compose(self.run_app(), "approved, then parked under the operator's feet")
+        key = self.rows()[0]["key"]
+        send = self.buttons(at, "send-")[0]                      # drawn while STAGED
+        conn = sqlite3.connect(self.base / "state" / "outbox-team.db")
+        conn.execute("UPDATE outbox SET state='UNPROVEN' WHERE key=?", (key,))
+        conn.commit()
+        conn.close()
+        at = send.click().run()
+        self.assertFalse(at.exception)
+        self.assertEqual("\n".join(str(x.value) for x in at.success), "",
+                         "a stale click on a parked row flashed success")
+        warnings = "\n".join(str(x.value) for x in at.warning)
+        self.assertIn("nothing sent", warnings)
+        self.assertIn("UNPROVEN", warnings)
+        self.assertEqual(self.rows()[0]["state"], "UNPROVEN")
+
+    def test_a_parked_row_can_be_settled_or_sent_again_by_a_human(self):
+        """Review round 3 (R3-7): an unresolved send could never leave triage. The card's
+        'Settled' keeps the row as SETTLED and removes it; its 'Send again' (UNPROVEN only)
+        is one more post through the same guards, an explicit second approval."""
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        at = self.compose(self.run_app(), "first parked reply")
+        at = self.compose(at, "second parked reply")
+        first, second = [r["key"] for r in self.rows()]
+        conn = sqlite3.connect(self.base / "state" / "outbox-team.db")
+        conn.execute("UPDATE outbox SET state='UNPROVEN' WHERE key=?", (first,))
+        conn.execute("UPDATE outbox SET state='MISMATCH' WHERE key=?", (second,))
+        conn.commit()
+        conn.close()
+        at = self.run_app()
+        self.assertEqual(len(self.buttons(at, "settle-")), 2)
+        self.assertEqual([b.key for b in self.buttons(at, "reapprove-")], [f"reapprove-{first}"],
+                         "Send again must be offered for UNPROVEN only — a MISMATCH is on the platform")
+        at = self.buttons(at, f"settle-{second}")[0].click().run()
+        self.assertFalse(at.exception)
+        self.assertIn("settled", "\n".join(str(x.value) for x in at.success))
+        states = {r["key"]: r["state"] for r in self.rows()}
+        self.assertEqual(states[second], "SETTLED")
+        self.assertEqual(len(self.buttons(at, "settle-")), 1, "a settled row still has a card")
+        at = self.buttons(at, f"reapprove-{first}")[0].click().run()
+        self.assertFalse(at.exception)
+        self.assertIn("sent again and proven", "\n".join(str(x.value) for x in at.success))
+        self.assertEqual({r["key"]: r["state"] for r in self.rows()}[first], "COMMITTED")
+        self.assertEqual((self.buttons(at, "settle-"), self.buttons(at, "reapprove-")), ([], []))
 
     def test_a_draft_staged_before_the_marker_was_configured_is_refused_at_the_click(self):
         """Review X7: the marker is verified again at the click BY THE OUTBOX THE SURFACE

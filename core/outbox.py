@@ -41,7 +41,7 @@ import time
 from pathlib import Path
 
 from core import redact
-from core.delivery import DeliveryMismatch, NotPosted
+from core.delivery import DeliveryMismatch, NotPosted, TargetGone
 from core.ratelimit import RateLimited
 
 INTENT, SENT, VERIFIED, COMMITTED, STAGED = (
@@ -58,7 +58,11 @@ MISMATCH = "MISMATCH"
 # human acts: never re-sent again, never committed, skipped by recover() — before, every
 # recover() run posted another copy, or retried forever (review round 2, R2-6 / F7).
 UNPROVEN = "UNPROVEN"
-MAX_RECOVER_ATTEMPTS = 3
+# A human looked at the platform and settled a MISMATCH or UNPROVEN row (settle()). Terminal
+# and KEPT, like DISCARDED: the record that this text was approved, went wrong, and was
+# resolved by a person — and no longer triage (round 3, R3-7: an unresolved send could never
+# leave the list).
+SETTLED = "SETTLED"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS outbox (
@@ -310,9 +314,14 @@ class Outbox:
                 "stage it again if it should")
         if row["state"] in (MISMATCH, UNPROVEN):
             # Parked for a human (round 2): the platform may hold this text already, so a
-            # click here is never a second delivery; the card says what to do.
+            # plain click here is never a second delivery; the card says what to do. An
+            # UNPROVEN row is re-approved only through release(reapprove=True) (round 3).
             return {"key": row["key"], "receipt": row["receipt"], "state": row["state"],
                     "unresolved": True}
+        if row["state"] == SETTLED:
+            raise ReleaseError(
+                f"{row['key']!r} was SETTLED by a human — a settled send never sends again; "
+                "stage changed text if a reply is still needed")
         return None
 
     def _check_placement(self, thread_id, exc=SendBlocked, tail=""):
@@ -544,12 +553,13 @@ class Outbox:
                         "deduped": True}
             if row["state"] == STAGED:
                 return {"key": key, "receipt": None, "state": STAGED, "deduped": True}
-            if row["state"] in (MISMATCH, UNPROVEN):
-                # Parked for a human (round 2): the platform may hold this text under a
-                # mangled post or an unprovable one. Never a second live send; the card
-                # says what to do. Not "in flight": nothing will resolve it by itself.
+            if row["state"] in (MISMATCH, UNPROVEN, SETTLED):
+                # Parked for a human (round 2), or settled by one (round 3): the platform
+                # may hold this text under a mangled post or an unprovable one. Never a
+                # second live send; the card says what to do. Not "in flight": nothing
+                # resolves it by itself.
                 return {"key": key, "receipt": row["receipt"], "state": row["state"],
-                        "unresolved": True}
+                        "unresolved": row["state"] != SETTLED, "settled": row["state"] == SETTLED}
             # INTENT/SENT: another sender holds the claim. Sending here is the
             # double-delivery bug — and if the claimant DIED mid-flight, only
             # read-back can tell "sent, unrecorded" from "never sent", so the row
@@ -621,9 +631,9 @@ class Outbox:
         for row in rows:
             counts["resumed"] += 1
             key, target = row["key"], row["target"]
-            # Every touch is counted, durably, before anything observable: a row recovery
-            # cannot settle in MAX_RECOVER_ATTEMPTS runs is parked for a human instead of
-            # being retried forever (review F7 / round 2 R2-6).
+            # Every touch is counted, durably, before anything observable — a diagnostic
+            # for the operator, not a parking rule: a transient outage must never park a
+            # reply that was never posted (round 3, R3-5 a).
             attempt = int(row["attempts"] or 0) + 1
             self._write(key, attempts=attempt)
             # Per ROW (review F7): one row whose thread is gone, or whose post was
@@ -637,10 +647,12 @@ class Outbox:
                 if self._read_back(target, key, row["thread_id"], row["text"], since=since):
                     counts["already_delivered"] += 1
                 elif row["resent_at"] is not None:
-                    # Recovery already re-sent this row once and the platform still shows
-                    # no key for it: a third post is never the answer (R2-6). Park it.
-                    self._park_unproven(key, counts, "re-sent once already and still not "
-                                        "provable — parked as UNPROVEN for a human")
+                    # Recovery already re-sent this row once (on an earlier run) and the
+                    # platform still shows no key for it: a third post is never the answer
+                    # (R2-6). Park it for a human.
+                    self._park_unproven(key, counts, f"re-sent once already (recovery run "
+                                        f"{attempt}) and the platform still shows no message "
+                                        "carrying its key — parked as UNPROVEN for a human")
                     continue
                 else:
                     if not _can_send(self.adapter):
@@ -656,18 +668,23 @@ class Outbox:
                     # thread reply as a top-level post would break the thread-only
                     # policy after the fact, in public, with no second chance.
                     receipt = self._deliver(target, row["text"], key, row["thread_id"])
-                    # The ONE permitted re-send is recorded with its receipt: a later run
-                    # that still finds no key parks the row instead of posting a third
-                    # copy (R2-6). Recorded AFTER the post, not before, so a crash between
-                    # the two re-sends once more rather than parking a reply nobody ever
-                    # posted — exactly-once under crashes keeps the ladder's shape
-                    # (tests/test_outbox_statemachine.py), and the persistent case (a
-                    # post the platform holds without its metadata) stays bounded at two.
-                    self._write(key, receipt=json.dumps(receipt), resent_at=time.time())
+                    # The ONE permitted re-send is recorded with its receipt, and the row is
+                    # SENT like the live path's: a later run that still finds no key parks
+                    # it instead of posting a third copy (R2-6). Recorded AFTER the post,
+                    # not before, so a crash between the two re-sends once more rather
+                    # than parking a reply nobody ever posted — exactly-once under crashes
+                    # keeps the ladder's shape (tests/test_outbox_statemachine.py); the
+                    # persistent case (a post the platform holds without its metadata) is
+                    # bounded at two posts, three only under a crash in that window.
+                    self._write(key, receipt=json.dumps(receipt), resent_at=time.time(),
+                                state=SENT)
                     counts["resent"] += 1
                     if not self._read_back(target, key, row["thread_id"], row["text"]):
-                        self._park_unproven(key, counts, f"re-send of {key} still not "
-                                            "provable — parked as UNPROVEN for a human")
+                        # Not proof of absence: a read-after-write miss is normal. The row
+                        # stays SENT, and the NEXT run proves it or parks it (round 3,
+                        # R3-5 c — parking here lost a correct delivery).
+                        counts["errors"].append((key, f"re-send of {key} not provable yet — "
+                                                      "left SENT for the next run"))
                         continue
                 self._write(key, state=VERIFIED)
                 self._write(key, state=COMMITTED)
@@ -677,18 +694,29 @@ class Outbox:
                 self._write(key, state=MISMATCH)
                 counts["mismatched"] += 1
                 counts["errors"].append((key, f"{type(ex).__name__}: {ex}"))
+            except TargetGone as ex:
+                # The thread's parent is deleted, the channel gone or archived: nothing
+                # will ever place or prove this reply. Parked at once (review F7), never
+                # retried forever, never re-sent top-level.
+                self._park_unproven(key, counts, f"the target is gone ({ex}) — parked as "
+                                    "UNPROVEN for a human")
             except NotPosted as ex:
-                # The platform refused the re-send: nothing new is on it. An INTENT row
-                # (never posted at all) goes back to the gate for a human to retry or
-                # discard; a SENT row keeps its unproven earlier post (R2-8).
-                self._claim(key, INTENT, STAGED)
                 counts["errors"].append((key, f"{type(ex).__name__}: {ex}"))
-            except Exception as ex:  # noqa: BLE001 — recorded by row, never a wedge
+                if row["state"] == INTENT:
+                    # Never posted at all and the platform refuses: back to the gate for
+                    # a human to retry or discard (R2-8).
+                    self._claim(key, INTENT, STAGED)
+                else:
+                    # An unproven earlier post AND a refused re-send: nothing recovery can
+                    # do settles it; a human must look (round 3, R3-5 d — before, retried
+                    # on every run forever).
+                    self._park_unproven(key, counts, f"the earlier post is unproven and the "
+                                        f"platform refuses a re-send ({ex}) — parked as "
+                                        "UNPROVEN for a human")
+            except Exception as ex:  # noqa: BLE001 — transient: recorded, retried, never parked
+                # An outage, a timeout, a 5xx: nothing is known about this row, so nothing
+                # changes — no post, no park (round 3, R3-5 a). The next run tries again.
                 counts["errors"].append((key, f"{type(ex).__name__}: {ex}"))
-                if attempt >= MAX_RECOVER_ATTEMPTS:
-                    self._park_unproven(key, counts, f"{type(ex).__name__} on "
-                                        f"{attempt} recovery runs — parked as UNPROVEN "
-                                        "for a human (F7: never retried forever)")
         return counts
 
     def _park_unproven(self, key, counts, why):
@@ -785,8 +813,13 @@ class Outbox:
         return {"key": key, "receipt": None, "state": STAGED, "staged": True,
                 "deduped": False}
 
-    def release(self, key: str, _crash_at: str | None = None) -> dict:
+    def release(self, key: str, _crash_at: str | None = None, reapprove: bool = False) -> dict:
         """The human click — deliver ONE staged draft through the full ladder.
+
+        `reapprove=True` is the card's "send again" on an UNPROVEN row: the human has looked
+        at the platform, the reply is not there, and they approve one more post (round 3,
+        R3-5 / R3-7). Without it an UNPROVEN or MISMATCH row answers "unresolved" and
+        nothing is sent — a stale Send button must never re-approve by accident (R3-6).
 
         The STAGED -> INTENT flip is written durably BEFORE the adapter is touched:
         that write IS the record of the approval, so a process death one instruction
@@ -802,9 +835,13 @@ class Outbox:
             raise ReleaseError(
                 f"no outbox row {key!r} — release() sends an explicitly staged "
                 "draft and never mints one; stage() first")
-        settled = self._non_staged(row)
-        if settled is not None:
-            return settled
+        from_state = STAGED
+        if reapprove and row["state"] == UNPROVEN:
+            from_state = UNPROVEN                   # the same guards, then UNPROVEN -> INTENT
+        else:
+            settled = self._non_staged(row)
+            if settled is not None:
+                return settled
         # Refuse BEFORE the flip when the adapter cannot deliver: flipping first and
         # failing inside the adapter wedged the row in INTENT — undiscardable, and
         # unrecoverable because recover() has the same adapter (review B3).
@@ -824,7 +861,7 @@ class Outbox:
         # channel demoted to 'never' since the draft was written must refuse the
         # send, however long the draft sat at the gate.
         self._check_policy(row["target"], row["scope"], PolicyError, "release")
-        if not self._claim(key, STAGED, INTENT):
+        if not self._claim(key, from_state, INTENT):
             # Lost the race to another click (or a discard): report what the row
             # became — never a second delivery.
             settled = self._non_staged(self.get(key))
@@ -859,6 +896,21 @@ class Outbox:
                 f"only a STAGED draft can be discarded; {key!r} is "
                 f"{self.get(key)['state']}")
         return {"key": key, "receipt": None, "state": DISCARDED}
+
+    def settle(self, key: str) -> dict:
+        """A human looked at the platform and settled a MISMATCH or UNPROVEN row — edited
+        or deleted the mangled post, found the reply there after all, or decided it is not
+        needed. Terminal and kept (SETTLED); the row leaves triage (round 3, R3-7). Only
+        FROM a parked state: a draft is discarded, a delivered row is done, and 'settling'
+        either would misrecord it."""
+        row = self.get(key)
+        if row is None:
+            raise ReleaseError(f"no outbox row {key!r} to settle")
+        if not (self._claim(key, UNPROVEN, SETTLED) or self._claim(key, MISMATCH, SETTLED)):
+            raise ReleaseError(
+                f"only an UNPROVEN or MISMATCH row can be settled; {key!r} is "
+                f"{self.get(key)['state']}")
+        return {"key": key, "receipt": row["receipt"], "state": SETTLED}
 
     def close(self):
         self.conn.close()

@@ -47,7 +47,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from core.delivery import ENGINE_EVENT_TYPE, DeliveryMismatch, NotPosted
+from core.delivery import ENGINE_EVENT_TYPE, DeliveryMismatch, NotPosted, TargetGone
 from core.ratelimit import RateLimited
 
 API_BASE = "https://slack.com/api"
@@ -77,6 +77,31 @@ def api_base(env=None) -> str:
             f"{API_BASE_ENV} must be http://127.0.0.1:<port> — a loopback stub for tests, "
             f"never a third host or a name; refusing {value!r}")
     return f"http://{u.hostname}:{u.port}"
+
+# chat.postMessage answers that mean "nothing was posted", exhaustively (Slack's method
+# documentation): the outbox may hand the draft back to the gate on these and ONLY these.
+# internal_error, fatal_error, request_timeout, service_unavailable and any non-JSON 5xx are
+# NOT here: Slack documents them as possibly applied in part, so such a row stays in flight
+# for recovery's read-back to decide (review round 3, R3-3 — treating them as "not posted"
+# let the next click post a duplicate).
+NOT_POSTED_ERRORS = frozenset({
+    "channel_not_found", "not_in_channel", "is_archived", "msg_too_long", "no_text",
+    "restricted_action", "restricted_action_read_only_channel",
+    "restricted_action_thread_only_channel", "restricted_action_non_threadable_channel",
+    "restricted_action_thread_locked", "too_many_attachments", "too_many_contact_cards",
+    "cannot_reply_to_message", "message_limit_exceeded", "thread_not_found",
+    "invalid_blocks", "invalid_blocks_format", "invalid_metadata_format",
+    "invalid_metadata_schema", "metadata_too_large", "metadata_must_be_sent_with_blocks",
+    "invalid_arguments", "invalid_arg_name", "invalid_array_arg", "invalid_charset",
+    "invalid_form_data", "invalid_post_type", "missing_post_type", "user_is_bot",
+    "as_user_not_supported", "team_access_not_granted", "ekm_access_denied",
+    "not_authed", "invalid_auth", "account_inactive", "token_revoked", "token_expired",
+    "no_permission", "missing_scope",
+})
+# Read-back answers that mean the target is gone for good (the thread's parent deleted,
+# the channel gone or archived): recovery parks such a row for a human at once instead of
+# retrying forever; every other read-back error is transient and retried (round 3, R3-5).
+TARGET_GONE_ERRORS = frozenset({"thread_not_found", "channel_not_found", "is_archived"})
 
 # Deny-by-default: everything this adapter is allowed to call, exhaustively. Extending
 # the adapter means extending this list IN THE SAME DIFF as the test that uses it.
@@ -226,10 +251,14 @@ class Adapter:
         try:
             payload = self._api("chat.postMessage", **params)
         except ApiError as ex:
-            # Slack ANSWERED with ok:false (not_in_channel, is_archived, msg_too_long, ...):
-            # nothing was posted, so the outbox may hand the draft back to the gate instead
-            # of leaving it in INTENT (review round 2, R2-8). A timeout is not this.
-            raise NotPosted(f"chat.postMessage refused by the platform: {ex.error}") from ex
+            if ex.error in NOT_POSTED_ERRORS:
+                # Slack ANSWERED with a definite refusal: nothing was posted, so the outbox
+                # may hand the draft back to the gate instead of leaving it in INTENT
+                # (review round 2, R2-8).
+                raise NotPosted(f"chat.postMessage refused by the platform: {ex.error}") from ex
+            # internal_error, fatal_error, a non-JSON 5xx: the post MAY have landed. The row
+            # stays in flight and recovery's read-back decides (round 3, R3-3).
+            raise
         ts = payload.get("ts")
         if not ts:
             raise ApiError("chat.postMessage", "ok response carrying no ts")
@@ -251,20 +280,27 @@ class Adapter:
         newest-page search missed a post older than 200 messages and re-sent it
         (review N8)."""
         mine = self._sent.get(key)
-        if mine is not None:
-            found = self._fetch_exact(mine["channel"], mine["ts"], mine["thread_id"])
-            if found is None or _metadata_key(found) != key:
-                return False
-            return self._exact_or_mismatch(found, mine["text"], key)
-        if thread_id is not None:
-            candidates = self._replies_raw(target, str(thread_id), with_metadata=True)
-        elif since is not None:
-            candidates = self._history_raw(target, oldest=f"{float(since) - 300.0:.6f}",
-                                           with_metadata=True)
-        else:
-            candidates = self._api("conversations.history", channel=target,
-                                   limit=PAGE_LIMIT, include_all_metadata="true"
-                                   ).get("messages", [])
+        try:
+            if mine is not None:
+                found = self._fetch_exact(mine["channel"], mine["ts"], mine["thread_id"])
+                if found is None or _metadata_key(found) != key:
+                    return False
+                return self._exact_or_mismatch(found, mine["text"], key)
+            if thread_id is not None:
+                candidates = self._replies_raw(target, str(thread_id), with_metadata=True)
+            elif since is not None:
+                candidates = self._history_raw(target, oldest=f"{float(since) - 300.0:.6f}",
+                                               with_metadata=True)
+            else:
+                candidates = self._api("conversations.history", channel=target,
+                                       limit=PAGE_LIMIT, include_all_metadata="true"
+                                       ).get("messages", [])
+        except ApiError as ex:
+            if ex.error in TARGET_GONE_ERRORS:
+                # the thread's parent was deleted, the channel is gone: nothing will ever
+                # place or prove this reply — recovery parks it for a human (round 3, R3-5)
+                raise TargetGone(f"{ex.method}: {ex.error}") from ex
+            raise
         for m in candidates:
             if _metadata_key(m) == key:
                 return True if text is None else self._exact_or_mismatch(m, text, key)

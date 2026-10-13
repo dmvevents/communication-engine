@@ -43,6 +43,7 @@ class SlackStub:
         self.rate_limit: dict = {}        # method -> Retry-After string, consumed once
         self.fail_next: dict = {}         # method -> error code, consumed once
         self.fail_always: dict = {}       # method -> error code, every call (a dead thread)
+        self.land_and_fail_next: dict = {}  # chat.postMessage: store the post, THEN answer this error once
         self.bot_user = bot_user
         self.slack_escapes = slack_escapes
         self.truncate_posts_to = None     # store only the first N chars of a post (a planted mismatch)
@@ -182,6 +183,10 @@ class SlackStub:
         if form.get("metadata") and not self.drop_post_metadata:
             m["metadata"] = json.loads(form["metadata"])
         self.channels.setdefault(ch, []).append(m)
+        if "chat.postMessage" in self.land_and_fail_next:
+            # the post LANDED but the answer is an error (Slack: internal_error / fatal_error
+            # "may have been applied in part"; a gateway 5xx) — review round 3, R3-3
+            return {"ok": False, "error": self.land_and_fail_next.pop("chat.postMessage")}
         return {"ok": True, "channel": ch, "ts": m["ts"], "message": self._public(m, True)}
 
     @staticmethod

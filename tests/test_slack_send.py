@@ -106,7 +106,9 @@ class StubSend(unittest.TestCase):
         self.stub.fail_always["conversations.replies"] = "thread_not_found"
         counts = self.box().recover()
         self.assertEqual(self.box().get(dm)["state"], COMMITTED, "the DM reply was wedged")
-        self.assertEqual(self.box().get(dead)["state"], INTENT)
+        # the thread's parent is gone: parked for a human at once (round 3), never retried
+        from core.outbox import UNPROVEN
+        self.assertEqual(self.box().get(dead)["state"], UNPROVEN)
         self.assertEqual([k for k, _ in counts["errors"]], [dead])
         self.assertIn("thread_not_found", counts["errors"][0][1])
         self.assertEqual(len(self.stub.posted(DM)), 1)
@@ -132,8 +134,11 @@ class StubSend(unittest.TestCase):
         with self.assertRaises(SendBlocked):
             box.release(key)
         self.assertEqual((box.get(key)["state"], len(self.posts())), (SENT, 1))
-        counts = self.box().recover()                           # run 1: the one re-send
-        self.assertEqual((counts["resent"], counts["unproven"]), (1, 1))
+        counts = self.box().recover()                           # run 1: the one re-send, left SENT
+        self.assertEqual((counts["resent"], counts["unproven"]), (1, 0))
+        self.assertEqual((self.box().get(key)["state"], len(self.posts())), (SENT, 2))
+        counts = self.box().recover()                           # run 2: still no key -> parked
+        self.assertEqual((counts["resent"], counts["unproven"]), (0, 1))
         self.assertEqual((self.box().get(key)["state"], len(self.posts())), (UNPROVEN, 2))
         for _ in range(3):                                      # later runs: nothing
             self.assertEqual(self.box().recover()["resumed"], 0)
@@ -165,6 +170,76 @@ class StubSend(unittest.TestCase):
         self.assertEqual([k for k, _ in counts["errors"]], [key])
         self.assertIn("is_archived", counts["errors"][0][1])
         self.assertEqual((self.box().get(key)["state"], self.stub.posted(CH)), (STAGED, []))
+
+    def test_an_ambiguous_answer_to_the_post_leaves_the_row_in_flight_and_never_duplicates(self):
+        """Review round 3 (R3-3): internal_error, fatal_error and a gateway 5xx are answers
+        Slack documents as possibly applied in part. Treating them as 'not posted' handed a
+        LANDED post back to the gate, and the next click — unstoppable by guard 2, since
+        the landed post carries the engine's marker — posted a duplicate. Such a row stays
+        in flight; recovery's read-back finds the post and commits it, one post in all."""
+        from core.delivery import NotPosted
+        for n, error in enumerate(("internal_error", "fatal_error")):
+            with self.subTest(error=error):
+                ask = f"1699999999.00020{n}"                     # its own ask, its own row
+                self.stub.seed(CH, "and the logs?", user="U_A", ts=ask)
+                self.stub.land_and_fail_next["chat.postMessage"] = error
+                box = self.box()
+                key = box.stage(CH, ask, TEXT, thread_id=ask)["key"]
+                posts_before = len(self.stub.posted(CH))
+                with self.assertRaises(RuntimeError) as cm:     # the adapter's own ApiError
+                    box.release(key)
+                self.assertEqual(type(cm.exception).__name__, "ApiError")
+                self.assertNotIsInstance(cm.exception, NotPosted)
+                self.assertEqual((box.get(key)["state"], len(self.stub.posted(CH))),
+                                 (INTENT, posts_before + 1))
+                again = self.box().release(key)                 # the human clicks again
+                self.assertEqual((again.get("in_flight"), len(self.stub.posted(CH))),
+                                 (True, posts_before + 1), "the second click posted a duplicate")
+                counts = self.box().recover()
+                self.assertEqual((counts["already_delivered"], counts["resent"]), (1, 0))
+                self.assertEqual((self.box().get(key)["state"], len(self.stub.posted(CH))),
+                                 (COMMITTED, posts_before + 1))
+
+    def test_a_dead_thread_parks_the_row_at_once_and_an_outage_never_does(self):
+        """Review round 3 (R3-5 a) and round 1's F7: the target being GONE (the thread's
+        parent deleted) parks the row on the first run — nothing will ever place it — while
+        a transient outage (service_unavailable on the read-back) is retried, run after run,
+        never parked and never posted."""
+        from core.outbox import UNPROVEN, _Crash
+        box = self.box()
+        dead = box.stage(CH, ASK_TS, TEXT, thread_id=ASK_TS)["key"]
+        with self.assertRaises(_Crash):
+            box.release(dead, _crash_at="after_intent")
+        self.stub.fail_always["conversations.replies"] = "service_unavailable"
+        for _ in range(4):                                       # an outage, four runs long
+            counts = self.box().recover()
+            self.assertIn("service_unavailable", counts["errors"][0][1])
+            self.assertEqual((self.box().get(dead)["state"], counts["unproven"]), (INTENT, 0),
+                             "a transient outage parked a reply that was never posted")
+        self.assertEqual(self.stub.posted(CH), [])
+        self.stub.fail_always["conversations.replies"] = "thread_not_found"
+        counts = self.box().recover()
+        self.assertEqual((self.box().get(dead)["state"], counts["unproven"]), (UNPROVEN, 1))
+        self.assertIn("gone", counts["errors"][0][1])
+        self.assertEqual(self.stub.posted(CH), [], "a dead thread was posted to, top-level or not")
+        self.assertEqual(self.box().recover()["resumed"], 0)
+
+    def test_a_sent_row_whose_re_send_is_refused_is_parked_not_retried_forever(self):
+        """Review round 3 (R3-5 d): an unproven earlier post AND a refused re-send — nothing
+        recovery can do settles it, so it is parked for a human instead of refused again on
+        every run."""
+        from core.outbox import UNPROVEN, _Crash
+        self.stub.drop_post_metadata = True                      # the first post is unprovable
+        box = self.box()
+        key = box.stage(CH, ASK_TS, TEXT, thread_id=ASK_TS)["key"]
+        with self.assertRaises(_Crash):
+            box.release(key, _crash_at="before_readback")
+        self.assertEqual((box.get(key)["state"], len(self.posts())), (SENT, 1))
+        self.stub.fail_always["chat.postMessage"] = "not_in_channel"
+        counts = self.box().recover()
+        self.assertEqual((self.box().get(key)["state"], counts["unproven"]), (UNPROVEN, 1))
+        self.assertTrue(any("refuses a re-send" in why for _, why in counts["errors"]), counts["errors"])
+        self.assertEqual(self.box().recover()["resumed"], 0, "parked, yet touched again")
 
     def test_a_crash_before_read_back_on_a_truncated_post_recovers_to_mismatch(self):
         """Review R2-7 (Y11), the restart half of F3: a new process must compare the

@@ -67,9 +67,10 @@ from core.config import ConfigError, ensure_dirs, load, load_adapter_class  # no
 from core.dashboard import html_text, open_ro, snapshot  # noqa: E402
 from core.delivery import NotPosted  # noqa: E402
 from core.journal import Journal  # noqa: E402
+from core.classify import ACTIONABLE_KINDS  # noqa: E402
 from core.outbox import (COMMITTED, DISCARDED, Outbox, PolicyError,  # noqa: E402
-                         MISMATCH, ReleaseError, SENT, SendBlocked, STAGED, UNPROVEN,
-                         VERIFIED, thread_block_reason)
+                         MISMATCH, ReleaseError, SENT, SendBlocked, SETTLED, STAGED,
+                         UNPROVEN, VERIFIED, thread_block_reason)
 
 
 # ---- config, fresh at every action --------------------------------------------
@@ -128,25 +129,40 @@ def _placement_for(ch, adapter):
     return None, f"{ch.id} answers only in threads, and {why}"
 
 
-def _seen_ts_for(cfg, channel_id, thread):
+def _seen_ts_for(cfg, channel_id, thread, ask_ts=None):
     """Guard 2's baseline: the newest platform ts this page SHOWED the human for the
     conversation they are answering (review round 2, R2-5: the outbox's own fallback is
-    the platform's newest at staging time, which may be a message no page displayed). The
-    page lists the journal, so a top-level reply is baselined on the newest journaled ts in
-    the channel; a thread reply on its root — the page shows the ask, never the thread, so
-    any reply already in it is unseen and the first click names it. None (the outbox falls
-    back to the platform) only when there is no journal yet."""
+    the platform's newest at staging time, which may be a message no page displayed).
+
+    The page lists OPEN ASKS — never statements, which are journaled but routed `logged`
+    and not shown (round 3, R3-4: the newest journaled row took a polled "never mind" as
+    seen). So a top-level reply is baselined on the newest open ask the page lists for the
+    channel, and at least on the ask being answered; a thread reply on the ask itself (the
+    page shows the ask and never the thread, so any later reply in the thread is unseen and
+    the first click names it — round 3, R3-8: baselining on the root named the very ask
+    being answered). None (the outbox falls back to the platform) only for a free compose
+    with no journal yet."""
     if thread is not None:
-        return str(thread)
+        return str(ask_ts) if ask_ts is not None else str(thread)
     if not Path(cfg.journal_path).is_file():
-        return None
+        return str(ask_ts) if ask_ts is not None else None
     conn = open_ro(cfg.journal_path)
     try:
-        row = conn.execute("SELECT ts FROM journal WHERE channel=? "
-                           "ORDER BY CAST(ts AS REAL) DESC LIMIT 1", (channel_id,)).fetchone()
-        return str(row[0]) if row else None
+        marks = ",".join("?" * len(ACTIONABLE_KINDS))
+        row = conn.execute(
+            f"SELECT ts FROM journal WHERE channel=? AND responded_at IS NULL AND kind IN ({marks}) "
+            "ORDER BY CAST(ts AS REAL) DESC LIMIT 1", (channel_id, *ACTIONABLE_KINDS)).fetchone()
     finally:
         conn.close()
+    newest_listed = str(row[0]) if row else None
+    if ask_ts is None:
+        return newest_listed
+    if newest_listed is None:
+        return str(ask_ts)
+    try:
+        return newest_listed if float(newest_listed) > float(ask_ts) else str(ask_ts)
+    except (TypeError, ValueError):
+        return str(ask_ts)
 
 
 def _adapter_for(cfg, inst):
@@ -400,8 +416,9 @@ def _stage_clicked():
                 return
             thread = _thread_root(cfg, ch.id, trigger) if placement == "thread" else None
         outbox = _outbox_for(cfg, inst, adapter)
+        ask_ts = reply_to["ts"] if reply_to is not None else None
         res = outbox.stage(ch.id, trigger, text, thread_id=thread,
-                           seen_ts=_seen_ts_for(cfg, ch.id, thread))
+                           seen_ts=_seen_ts_for(cfg, ch.id, thread, ask_ts))
     except PolicyError as ex:
         _push_flash("error", f"refused: {ex}")
         return
@@ -466,6 +483,14 @@ def _release_clicked(inst_name, key):
                                 f"`{res['receipt']}`; nothing was re-sent")
             _tie_or_warn(cfg, outbox.get(key), key)
             return
+        if res.get("unresolved"):
+            # A Send drawn while the row was STAGED, clicked after a recovery run parked
+            # it: nothing was sent, and saying "sent and proven" here would be the reverse
+            # of the truth (round 3, R3-6). The card below has the actions.
+            _push_flash("warning", f"nothing sent — this draft is parked as {res['state']}; "
+                                   "see its card below (settle it, or send again once you "
+                                   "have looked at the platform)")
+            return
         _push_flash("success", f"sent and proven: state {res['state']}, receipt "
                                f"`{res['receipt']}`")
         if res.get("receipt") and res["state"] in (COMMITTED, VERIFIED):
@@ -500,6 +525,72 @@ def _release_clicked(inst_name, key):
             state = row["state"] if row is not None else "?"
         _push_flash("error", f"{type(ex).__name__}: {ex} — row state is now {state}; "
                              "nothing else changed")
+    finally:
+        if outbox is not None:
+            outbox.close()
+
+
+def _reapprove_clicked(inst_name, key):
+    """The card's "send again" on an UNPROVEN row: the human has looked at the platform and
+    the reply is not there. One more post, through the same guards — an explicit second
+    approval, never a stale Send (round 3, R3-5 / R3-7)."""
+    try:
+        cfg = _fresh_cfg()
+    except ConfigError as ex:
+        _push_flash("error", f"settings refused: {ex} — nothing sent")
+        return
+    inst = _instance(cfg, inst_name)
+    if inst is None:
+        _push_flash("error", f"connection {inst_name} no longer exists in settings.json "
+                             "— nothing sent")
+        return
+    outbox = None
+    try:
+        outbox = _outbox_for(cfg, inst, _adapter_for(cfg, inst))
+        res = outbox.release(key, reapprove=True)
+        if res.get("unresolved") or res.get("in_flight"):
+            _push_flash("warning", f"nothing sent — the row is {res['state']} now")
+            return
+        _push_flash("success", f"sent again and proven: state {res['state']}, receipt "
+                               f"`{res['receipt']}`")
+        if res.get("receipt") and res["state"] in (COMMITTED, VERIFIED):
+            _tie_or_warn(cfg, outbox.get(key), key)
+    except (PolicyError, ReleaseError) as ex:
+        _push_flash("error", f"refused: {ex}")
+    except Exception as ex:  # noqa: BLE001 — the page must say what the row is now
+        state = "?"
+        if outbox is not None:
+            row = outbox.get(key)
+            state = row["state"] if row is not None else "?"
+        _push_flash("error", f"{type(ex).__name__}: {ex} — row state is now {state}")
+    finally:
+        if outbox is not None:
+            outbox.close()
+
+
+def _settle_clicked(inst_name, key):
+    """The card's "settled": the human looked at the platform and resolved it there. The
+    row is kept as SETTLED and leaves triage (round 3, R3-7). Needs no adapter."""
+    try:
+        cfg = _fresh_cfg()
+    except ConfigError as ex:
+        _push_flash("error", f"settings refused: {ex} — nothing changed")
+        return
+    inst = _instance(cfg, inst_name)
+    if inst is None:
+        _push_flash("error", f"connection {inst_name} no longer exists in settings.json "
+                             "— nothing changed")
+        return
+    outbox = None
+    try:
+        outbox = _outbox_for(cfg, inst, _NoAdapter())
+        res = outbox.settle(key)
+        _push_flash("success", f"settled — kept in the outbox as {res['state']}, no longer "
+                               "listed; nothing was sent")
+    except ReleaseError as ex:
+        _push_flash("error", f"refused: {ex}")
+    except Exception as ex:  # noqa: BLE001
+        _push_flash("error", f"{type(ex).__name__}: {ex} — nothing changed")
     finally:
         if outbox is not None:
             outbox.close()
@@ -700,12 +791,13 @@ def render(cfg):
                        "be sent and nothing is recorded as answered; compare the two on the "
                        "platform, then edit or delete there. Needs a human.")
             else:
-                why = ("UNPROVEN — recovery re-sent this approved text once, or its read-back "
-                       "kept failing, and the platform still shows no message carrying its "
-                       "key. Nothing more will be sent and nothing is recorded as answered; "
-                       "look for the text above on the platform and settle it there. If it "
-                       "is not there and still needed, stage it again with changed text — "
-                       "the same text IS this row. Needs a human.")
+                why = ("UNPROVEN — recovery could not settle this approved text: the platform "
+                       "showed no message carrying its key on the run after its one re-send, "
+                       "or the target is gone, or an unproven post could not be re-sent. "
+                       "Nothing more is sent by itself and nothing is recorded as answered. "
+                       "Look for the text above on the platform: if it is there, or no longer "
+                       "needed, mark it settled; if it is not there and still needed, send "
+                       "it again. Needs a human.")
             st.markdown(
                 "<div style='border:1px solid rgba(128,128,128,.3);border-left:"
                 "3px solid #8f1d1d;border-radius:8px;padding:10px 14px;margin:2px 0'>"
@@ -715,6 +807,13 @@ def render(cfg):
                 f"{html_text(row['text'])}</div>"
                 f"<div style='color:#8f1d1d;font-size:.85rem;margin-top:4px'>{why}</div></div>",
                 unsafe_allow_html=True)
+            again, settle = st.columns([1, 1])
+            if row["state"] == UNPROVEN and inst_no_send is None:
+                again.button("Send again (I looked; it is not there)",
+                             key=f"reapprove-{row['key']}", on_click=_reapprove_clicked,
+                             args=(inst.name, row["key"]))
+            settle.button("Settled on the platform", key=f"settle-{row['key']}",
+                          on_click=_settle_clicked, args=(inst.name, row["key"]))
     if not any_staged:
         st.markdown("_no drafts at the gate_")
 
