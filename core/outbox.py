@@ -181,6 +181,41 @@ class Outbox:
     def get(self, key):
         return self.conn.execute("SELECT * FROM outbox WHERE key=?", (key,)).fetchone()
 
+    def _claim(self, key, from_state, to_state) -> bool:
+        """Compare-and-swap on state — the one durable write that IS the click.
+
+        release() used to read STAGED and then UPDATE unconditionally, so two Sends
+        landing between the read and the write both reached the adapter: one approved
+        draft, two messages (independent merge review 2026-10-13, repro R1), and a
+        Discard interleaved with a Send still sent. With the state in the WHERE clause
+        exactly one caller wins; the loser sees rowcount 0 and reads what the row
+        became."""
+        cur = self.conn.execute(
+            "UPDATE outbox SET state=?, updated_at=? WHERE key=? AND state=?",
+            (to_state, time.time(), key, from_state))
+        self.conn.commit()
+        return cur.rowcount == 1
+
+    def _non_staged(self, row):
+        """What a release() of a row that is NOT a draft reports — used before the
+        claim (the sequential cases) and again after a lost claim (the concurrent
+        ones), so every state has exactly one answer. None means: still STAGED."""
+        if row["state"] in (VERIFIED, COMMITTED):
+            # Already proven on the target: return the receipt, never re-send.
+            return {"key": row["key"], "receipt": row["receipt"], "state": row["state"],
+                    "deduped": True}
+        if row["state"] in (INTENT, SENT):
+            # A claim in flight, or one that died mid-flight. Only recover()'s
+            # read-back can tell 'sent, unrecorded' from 'never sent' — a second
+            # live delivery here is the double-message bug.
+            return {"key": row["key"], "receipt": None, "state": row["state"],
+                    "in_flight": True}
+        if row["state"] == DISCARDED:
+            raise ReleaseError(
+                f"draft {row['key']!r} was DISCARDED — a rejected draft never sends; "
+                "stage it again if it should")
+        return None
+
     def _deliver(self, target, text, key, thread_id):
         """The one place adapter.send() is called, from both the live path and recovery.
 
@@ -422,20 +457,16 @@ class Outbox:
             raise ReleaseError(
                 f"no outbox row {key!r} — release() sends an explicitly staged "
                 "draft and never mints one; stage() first")
-        if row["state"] in (VERIFIED, COMMITTED):
-            # Already proven on the target: return the receipt, never re-send.
-            return {"key": key, "receipt": row["receipt"], "state": row["state"],
-                    "deduped": True}
-        if row["state"] in (INTENT, SENT):
-            # A claim in flight, or one that died mid-flight. Only recover()'s
-            # read-back can tell 'sent, unrecorded' from 'never sent' — a second
-            # live delivery here is the double-message bug.
-            return {"key": key, "receipt": None, "state": row["state"],
-                    "in_flight": True}
-        if row["state"] == DISCARDED:
+        settled = self._non_staged(row)
+        if settled is not None:
+            return settled
+        # Refuse BEFORE the flip when the adapter cannot deliver: flipping first and
+        # failing inside the adapter wedged the row in INTENT — undiscardable, and
+        # unrecoverable because recover() has the same adapter (review B3).
+        if not _can_send(self.adapter):
             raise ReleaseError(
-                f"draft {key!r} was DISCARDED — a rejected draft never sends; "
-                "stage it again if it should")
+                f"the adapter for {row['target']} declares no send capability — the "
+                "draft stays STAGED; it can only be discarded")
         # Policy is re-resolved at the CLICK, not inherited from staging time: a
         # channel demoted to 'never' since the draft was written must refuse the
         # send, however long the draft sat at the gate.
@@ -443,7 +474,13 @@ class Outbox:
             raise PolicyError(
                 f"reply policy for {row['target']} ({row['scope']} scope) is now "
                 "'never' — the draft stays staged; nothing was sent")
-        self._write(key, state=INTENT)
+        if not self._claim(key, STAGED, INTENT):
+            # Lost the race to another click (or a discard): report what the row
+            # became — never a second delivery.
+            settled = self._non_staged(self.get(key))
+            if settled is None:
+                raise ReleaseError(f"draft {key!r} changed under this click; retry")
+            return settled
         return self._finish(key, row["target"], row["text"], row["thread_id"],
                             _crash_at)
 
@@ -454,14 +491,25 @@ class Outbox:
         row = self.get(key)
         if row is None:
             raise ReleaseError(f"no outbox row {key!r} to discard")
-        if row["state"] != STAGED:
+        # The same compare-and-swap as release(): a Discard that lands while a Send
+        # is claiming must lose, never relabel a delivered row.
+        if not self._claim(key, STAGED, DISCARDED):
             raise ReleaseError(
-                f"only a STAGED draft can be discarded; {key!r} is {row['state']}")
-        self._write(key, state=DISCARDED)
+                f"only a STAGED draft can be discarded; {key!r} is "
+                f"{self.get(key)['state']}")
         return {"key": key, "receipt": None, "state": DISCARDED}
 
     def close(self):
         self.conn.close()
+
+
+def _can_send(adapter) -> bool:
+    """Does this adapter declare a send path? capabilities() is the contract's answer;
+    an adapter without capabilities() (test doubles) is judged by having send()."""
+    caps = getattr(adapter, "capabilities", None)
+    if callable(caps):
+        return bool(caps().get("send"))
+    return callable(getattr(adapter, "send", None))
 
 
 class _Crash(BaseException):

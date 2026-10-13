@@ -38,7 +38,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.config import ConfigError, load  # noqa: E402
-from core.dashboard import SEVERITY, snapshot  # noqa: E402
+from core.dashboard import SEVERITY, html_text, snapshot  # noqa: E402
 
 try:
     import streamlit as st
@@ -166,7 +166,7 @@ for item in attention:
         f"ts {html.escape(str(item['ts']))}"
         f"<div style='opacity:.75;font-size:.85rem'>{html.escape(item['why'])}</div>"
         f"<div style='font-size:.9rem;margin-top:4px'>"
-        f"{html.escape(item['text'] or '')}</div></div>",
+        f"{html_text(item['text'])}</div></div>",
         unsafe_allow_html=True)
 
 tiles = st.columns(len(SEVERITY) + 1)
@@ -185,7 +185,9 @@ with journal_tab:
         st.markdown("_No journal file yet — nothing has been polled._")
     else:
         st.markdown(f"**{j['distinct']}** distinct messages · "
-                    f"**{j['unanswered']}** unanswered · **{j['answered']}** answered")
+                    f"**{j['unanswered']}** unanswered · **{j['answered']}** answered "
+                    f"({j['answered_by_thread']} closed by someone else's in-thread "
+                    "reply, not by an answer sent from here)")
         dom_table(("kind", "count"),
                   [(html.escape(str(k)), n)
                    for k, n in sorted(j["by_kind"].items(), key=lambda kv: str(kv[0]))])
@@ -196,7 +198,7 @@ with journal_tab:
             dom_table(("", "channel", "ts", "kind", "text"),
                       [(badge(a["severity"]), html.escape(a["where"]),
                         html.escape(str(a["ts"])), html.escape(str(a["kind"] or "—")),
-                        html.escape(a["text"] or ""))
+                        html_text(a["text"]))
                        for a in open_asks])
     st.caption(f"source: `{cfg.journal_path}`")
 
@@ -216,7 +218,7 @@ with outbox_tab:
                         "recover:")
             dom_table(("", "target", "trigger ts", "exact text"),
                       [(badge(a["severity"]), html.escape(a["where"]),
-                        html.escape(str(a["ts"])), html.escape(a["text"] or ""))
+                        html.escape(str(a["ts"])), html_text(a["text"]))
                        for a in gate])
         st.caption(f"source: `{outbox_paths[name]}`")
 

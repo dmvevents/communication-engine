@@ -6,6 +6,7 @@ reproduces that scenario and asserts the count stays honest.
 """
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -460,3 +461,43 @@ class AmbiguityCountTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class ResponseTimestampTest(unittest.TestCase):
+    """mark_responded() stamps responded_at at the moment the ANSWER was written when the
+    caller says so (the draft's created_at; a swept reply's arrival), not the moment the
+    tie is recorded. Stamping at tie time launders an edit made in between: R23's
+    edited_after_response compares revision.recorded_at > responded_at, so an edit sighted
+    before a late tie vanished (independent review F9, 2026-10-13)."""
+
+    def test_an_explicit_time_is_recorded_verbatim(self):
+        with tempfile.TemporaryDirectory() as d:
+            j = Journal(f"{d}/j.db")
+            j.record("C", "1.0", sender_id="U", text="deploy to staging?", kind="QUESTION")
+            j.mark_responded("C", "1.0", "k", at=1234.5)
+            self.assertEqual(j.get("C", "1.0")["responded_at"], 1234.5)
+            j.close()
+
+    def test_the_default_is_now(self):
+        with tempfile.TemporaryDirectory() as d:
+            j = Journal(f"{d}/j.db")
+            j.record("C", "1.0", sender_id="U", text="deploy to staging?", kind="QUESTION")
+            before = time.time()
+            j.mark_responded("C", "1.0", "k")
+            self.assertGreaterEqual(j.get("C", "1.0")["responded_at"], before)
+            j.close()
+
+    def test_an_edit_sighted_after_the_answer_was_written_is_flagged(self):
+        """The laundering scenario end to end: answer written at t=100 (a draft at the
+        gate), the asker edits at t=200 (revision recorded), the tie lands at t=300 with
+        at=100 -> the edit is AFTER the answer and must surface."""
+        with tempfile.TemporaryDirectory() as d:
+            j = Journal(f"{d}/j.db")
+            j.record("C", "1.0", sender_id="U", text="deploy to staging?", kind="QUESTION")
+            j.record("C", "1.0", sender_id="U", text="deploy to PROD?", kind="QUESTION")
+            edit_seen = j.revisions("C", "1.0")[-1]["recorded_at"]
+            j.mark_responded("C", "1.0", "k", at=edit_seen - 50)
+            self.assertEqual([(r["channel"], r["ts"]) for r in j.edited_after_response()],
+                             [("C", "1.0")],
+                             "an edit sighted after the answer was written was laundered")
+            j.close()

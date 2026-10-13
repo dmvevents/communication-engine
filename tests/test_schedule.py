@@ -639,6 +639,10 @@ class HistoryOnlyFake:
         from core.config import load_adapter_class
         root = Path(__file__).resolve().parent.parent
         self.inner = load_adapter_class(root / "channels", "fake")()
+        self.explode_on = None          # a platform error for this thread
+        self.rate_limit_after = None    # RateLimited after N replies() calls
+        self.calls = 0
+        self.roots_swept = set()
 
     def seed(self, messages):
         self.inner.seed(messages)
@@ -648,6 +652,13 @@ class HistoryOnlyFake:
         return [m for m in msgs if not m.get("thread_id")], new_cursor
 
     def replies(self, channel_id, thread_ts, oldest=None):
+        self.calls += 1
+        self.roots_swept.add(thread_ts)
+        if self.rate_limit_after is not None and self.calls > self.rate_limit_after:
+            from core.ratelimit import RateLimited
+            raise RateLimited("5", method="conversations.replies")
+        if self.explode_on is not None and thread_ts == self.explode_on:
+            raise RuntimeError("conversations.replies failed: thread_not_found")
         return self.inner.replies(channel_id, thread_ts, oldest=oldest)
 
 
@@ -688,6 +699,78 @@ class ThreadSweepCycleTest(SchedulerHarness):
         self.assertEqual(sched.cycle()["answered"], 0)
         self.assertIsNone(self.journal.get("C1", "1.0")["responded_at"])
         self.assertEqual({r["id"] for r in self.owed.open_items()}, {"msg@C1@1.0"})
+
+    def test_a_dead_thread_is_reported_and_never_stops_the_cycle(self):
+        """One deleted ask (conversations.replies -> thread_not_found, forever) must not
+        become a crash loop that also leaves every later channel unpolled."""
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg("C1", "1.0", "where is the dashboard?"),
+                      msg("C2", "5.0", "status: all green")])
+        adapter.explode_on = "1.0"
+        sched = self.scheduler(adapter, channels=("C1", "C2"))
+        summary = sched.cycle()
+        self.assertEqual(summary["polled"], 2, "C2 was never polled after C1's dead thread")
+        self.assertEqual([(c, ts) for c, ts, _ in summary["sweep_errors"]], [("C1", "1.0")],
+                         "the dead thread must be named in the cycle summary")
+        self.assertIn("thread_not_found", summary["sweep_errors"][0][2])
+        self.assertIsNone(self.journal.get("C1", "1.0")["responded_at"])
+
+    def test_sweep_rate_limits_and_truncation_reach_the_cycle_summary(self):
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg("C1", f"{i}.0", f"question {i}?") for i in range(1, 4)])
+        adapter.rate_limit_after = 1
+        summary = self.scheduler(adapter).cycle()
+        self.assertEqual(summary["sweep_rate_limited"], [("C1", "conversations.replies")],
+                         "a replies 429 printed the same cycle line as a healthy sweep")
+        adapter2 = HistoryOnlyFake()
+        adapter2.seed([msg("C1", f"{i}.0", f"question {i}?") for i in range(1, 30)])
+        summary2 = self.scheduler(adapter2).cycle()
+        self.assertEqual(summary2["sweep_truncated"], ["C1"],
+                         "a sweep that left open asks unswept said nothing")
+
+    def test_the_sweep_budget_is_per_source_per_cycle(self):
+        """25 calls per CHANNEL per cycle exceeds Slack's tier at two channels; the budget
+        is one adapter's, spent across its channels (review F8)."""
+        from core.threads import SWEEP_MAX
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg("C1", f"{i}.0", f"question {i}?") for i in range(1, 21)]
+                     + [msg("C2", f"{i}.0", f"question {i}?") for i in range(1, 21)])
+        self.scheduler(adapter, channels=("C1", "C2")).cycle()
+        self.assertEqual(adapter.calls, SWEEP_MAX,
+                         f"one cycle issued {adapter.calls} replies() calls for one adapter")
+
+    def test_a_429_stops_the_rest_of_that_sources_sweeps_this_cycle(self):
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg("C1", "1.0", "q1?"), msg("C1", "2.0", "q2?"),
+                      msg("C2", "3.0", "q3?")])
+        adapter.rate_limit_after = 1
+        summary = self.scheduler(adapter, channels=("C1", "C2")).cycle()
+        self.assertEqual(adapter.calls, 2, "after a 429 the same method was called again "
+                                           "in the same cycle")
+        self.assertEqual(summary["polled"], 3, "polling must go on after a sweep 429")
+
+    def test_older_asks_are_swept_on_later_cycles(self):
+        from core.threads import SWEEP_MAX
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg("C1", f"{i}.0", f"question {i}?") for i in range(1, 2 * SWEEP_MAX + 1)])
+        sched = self.scheduler(adapter)
+        for _ in range(3):
+            sched.cycle()
+        self.assertEqual(adapter.roots_swept, {f"{i}.0" for i in range(1, 2 * SWEEP_MAX + 1)},
+                         "asks beyond the newest window were never swept — starvation")
+
+    def test_a_follow_up_question_in_the_thread_does_not_close_the_ask(self):
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg("C1", "1.0", "where is the dashboard?")])
+        sched = self.scheduler(adapter)
+        sched.cycle()
+        adapter.seed([msg("C1", "2.0", "and where are the logs?", sender_id="U_B",
+                          thread_id="1.0")])
+        self.assertEqual(sched.cycle()["answered"], 0,
+                         "a follow-up QUESTION closed the original ask")
+        self.assertEqual({r["id"] for r in self.owed.open_items()},
+                         {"msg@C1@1.0", "msg@C1@2.0"},
+                         "both questions are owed; the follow-up is an ask of its own")
 
     def test_an_adapter_without_replies_leaves_the_cycle_whole(self):
         adapter = QueueAdapter([([msg("C1", "1.0", "where is it?")], "1.0")])

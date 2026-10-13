@@ -245,3 +245,21 @@ class AttachmentFieldTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class ThreadIndexTest(unittest.TestCase):
+    """The thread sweep asks the store two questions per open ask every cycle
+    (thread_root, thread_replies); both were full table scans (review F11)."""
+
+    def test_the_thread_lookups_have_indexes(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = Store(f"{d}/m.db")
+            cols = {tuple(r[2] for r in s.conn.execute(f"PRAGMA index_info({idx[1]!r})"))
+                    for idx in s.conn.execute("PRAGMA index_list(messages)")}
+            self.assertIn(("channel_id", "thread_id"), cols)
+            self.assertIn(("channel_id", "ts"), cols)
+            plan = " ".join(r[3] for r in s.conn.execute(
+                "EXPLAIN QUERY PLAN SELECT ts FROM messages WHERE channel_id=? AND thread_id=?",
+                ("C", "1.0")))
+            self.assertIn("USING INDEX", plan, plan)
+            s.close()

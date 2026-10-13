@@ -39,7 +39,7 @@ import time
 from dataclasses import dataclass, field
 
 from . import threads
-from .classify import Taxonomy, classify
+from .classify import ACTIONABLE_KINDS, Taxonomy, classify
 
 
 class AlreadyRunning(RuntimeError):
@@ -138,6 +138,9 @@ class Scheduler:
         self._interval = self.base_interval
         self._last_fire = None
         self._backoff_until = 0.0
+        # ENH-30: where each channel's thread-sweep window resumes next cycle, so no
+        # open ask starves behind the newest few (in-memory: a restart just rewinds).
+        self._sweep_start: dict = {}
 
     # ---- the loop ---------------------------------------------------------
     def run(self, max_cycles: int | None = None, stop=lambda: False) -> int:
@@ -174,7 +177,12 @@ class Scheduler:
     def cycle(self) -> dict:
         now = self.clock()
         polled = fresh = answered = 0
+        sweep_rate_limited, sweep_truncated, sweep_errors = [], [], []
         for src in self.sources:
+            # One thread-sweep budget per ADAPTER per cycle, spent across its channels:
+            # 25 calls per channel exceeded Slack's tier at two channels (review F8).
+            # A 429 ends this source's sweeping for the cycle; polling goes on.
+            budget = threads.SWEEP_MAX
             for ch in src.channels:
                 cursor = self.store.cursor_get(src.name, ch)
                 messages, new_cursor = src.adapter.poll(cursor)
@@ -192,10 +200,30 @@ class Scheduler:
                 # thread reply, so an in-thread answer reaches the engine only here;
                 # the fetched replies are journaled like any other message (a
                 # question asked inside a thread becomes an owed ask of its own).
-                swept = threads.sweep(src.adapter, self.store, self.journal, ch)
+                if budget <= 0:
+                    continue
+                swept = threads.sweep(
+                    src.adapter, self.store, self.journal, ch, max_threads=budget,
+                    start=self._sweep_start.get(ch, 0),
+                    # A reply that classifies as an ask of its own is a new question,
+                    # never the answer (review F7); the source's vocabulary decides.
+                    is_answer=lambda m, _src=src: classify(
+                        m.get("text") or "", _src.taxonomy,
+                        attachments=m.get("attachments")).kind not in ACTIONABLE_KINDS)
                 if swept is not None:
+                    budget -= swept["swept"]
+                    self._sweep_start[ch] = swept["next_start"]
                     fresh += self._journal_and_route(ch, swept["replies"], src)
                     answered += len(swept["answered"])
+                    # The sweep's refusals are the operator's business (G4): a 429, a
+                    # truncated sweep or a dead thread must not print the same cycle
+                    # line as a healthy one.
+                    if swept["rate_limited"]:
+                        sweep_rate_limited.append((ch, swept["rate_limited"]))
+                        budget = 0          # the platform said stop; stop for this source
+                    if swept["truncated"]:
+                        sweep_truncated.append(ch)
+                    sweep_errors.extend((ch, ts, msg) for ts, msg in swept["errors"])
         self._close_answered()
         unattended = self._observe_owed()
         self._last_fire = now
@@ -203,7 +231,9 @@ class Scheduler:
                           else min(self._interval * 2, self.max_interval))
         self._backoff_until = now + self._interval
         return {"polled": polled, "fresh": fresh, "answered": answered,
-                "unattended": unattended, "next_interval": self._interval}
+                "unattended": unattended, "next_interval": self._interval,
+                "sweep_rate_limited": sweep_rate_limited,
+                "sweep_truncated": sweep_truncated, "sweep_errors": sweep_errors}
 
     def _journal_and_route(self, channel, messages, src) -> int:
         fresh = 0

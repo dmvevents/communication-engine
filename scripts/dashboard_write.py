@@ -5,7 +5,9 @@ Loaded by scripts/dashboard.py ONLY when COMMS_UI_WRITE_ENABLED=true; with the g
 off this module is never imported, so the read dashboard stays the viewer it always
 was. This is the ONE surface allowed to reach core/outbox, and it reaches nothing
 else: every send funnels through the outbox ladder, which means every send is
-durable, deduped, paced, and read-back-proven — the UI adds a human, not a bypass.
+durable, deduped, paced, and read-back-proven — the UI adds a human, not a bypass. The
+Send handler also opens a writable Journal — only after a PROVEN send, only to tie the
+answer to its ask.
 
 The contract this surface renders, in one sentence: **composing stages; only a human
 click on the exact staged text sends; discard is terminal and kept.** No handler
@@ -23,16 +25,31 @@ draft lands COMMITTED with a receipt and no network. Of the shipped adapters onl
 so flipping the gate gives no live platform a send path; the surface says so per
 instance instead of rendering a compose box that cannot deliver.
 
-Answering closes the ask (ENH-30). Each open ask of a composable channel offers a
-Reply that pre-fills the compose form; the reply stages with the ask's ts as its
-trigger (in the ask's thread when the thread policy allows, top-level otherwise —
-never refused, never silently threaded), and the Send click — the moment the answer
-is PROVEN on the target — ties the ask to the outbox key via Journal.mark_responded.
-Staging never ties (a draft is a promise, not an answer) and a free compose ties to
-nothing. Measured 2026-10-12 on the aws-do-agent integration: with no tie at all,
-every answered ask stayed UNANSWERED forever.
+Answering closes the ask (ENH-30). Each open ask of a channel that accepts a reply
+(thread scope OR channel scope not 'never') offers Reply, which pre-fills the compose
+form; the reply stages with the ask's ts as its trigger — under the ask's thread ROOT
+when the thread policy allows, top-level otherwise, never refused and never silently
+threaded — and the Send click, the moment the answer is PROVEN on the target, ties the
+ask to the outbox key via Journal.mark_responded. Staging never ties (a draft is a
+promise, not an answer); a free compose ties to nothing. Measured 2026-10-12 on the
+aws-do-agent integration: with no tie at all, every answered ask stayed UNANSWERED.
+
+Three rules the independent merge review (2026-10-13) made load-bearing:
+
+* **every action acts on the config as it is NOW.** A button binds only the instance
+  name and the row key; the handler reloads settings.json and builds the adapter and
+  outbox fresh, so a channel demoted to 'never' after the page rendered refuses at the
+  click instead of sending (review B2);
+* **actions run in callbacks, before the render pass,** so the screen the operator
+  sees afterwards is the post-action truth — never a stale "replying to B" banner over a
+  form that will stage to A;
+* **a handler never crashes the page.** Send is offered only where the adapter can
+  deliver (a draft on a read-only adapter is Discard-only, and says why); Discard needs
+  no adapter at all; anything unexpected is reported with the row's actual state.
 """
 import html
+import os
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -43,23 +60,40 @@ import streamlit as st
 # grandparent) goes on sys.path explicitly.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.config import ensure_dirs, load_adapter_class  # noqa: E402
-from core.dashboard import open_ro, snapshot  # noqa: E402
+from core.config import ConfigError, ensure_dirs, load, load_adapter_class  # noqa: E402
+from core.dashboard import html_text, open_ro, snapshot  # noqa: E402
 from core.journal import Journal  # noqa: E402
 from core.outbox import (COMMITTED, DISCARDED, Outbox, PolicyError,  # noqa: E402
-                         ReleaseError, SendBlocked, STAGED, VERIFIED)
+                         ReleaseError, SENT, SendBlocked, STAGED, VERIFIED)
+
+
+# ---- config, fresh at every action --------------------------------------------
+def _settings_path():
+    """The same resolution scripts/dashboard.py uses — one source of truth."""
+    return Path(os.environ.get("COMMS_SETTINGS", "settings.json"))
+
+
+def _fresh_cfg():
+    """Reload settings.json NOW. A render-time config captured into a button is the
+    stale-policy hole: a channel demoted to 'never' after render would still send."""
+    return load(_settings_path())
+
+
+def _instance(cfg, name):
+    for inst in cfg.instances:
+        if inst.name == name:
+            return inst
+    return None
 
 
 def _channel_scope_policy(ch):
-    """The channel-scope policy string for one configured channel (compose posts
-    top-level; thread placement is the outbox row's business, not the form's)."""
+    """The channel-scope policy string: config's policy() is a plain string when both
+    placements share one, a per-scope dict once they differ."""
     p = ch.policy()
     return p if isinstance(p, str) else p.get("channel", "never")
 
 
 def _thread_scope_policy(ch):
-    """The thread-scope policy string: config's policy() is a plain string when both
-    placements share one, a per-scope dict once they differ."""
     p = ch.policy()
     return p if isinstance(p, str) else p.get("thread", "never")
 
@@ -68,15 +102,30 @@ def _adapter_for(cfg, inst):
     return load_adapter_class(cfg.channels_dir, inst.adapter)(auth=inst.auth)
 
 
-def _outbox_for(cfg, inst):
+def _can_send(adapter):
+    caps = getattr(adapter, "capabilities", None)
+    if callable(caps):
+        return bool(caps().get("send"))
+    return callable(getattr(adapter, "send", None))
+
+
+class _NoAdapter:
+    """Stands in where no adapter call can happen — stage() and discard() never touch
+    one — so a half-configured connection can still have its drafts discarded (S5)."""
+
+    def capabilities(self):
+        return {"read": False, "history": False, "search": False, "send": False,
+                "react": False, "threads": False}
+
+
+def _outbox_for(cfg, inst, adapter):
     """A WRITABLE outbox — constructed only inside an action handler, never while
     rendering: building one creates the db file, and a surface that mints state by
     being looked at is the exact disease the viewer's tests forbid. An ACTION may
     create the state it writes, so this is also where the config's directories are
     ensured (the same ensure_dirs the scheduler runs before its first write)."""
     ensure_dirs(cfg)
-    return Outbox(cfg.outbox_path_for(inst.name), _adapter_for(cfg, inst),
-                  inst.policies())
+    return Outbox(cfg.outbox_path_for(inst.name), adapter, inst.policies())
 
 
 def _rows(outbox_path, states):
@@ -98,6 +147,7 @@ def _push_flash(kind, msg):
     st.session_state.setdefault("write_flash", []).append((kind, msg))
 
 
+# ---- the tie: a PROVEN answer closes its ask --------------------------------------
 def _tie_answer(cfg, row, key):
     """ENH-30: a PROVEN send whose trigger is a journaled ask answers that ask.
     Returns the ask ts tied, or None. Stage never calls this (a draft is a promise);
@@ -110,97 +160,278 @@ def _tie_answer(cfg, row, key):
         ask = journal.get(row["target"], row["trigger_ts"])
         if ask is None or ask["responded_at"] is not None:
             return None
-        journal.mark_responded(row["target"], row["trigger_ts"], key)
+        # Stamped at the time the ANSWER WAS WRITTEN (the draft's created_at), never at
+        # send time: a draft may sit at the gate for hours, and an edit the asker made
+        # in between must read as edited AFTER the answer (R23), not be laundered into
+        # a clean tie (independent review F9).
+        journal.mark_responded(row["target"], row["trigger_ts"], key,
+                               at=row["created_at"] if "created_at" in row.keys() else None)
         return row["trigger_ts"]
     finally:
         journal.close()
 
 
-def _release_clicked(cfg, inst, key):
-    """Button callback — runs BEFORE the render pass, so the surface the operator
-    sees after the click is the post-action truth, never a stale card whose Send
-    button belongs to a draft that already left."""
-    outbox = _outbox_for(cfg, inst)
+def _tie_or_warn(cfg, row, key):
+    """Tie a PROVEN send to its ask, and tell the truth if the journal refuses.
+    The send already happened; a journal lock or disk error here must not crash the
+    page (the operator would re-send) and must not pass silently (the ask would read
+    unanswered with nothing saying why). The retry is Reply-with-the-same-text: the
+    stage dedupes to the proven row and the compose handler ties it then."""
     try:
-        res = outbox.release(key)
-        _push_flash("success", f"sent and proven: state {res['state']}, receipt "
-                               f"`{res['receipt']}`")
-        if res.get("receipt") and res["state"] in (COMMITTED, VERIFIED):
-            tied = _tie_answer(cfg, outbox.get(key), key)
-            if tied is not None:
-                _push_flash("success", f"the ask at ts {tied} is now recorded as "
-                                       "answered — it leaves the unanswered queue")
-    except (PolicyError, ReleaseError, SendBlocked) as ex:
-        _push_flash("error", f"refused: {ex}")
-    finally:
-        outbox.close()
+        tied = _tie_answer(cfg, row, key)
+    except sqlite3.Error as ex:
+        _push_flash("warning", "sent and proven, but recording the ask as answered "
+                               f"FAILED: {ex} — it stays in the unanswered queue; "
+                               "Reply with the same text to retry the tie")
+        return None
+    if tied is not None:
+        _push_flash("success", f"the ask at ts {tied} is now recorded as answered — "
+                               "it leaves the unanswered queue")
+    return tied
 
 
-def _discard_clicked(cfg, inst, key):
-    outbox = _outbox_for(cfg, inst)
-    try:
-        outbox.discard(key)
-        _push_flash("success", "discarded — kept in the outbox as DISCARDED, "
-                               "never sendable")
-    except ReleaseError as ex:
-        _push_flash("error", f"refused: {ex}")
-    finally:
-        outbox.close()
+# ---- targets: where a draft may go ------------------------------------------------
+def _targets(cfg):
+    """(free, replyable, unconfigured).
 
+    free       {label: (inst, ch)} — channels that accept a top-level compose: the
+               channel-scope policy is not 'never' AND the adapter declares send.
+    replyable  {channel_id: (inst, ch)} — channels an open ask can be answered on:
+               the THREAD scope or the channel scope is not 'never', and the adapter
+               declares send. "Answer in the thread, never the main channel" is a
+               policy the config can express; it must be answerable here too.
+    unconfigured  [(instance, reason)] — connections whose adapter could not even be
+               constructed (a slack instance with its token but no `channels` entry
+               yet, the state the add-connection form leaves). Skipped, and NAMED, so
+               a half-configured connection never takes the whole surface down.
 
-def _reply_clicked(channel, ts, text):
-    """Button callback: remember which ask the next compose answers."""
-    st.session_state["reply_to"] = {"channel": channel, "ts": str(ts),
-                                    "text": text or ""}
-
-
-def _cancel_reply_clicked():
-    st.session_state.pop("reply_to", None)
-
-
-def _open_asks(cfg, composable_ids):
-    """Open asks on channels the operator can compose to — read-only, through the
-    same snapshot the viewer renders (one definition of "unanswered", not two)."""
-    snap = snapshot(cfg.journal_path, {})
-    return [a for a in snap["attention"]
-            if a["severity"] == "unanswered" and a["where"] in composable_ids]
-
-
-def composable(cfg):
-    """([(instance, channel, policy)], [(instance_name, reason)]) — the compose
-    targets and the connections that could not even be constructed.
-
-    A compose target is a channel whose policy is not 'never' AND whose instance's
-    adapter declares send capability. Both halves are load-bearing: default-deny is
-    the engine's rule, and offering a compose box whose adapter cannot deliver (every
-    shipped live adapter — read-only by authorization) would stage drafts no click
-    can ever send.
-
-    Constructing the adapter can itself fail: a half-configured connection — e.g. a
-    slack instance whose token is set but whose `channels` auth entry has not been
-    added yet, the exact state the add-connection form leaves before the second auth
-    entry is staged — makes the adapter's __init__ refuse (it will not run
-    half-configured). Such an instance is not a compose target, and it must not take
-    the whole surface down: core/doctor already guards this same construction call and
-    surfaces the failure per-check; this surface does the same, skipping the instance
-    and returning it so render() can NAME what still needs configuring instead of
-    showing the operator a crashed page."""
-    out, unconfigured = [], []
+    Both maps require send capability: offering a compose or a Reply whose adapter
+    cannot deliver would stage drafts no click can ever send (every shipped live
+    adapter is read-only by authorization)."""
+    free, replyable, unconfigured = {}, {}, []
     for inst in cfg.instances:
         try:
             adapter = _adapter_for(cfg, inst)
         except Exception as ex:  # noqa: BLE001 — surfaced per-instance by render()
             unconfigured.append((inst.name, str(ex)))
             continue
-        if not adapter.capabilities().get("send"):
+        if not _can_send(adapter):
             continue
         for ch in inst.channels:
-            policy = _channel_scope_policy(ch)
-            if policy != "never":
-                out.append((inst, ch, policy))
-    return out, unconfigured
+            cpol, tpol = _channel_scope_policy(ch), _thread_scope_policy(ch)
+            if cpol != "never":
+                free[f"{inst.name} · {ch.id} (policy: {cpol})"] = (inst, ch)
+            if cpol != "never" or tpol != "never":
+                replyable[ch.id] = (inst, ch)
+    return free, replyable, unconfigured
 
 
+def composable(cfg):
+    """([(instance, channel, policy)], [(instance_name, reason)]) — the free compose
+    targets and the connections that could not be constructed (kept for callers of
+    the ENH-28 shape; render() uses _targets directly)."""
+    free, _, unconfigured = _targets(cfg)
+    return ([(inst, ch, _channel_scope_policy(ch)) for inst, ch in free.values()],
+            unconfigured)
+
+
+def _open_asks(cfg, replyable):
+    """Open asks on channels that accept a reply — read-only, through the same
+    snapshot the viewer renders (one definition of "unanswered", not two)."""
+    snap = snapshot(cfg.journal_path, {})
+    return [a for a in snap["attention"]
+            if a["severity"] == "unanswered" and a["where"] in replyable]
+
+
+def _thread_root(cfg, channel, ts):
+    """The thread an ask lives in: its own thread_id when the stored message is a
+    reply, else itself — the same rule core/store.thread_root applies for the sweep,
+    read here through a read-only connection so rendering never mints the store. A
+    reply placed under a reply's ts is one the sweep never looks under (review F4)."""
+    if not Path(cfg.store_path).is_file():
+        return str(ts)
+    conn = open_ro(cfg.store_path)
+    try:
+        row = conn.execute("SELECT thread_id FROM messages WHERE channel_id=? AND ts=?",
+                           (channel, str(ts))).fetchone()
+        return row[0] if row and row[0] else str(ts)
+    finally:
+        conn.close()
+
+
+# ---- callbacks: every action acts BEFORE the render pass, on fresh config ----------
+def _reply_clicked(channel, ts, text, label):
+    """Remember which ask the next compose answers; park the free-compose selector on
+    that channel too (when it accepts top-level composes) so the draft AFTER the reply
+    goes where the operator was just working, visibly."""
+    st.session_state["reply_to"] = {"channel": channel, "ts": str(ts),
+                                    "text": text or ""}
+    if label:
+        st.session_state["compose_where"] = label
+
+
+def _cancel_reply_clicked():
+    st.session_state.pop("reply_to", None)
+
+
+def _stage_clicked():
+    """Form submit — runs before the rerun, so the page the operator sees next shows
+    the staged draft at the gate and no leftover reply banner."""
+    text = st.session_state.get("compose_text", "") or ""
+    where = st.session_state.get("compose_where")
+    reply_to = st.session_state.get("reply_to")
+    if not text.strip():
+        _push_flash("error", "an empty draft stages nothing")
+        return
+    try:
+        cfg = _fresh_cfg()
+    except ConfigError as ex:
+        _push_flash("error", f"settings refused: {ex} — nothing staged")
+        return
+    free, replyable, _ = _targets(cfg)
+    if reply_to is not None:
+        pair = replyable.get(reply_to["channel"])
+        if pair is None:
+            st.session_state.pop("reply_to", None)
+            _push_flash("error", f"channel {reply_to['channel']} no longer accepts a reply "
+                                 "(policy or adapter changed since you clicked Reply) — "
+                                 "nothing staged")
+            return
+        inst, ch = pair
+        trigger = reply_to["ts"]                    # the ASK is the trigger: the tie key
+        in_thread = _thread_scope_policy(ch) != "never"
+        thread = _thread_root(cfg, ch.id, trigger) if in_thread else None
+    else:
+        pair = free.get(where)
+        if pair is None:
+            _push_flash("error", "pick a channel to stage to — the selected one no longer "
+                                 "accepts a top-level compose")
+            return
+        inst, ch = pair
+        # The compose moment IS the trigger: a deliberate second compose of the same
+        # text is a new draft, not a dedupe of the first.
+        trigger, thread = f"ui-compose-{time.time():.6f}", None
+    outbox = None
+    try:
+        outbox = _outbox_for(cfg, inst, _NoAdapter())      # stage() never calls one
+        res = outbox.stage(ch.id, trigger, text, thread_id=thread)
+    except PolicyError as ex:
+        _push_flash("error", f"refused: {ex}")
+        return
+    except Exception as ex:  # noqa: BLE001 — a crashed page hides what happened
+        _push_flash("error", f"{type(ex).__name__}: {ex} — nothing staged")
+        return
+    finally:
+        if outbox is not None:
+            outbox.close()
+    st.session_state.pop("reply_to", None)
+    st.session_state["compose_text"] = ""
+    if (reply_to is not None and res.get("deduped") and res.get("receipt")
+            and res["state"] in (COMMITTED, VERIFIED)):
+        # The answer is already PROVEN on the target (a Send whose tie failed, or a
+        # row recovered by Outbox.recover()): tie it now. Staging a NEW draft never
+        # ties — a draft is a promise, not an answer.
+        proven = _outbox_for(cfg, inst, _NoAdapter())
+        try:
+            _tie_or_warn(cfg, proven.get(res["key"]), res["key"])
+        finally:
+            proven.close()
+    if res.get("deduped"):
+        _push_flash("warning", f"already known: `{res['key'][:12]}…` is {res['state']}")
+        return
+    placement = ("" if reply_to is None else
+                 (f" as a reply to ts {trigger}, in its thread" if thread
+                  else f" as a reply to ts {trigger}, top-level (thread_reply_policy "
+                       "is 'never' for this channel)"))
+    _push_flash("success", f"staged `{res['key'][:12]}…`{placement} — waiting for your "
+                           "click below; nothing has been sent")
+
+
+def _release_clicked(inst_name, key):
+    """The Send click. Binds only the instance NAME and the row key; everything else
+    is resolved now, from the settings file as it is at this moment."""
+    try:
+        cfg = _fresh_cfg()
+    except ConfigError as ex:
+        _push_flash("error", f"settings refused: {ex} — nothing sent")
+        return
+    inst = _instance(cfg, inst_name)
+    if inst is None:
+        _push_flash("error", f"connection {inst_name} no longer exists in settings.json "
+                             "— nothing sent")
+        return
+    outbox = None
+    try:
+        outbox = _outbox_for(cfg, inst, _adapter_for(cfg, inst))
+        res = outbox.release(key)
+        if res.get("in_flight"):
+            # Not proven: a claim is in flight or died mid-flight. Saying "sent and
+            # proven" here would be false; only recovery's read-back can tell.
+            _push_flash("warning", f"already in flight — state {res['state']}, not "
+                                   "proven yet; run Outbox.recover() before anything "
+                                   "else touches this draft")
+            return
+        if res.get("deduped"):
+            _push_flash("info", f"already delivered — state {res['state']}, receipt "
+                                f"`{res['receipt']}`; nothing was re-sent")
+            _tie_or_warn(cfg, outbox.get(key), key)
+            return
+        _push_flash("success", f"sent and proven: state {res['state']}, receipt "
+                               f"`{res['receipt']}`")
+        if res.get("receipt") and res["state"] in (COMMITTED, VERIFIED):
+            _tie_or_warn(cfg, outbox.get(key), key)
+    except (PolicyError, ReleaseError) as ex:
+        _push_flash("error", f"refused: {ex}")
+    except SendBlocked as ex:
+        # After SENT is durable a failed read-back is NOT a refusal: the message may
+        # well be on the platform, and "refused" would invite a second one.
+        state = outbox.get(key)["state"] if outbox is not None else "?"
+        if state in (SENT, VERIFIED):
+            _push_flash("warning", f"SENT but delivery unproven (state {state}): {ex} — "
+                                   "do NOT re-send; run Outbox.recover()")
+        else:
+            _push_flash("error", f"refused: {ex}")
+    except Exception as ex:  # noqa: BLE001 — the page must say what the row is now
+        state = "?"
+        if outbox is not None:
+            row = outbox.get(key)
+            state = row["state"] if row is not None else "?"
+        _push_flash("error", f"{type(ex).__name__}: {ex} — row state is now {state}; "
+                             "nothing else changed")
+    finally:
+        if outbox is not None:
+            outbox.close()
+
+
+def _discard_clicked(inst_name, key):
+    """Discard never calls an adapter, so it must never need one: a draft on a
+    half-configured connection stays discardable (review S5)."""
+    try:
+        cfg = _fresh_cfg()
+    except ConfigError as ex:
+        _push_flash("error", f"settings refused: {ex} — nothing changed")
+        return
+    inst = _instance(cfg, inst_name)
+    if inst is None:
+        _push_flash("error", f"connection {inst_name} no longer exists in settings.json "
+                             "— nothing changed")
+        return
+    outbox = None
+    try:
+        outbox = _outbox_for(cfg, inst, _NoAdapter())
+        outbox.discard(key)
+        _push_flash("success", "discarded — kept in the outbox as DISCARDED, "
+                               "never sendable")
+    except ReleaseError as ex:
+        _push_flash("error", f"refused: {ex}")
+    except Exception as ex:  # noqa: BLE001
+        _push_flash("error", f"{type(ex).__name__}: {ex} — nothing changed")
+    finally:
+        if outbox is not None:
+            outbox.close()
+
+
+# ---- render ---------------------------------------------------------------------
 def render(cfg):
     st.divider()
     st.header("write surface")
@@ -210,95 +441,104 @@ def render(cfg):
     for kind, msg in st.session_state.pop("write_flash", []):
         getattr(st, kind)(msg)
 
-    # ---- compose: stage only, never send -----------------------------------
-    options, unconfigured = composable(cfg)
+    free, replyable, unconfigured = _targets(cfg)
     for name, reason in unconfigured:
         st.warning(f"connection **{html.escape(name)}** is not fully configured yet, "
                    f"so it cannot be watched or composed to: {html.escape(reason)} "
                    "Finish it under “edit connection (adapter / auth)” below — add the "
                    "missing auth entry as an env:NAME reference — then it becomes "
                    "available. (The connection is kept; only this surface skips it.)")
-    if not options:
-        st.info("The write gate is on, but no channel is composable: a channel "
-                "needs `reply_policy` (or `thread_reply_policy`) of 'staged' or "
-                "'direct' in settings.json — every channel defaults to 'never' "
-                "(deny) — AND its instance's adapter must declare send capability. "
-                "Of the shipped adapters only `fake` does; the live adapters are "
-                "read-only by authorization (see the quickstart's honest limits).")
+    label_of = {ch.id: label for label, (inst, ch) in free.items()}
+
+    # ---- open asks: Reply pre-fills the form (ENH-30) -------------------------
+    asks = _open_asks(cfg, replyable)
+    if asks:
+        st.markdown("##### open asks you can answer from here")
+        for a in asks:
+            col_text, col_btn = st.columns([5, 1])
+            # An HTML BLOCK (`<div`-led, no blank line inside): ask text is
+            # attacker-controlled, and inline markdown stays inert only there.
+            col_text.markdown(
+                "<div style='padding:2px 0'>"
+                f"<b>{html.escape(a['where'])}</b> · ts {html.escape(str(a['ts']))}"
+                f" · {html.escape(str(a['kind'] or 'unclassified'))}<br>"
+                f"<span style='font-size:.9rem'>{html_text(a['text'])}</span>"
+                "</div>", unsafe_allow_html=True)
+            # '|' cannot appear in a platform channel id or ts, so the key is
+            # unambiguous ('-' could be, and a collision crashes the page).
+            col_btn.button("Reply", key=f"reply|{a['where']}|{a['ts']}",
+                           on_click=_reply_clicked,
+                           args=(a["where"], a["ts"], a["text"], label_of.get(a["where"])))
+
+    reply_to = st.session_state.get("reply_to")
+    if reply_to is not None and reply_to["channel"] not in replyable:
+        # The channel was demoted or its adapter changed since Reply was clicked.
+        st.session_state.pop("reply_to", None)
+        reply_to = None
+    if reply_to is not None and (reply_to["channel"], reply_to["ts"]) not in {
+            (a["where"], str(a["ts"])) for a in asks}:
+        # Answered elsewhere since Reply was clicked (the sweep, another tab): the
+        # banner must not keep promising to record an ask that is already closed.
+        st.session_state.pop("reply_to", None)
+        st.info(f"the ask at ts {html.escape(reply_to['ts'])} in "
+                f"{html.escape(reply_to['channel'])} is no longer open — it was answered "
+                "elsewhere; nothing to reply to")
+        reply_to = None
+    if reply_to is not None:
+        _, reply_ch = replyable[reply_to["channel"]]
+        placement = ("in its thread" if _thread_scope_policy(reply_ch) != "never"
+                     else "top-level in the channel (thread_reply_policy is 'never' "
+                          "for this channel)")
+        st.info(f"replying to **{html.escape(reply_to['channel'])}** · ts "
+                f"{html.escape(reply_to['ts'])} — {placement}. Sending will record "
+                "that ask as answered.")
+        st.button("cancel reply", key="reply_cancel", on_click=_cancel_reply_clicked)
+
+    # ---- compose: stage only, never send ----------------------------------------
+    if reply_to is None and not free:
+        if replyable:
+            st.info("The write gate is on, but no channel accepts a top-level compose "
+                    "(every channel-scope policy is 'never'). Channels whose "
+                    "thread_reply_policy allows it are answered through **Reply** on an "
+                    "open ask above — in the thread, never the main channel.")
+        else:
+            st.info("The write gate is on, but no channel is composable: a channel "
+                    "needs `reply_policy` (or `thread_reply_policy`) of 'staged' or "
+                    "'direct' in settings.json — every channel defaults to 'never' "
+                    "(deny) — AND its instance's adapter must declare send capability. "
+                    "Of the shipped adapters only `fake` does; the live adapters are "
+                    "read-only by authorization (see the quickstart's honest limits).")
     else:
-        labels = {f"{inst.name} · {ch.id} (policy: {policy})": (inst, ch)
-                  for inst, ch, policy in options}
-        label_of = {ch.id: label for label, (inst, ch) in labels.items()}
-        composable_ids = {ch.id: (inst, ch) for inst, ch, _ in options}
-        # ---- open asks: Reply pre-fills the form (ENH-30) ----------------
-        asks = _open_asks(cfg, composable_ids)
-        if asks:
-            st.markdown("##### open asks you can answer from here")
-            for a in asks:
-                col_text, col_btn = st.columns([5, 1])
-                col_text.markdown(
-                    f"**{html.escape(a['where'])}** · ts {html.escape(str(a['ts']))}"
-                    f" · {html.escape(str(a['kind'] or 'unclassified'))}<br>"
-                    f"<span style='font-size:.9rem'>{html.escape(a['text'] or '')}"
-                    "</span>", unsafe_allow_html=True)
-                col_btn.button("Reply", key=f"reply-{a['where']}-{a['ts']}",
-                               on_click=_reply_clicked,
-                               args=(a["where"], a["ts"], a["text"]))
-        reply_to = st.session_state.get("reply_to")
-        if reply_to is not None and reply_to["channel"] not in composable_ids:
-            # The channel was demoted since Reply was clicked: never stage to it.
-            st.session_state.pop("reply_to", None)
-            reply_to = None
-        if reply_to is not None:
-            _, reply_ch = composable_ids[reply_to["channel"]]
-            placement = ("in its thread" if _thread_scope_policy(reply_ch) != "never"
-                         else "top-level in the channel (thread_reply_policy is "
-                              "'never' for this channel)")
-            st.info(f"replying to **{html.escape(reply_to['channel'])}** · ts "
-                    f"{html.escape(reply_to['ts'])} — {placement}. Sending will "
-                    "record that ask as answered.")
-            st.button("cancel reply", key="reply-cancel", on_click=_cancel_reply_clicked)
-        with st.form("compose", clear_on_submit=True):
-            choices = sorted(labels)
-            preset = (choices.index(label_of[reply_to["channel"]])
-                      if reply_to is not None else 0)
-            where = st.selectbox("stage to", choices, index=preset,
-                                 disabled=reply_to is not None)
-            text = st.text_area("message", height=100)
-            submitted = st.form_submit_button("Stage draft")
-        if submitted:
-            if not text.strip():
-                st.error("an empty draft stages nothing")
+        if st.session_state.get("compose_where") not in free:
+            st.session_state.pop("compose_where", None)
+        with st.form("compose"):
+            if reply_to is None:
+                st.selectbox("stage to", sorted(free), key="compose_where")
             else:
-                if reply_to is not None:
-                    inst, ch = composable_ids[reply_to["channel"]]
-                    # The ASK is the trigger: the release will tie the two.
-                    trigger = reply_to["ts"]
-                    thread = (reply_to["ts"]
-                              if _thread_scope_policy(ch) != "never" else None)
-                else:
-                    inst, ch = labels[where]
-                    # The compose moment IS the trigger: a deliberate second compose
-                    # of the same text is a new draft, not a dedupe of the first.
-                    trigger, thread = f"ui-compose-{time.time():.6f}", None
-                outbox = _outbox_for(cfg, inst)
-                try:
-                    res = outbox.stage(ch.id, trigger, text, thread_id=thread)
-                finally:
-                    outbox.close()
-                st.session_state.pop("reply_to", None)
-                if res.get("deduped"):
-                    st.warning(f"already known: `{res['key'][:12]}…` is {res['state']}")
-                else:
-                    st.success(f"staged `{res['key'][:12]}…` — waiting for your "
-                               "click below; nothing has been sent")
+                st.caption(f"stage to: **{html.escape(reply_to['channel'])}** — in reply "
+                           f"to ts {html.escape(reply_to['ts'])}")
+            st.text_area("message", height=100, key="compose_text")
+            st.form_submit_button("Stage draft", on_click=_stage_clicked)
 
     # ---- the gate: staged drafts, one click each ----------------------------
     st.subheader("staged — waiting for you")
     any_staged = False
     for inst in cfg.instances:
         outbox_path = cfg.outbox_path_for(inst.name)
-        for row in _rows(outbox_path, (STAGED,)):
+        drafts = _rows(outbox_path, (STAGED,))
+        if not drafts:
+            continue
+        # Send is offered only where the adapter can deliver: a click on a draft whose
+        # adapter has no send() used to flip the row to INTENT and crash — a wedge no
+        # Discard could clear (review B3). The reason is on the card, not hidden.
+        try:
+            no_send = (None if _can_send(_adapter_for(cfg, inst))
+                       else "this instance's adapter cannot send (read-only by "
+                            "authorization) — Discard is the only action")
+        except Exception as ex:  # noqa: BLE001 — half-configured connection
+            no_send = (f"this connection is not fully configured ({html.escape(str(ex))})"
+                       " — finish it or Discard")
+        for row in drafts:
             any_staged = True
             st.markdown(
                 "<div style='border:1px solid rgba(128,128,128,.3);border-left:"
@@ -308,14 +548,20 @@ def render(cfg):
                 "</code>"
                 + ("" if str(row["trigger_ts"]).startswith("ui-compose-") else
                    f" · <b>in reply to ts {html.escape(str(row['trigger_ts']))}</b>"
-                   + (" (in thread)" if row["thread_id"] else " (top-level)"))
+                   + (f" (in thread {html.escape(str(row['thread_id']))})"
+                      if row["thread_id"] else " (top-level)"))
                 + "<div style='font-size:.9rem;margin-top:4px'>"
-                f"{html.escape(row['text'])}</div></div>", unsafe_allow_html=True)
+                f"{html_text(row['text'])}</div>"
+                + ("" if no_send is None else
+                   f"<div style='color:#8f1d1d;font-size:.85rem;margin-top:4px'>no Send: "
+                   f"{no_send}</div>")
+                + "</div>", unsafe_allow_html=True)
             approve, reject = st.columns(2)
-            approve.button("Send — this exact text", key=f"send-{row['key']}",
-                           on_click=_release_clicked, args=(cfg, inst, row["key"]))
+            if no_send is None:
+                approve.button("Send — this exact text", key=f"send-{row['key']}",
+                               on_click=_release_clicked, args=(inst.name, row["key"]))
             reject.button("Discard", key=f"discard-{row['key']}",
-                          on_click=_discard_clicked, args=(cfg, inst, row["key"]))
+                          on_click=_discard_clicked, args=(inst.name, row["key"]))
     if not any_staged:
         st.markdown("_no drafts at the gate_")
 
@@ -331,7 +577,7 @@ def render(cfg):
             f"<td style='padding:4px 8px'><b>{html.escape(row['state'])}</b></td>"
             f"<td style='padding:4px 8px'>{html.escape(row['target'])}</td>"
             f"<td style='padding:4px 8px'>{html.escape(name)}</td>"
-            f"<td style='padding:4px 8px'>{html.escape(row['text'])}</td>"
+            f"<td style='padding:4px 8px'>{html_text(row['text'])}</td>"
             f"<td style='padding:4px 8px'><code>{html.escape(str(row['receipt']))}"
             "</code></td></tr>"
             for name, row in sent_rows)

@@ -2112,7 +2112,7 @@ run_mutation "outbox: stage() accepts a never-policy target" \
 # operator's click silently never happened.
 run_mutation "outbox: release() skips the durable STAGED->INTENT flip" \
   "core/outbox.py" \
-  "('        self._write(key, state=INTENT)', '        pass')" \
+  "('        if not self._claim(key, STAGED, INTENT):', '        if False:')" \
   "test_outbox_write"
 
 # ENH-28 — an INTENT/SENT row belongs to recover(); a second live delivery from the
@@ -2128,11 +2128,20 @@ run_mutation "outbox: release() delivers an already-delivered draft again" \
   "('        if row[\"state\"] in (VERIFIED, COMMITTED):\n            # Already proven on the target: return the receipt, never re-send.', '        if False:\n            # Already proven on the target: return the receipt, never re-send.')" \
   "test_outbox_write"
 
-# ENH-28 — DISCARDED is terminal: a rejected draft that can still be released makes
-# the human 'no' advisory.
-run_mutation "outbox: a DISCARDED draft can still be released" \
+# ENH-28/review B1 — the click is a CLAIM: with the state dropped from the WHERE clause
+# two Sends landing between the read and the write both reach the adapter (one approved
+# draft, two messages), and a Discard interleaved with a Send still sends. DISCARDED being
+# terminal is guaranteed by this same clause.
+run_mutation "outbox: the state claim is unconditional (two clicks deliver one draft twice)" \
   "core/outbox.py" \
-  "('        if row[\"state\"] == DISCARDED:', '        if False:')" \
+  "('            \"UPDATE outbox SET state=?, updated_at=? WHERE key=? AND state=?\",\n            (to_state, time.time(), key, from_state))', '            \"UPDATE outbox SET state=?, updated_at=? WHERE key=?\",\n            (to_state, time.time(), key))')" \
+  "test_outbox_write"
+
+# review B3 — refuse BEFORE the flip when the adapter cannot deliver: flipping first wedges
+# the row in INTENT, undiscardable and unrecoverable.
+run_mutation "outbox: release() flips a draft whose adapter cannot send" \
+  "core/outbox.py" \
+  "('        if not _can_send(self.adapter):', '        if False:')" \
   "test_outbox_write"
 
 # ENH-28 — policy is re-resolved at the CLICK: a channel demoted to 'never' since
@@ -2144,9 +2153,9 @@ run_mutation "outbox: release() honours the policy from staging time, not the cl
 
 # ENH-28 — discard() must refuse anything that is not a draft: 'discarding' a
 # delivered row misrecords what is already on the platform.
-run_mutation "outbox: discard() rewrites the record of a delivered send" \
+run_mutation "outbox: discard() skips the compare-and-swap (records nothing)" \
   "core/outbox.py" \
-  "('        if row[\"state\"] != STAGED:', '        if False:')" \
+  "('        if not self._claim(key, STAGED, DISCARDED):', '        if False:')" \
   "test_outbox_write"
 
 # ENH-28 — THE gate, shell side: the write surface must not exist for a read-only
@@ -2176,7 +2185,7 @@ run_mutation "dashboard.py (shell): a junk gate value is silently accepted" \
 # the R22 cues and the ENH-9 signal once died).
 run_mutation "dashboard_write: the compose form sends instead of staging" \
   "scripts/dashboard_write.py" \
-  "('                    res = outbox.stage(ch.id, trigger, text, thread_id=thread)', '                    res = outbox.release(outbox.stage(ch.id, trigger, text, thread_id=thread)[\"key\"])')" \
+  "('        res = outbox.stage(ch.id, trigger, text, thread_id=thread)', '        res = outbox.stage(ch.id, trigger, text, thread_id=thread); res = _outbox_for(cfg, inst, _adapter_for(cfg, inst)).release(res[\"key\"])')" \
   "test_dashboard_write"
 
 # ENH-28 — rendering reads, actions write: a missing outbox is the normal fresh
@@ -2348,7 +2357,7 @@ run_mutation "dashboard: an unclassified row is hidden from the queue" \
 # ENH-30 — the asker bumping their own thread is not an answer.
 run_mutation "threads: the asker's own follow-up counts as the answer" \
   "core/threads.py" \
-  "('        if r.get(\"sender_id\") and r[\"sender_id\"] != asker:', '        if r.get(\"sender_id\"):')" \
+  "('        if not sender or sender == asker or sender in UNATTRIBUTED_SENDERS:', '        if not sender or sender in UNATTRIBUTED_SENDERS:')" \
   "test_threads"
 
 # ENH-30 — an adapter without replies() must read as 'cannot see answers', never as
@@ -2368,7 +2377,7 @@ run_mutation "threads: STATEMENTs are swept like asks" \
 # ENH-30 — the sweep is bounded and SAYS when it truncated.
 run_mutation "threads: a truncated sweep reports itself complete" \
   "core/threads.py" \
-  "('              \"truncated\": len(open_asks) > len(batch), \"rate_limited\": None}', '              \"truncated\": False, \"rate_limited\": None}')" \
+  "('    result[\"truncated\"] = len(open_asks) > len(batch)', '    result[\"truncated\"] = False')" \
   "test_threads"
 
 # ENH-30 — a 429 must be visible in the result, never swallowed.
@@ -2380,13 +2389,13 @@ run_mutation "threads: a rate limit is swallowed silently" \
 # ENH-30 — the tie itself: without mark_responded the ask stays open forever.
 run_mutation "threads: a foreign reply never marks the ask responded" \
   "core/threads.py" \
-  "('            journal.mark_responded(channel, row[\"ts\"], f\"thread-reply:{hit[\\'ts\\']}\")', '            pass')" \
+  "('                journal.mark_responded(channel, row[\"ts\"], f\"thread-reply:{hit[\\'ts\\']}\",\n                                       at=arrivals.get(str(hit[\"ts\"])))', '                pass')" \
   "test_threads"
 
 # ENH-30 — the scheduler must actually run the sweep each cycle.
 run_mutation "schedule: the cycle skips the thread sweep" \
   "core/schedule.py" \
-  "('                swept = threads.sweep(src.adapter, self.store, self.journal, ch)', '                swept = None')" \
+  "('                swept = threads.sweep(', '                swept = None and threads.sweep(')" \
   "test_schedule"
 
 # ENH-30 — the Slack adapter must drop the parent (it is the ask, not an answer).
@@ -2411,26 +2420,239 @@ run_mutation "fake: replies() ignores oldest" \
 # ENH-30 — the write surface: a PROVEN send from Reply must tie the ask.
 run_mutation "dashboard_write: a sent reply never marks the ask answered" \
   "scripts/dashboard_write.py" \
-  "('        journal.mark_responded(row[\"target\"], row[\"trigger_ts\"], key)', '        pass')" \
+  "('        journal.mark_responded(row[\"target\"], row[\"trigger_ts\"], key,\n                               at=row[\"created_at\"] if \"created_at\" in row.keys() else None)', '        pass')" \
   "test_dashboard_write"
 
 # ENH-30 — STAGING must not tie: a draft is a promise, not an answer.
 run_mutation "dashboard_write: staging a reply already marks the ask answered" \
   "scripts/dashboard_write.py" \
-  "('                st.session_state.pop(\"reply_to\", None)\n                if res.get(\"deduped\"):', '                st.session_state.pop(\"reply_to\", None)\n                _tie_answer(cfg, {\"target\": ch.id, \"trigger_ts\": trigger}, res[\"key\"])\n                if res.get(\"deduped\"):')" \
+  "('    if (reply_to is not None and res.get(\"deduped\") and res.get(\"receipt\")\n            and res[\"state\"] in (COMMITTED, VERIFIED)):', '    if reply_to is not None:')" \
   "test_dashboard_write"
 
 # ENH-30 — Reply must only be offered where composing is allowed (deny-by-default).
 run_mutation "dashboard_write: Reply offered on a never-policy channel" \
   "scripts/dashboard_write.py" \
-  "('            if a[\"severity\"] == \"unanswered\" and a[\"where\"] in composable_ids]', '            if a[\"severity\"] == \"unanswered\"]')" \
+  "('            if a[\"severity\"] == \"unanswered\" and a[\"where\"] in replyable]', '            if a[\"severity\"] == \"unanswered\"]')" \
   "test_dashboard_write"
 
 # ENH-30/R21 — the docs must keep saying what 'unanswered' means and how it closes.
 run_mutation "docs: the answered-state explanation vanishes from the quickstart" \
   "docs/QUICKSTART.md" \
-  "('A top-level reply in the channel cannot be attributed to the ask it answers, so\nit leaves the ask open — answer in the thread.', 'Replies close asks.')" \
+  "('A top-level reply posted in the channel by someone else cannot be attributed to the\nask it answers, so it leaves the ask open — answer in the thread, or from this surface\\'s\nReply button', 'Replies close asks.')" \
   "test_docs"
+
+# ---------------------------------------------------------------------------
+# ENH-30 follow-up — the independent reviews of 89fd0fa (comms lanes + the merge
+# reviewer, 2026-10-13). Each mutation below removes one property those reviews found
+# missing or watched fail; a survivor is a review finding with no test behind it.
+# ---------------------------------------------------------------------------
+
+# A deleted ask answers thread_not_found forever; escaping made a crash loop, swallowing
+# is the F-2 silent no-op. Recorded BY ASK or not at all.
+run_mutation "threads: a platform error on one thread is swallowed" \
+  "core/threads.py" \
+  "('            result[\"errors\"].extend((str(r[\"ts\"]), f\"{type(ex).__name__}: {ex}\")\n                                    for r in rows)', '            pass')" \
+  "test_threads"
+
+# The inverted dual-write: a store-derived floor skips a reply that is stored but not
+# yet journaled, and a broadcast bump hides an earlier real answer.
+run_mutation "threads: the fetch floor is the newest stored reply, not the ask" \
+  "core/threads.py" \
+  "('        oldest = min((str(r[\"ts\"]) for r in rows), key=ts_order)', '        oldest = max([str(r[\"ts\"]) for r in rows] + [str(m[\"ts\"]) for m in store.thread_replies(channel, root)], key=ts_order)')" \
+  "test_threads"
+
+# Only replies AFTER the ask can answer it.
+run_mutation "threads: a reply older than the ask answers it" \
+  "core/threads.py" \
+  "('            later = [m for m in in_thread if ts_order(m[\"ts\"]) > ts_order(row[\"ts\"])]', '            later = list(in_thread)')" \
+  "test_threads"
+
+# SWEEP_MAX is a bound only if the default the scheduler relies on honours it.
+run_mutation "threads: the default sweep is unbounded" \
+  "core/threads.py" \
+  "('          max_threads: int = SWEEP_MAX, start: int = 0, is_answer=None) -> dict | None:', '          max_threads: int = 10**9, start: int = 0, is_answer=None) -> dict | None:')" \
+  "test_threads"
+
+# The sweep's refusals must reach the operator (G4): a dead thread, a 429, a truncation.
+run_mutation "schedule: sweep errors never reach the cycle summary" \
+  "core/schedule.py" \
+  "('                    sweep_errors.extend((ch, ts, msg) for ts, msg in swept[\"errors\"])', '                    pass')" \
+  "test_schedule"
+
+run_mutation "schedule: a sweep 429 prints the same cycle line as a healthy sweep" \
+  "core/schedule.py" \
+  "('                    if swept[\"rate_limited\"]:\n                        sweep_rate_limited.append((ch, swept[\"rate_limited\"]))', '                    if False:\n                        sweep_rate_limited.append((ch, swept[\"rate_limited\"]))')" \
+  "test_schedule"
+
+# A third party's \"+1\" closes an ask too; the surface must keep that countable apart.
+run_mutation "dashboard: thread-closed asks are counted as answers sent from here" \
+  "core/dashboard.py" \
+  "('                \"AND response_key LIKE \\'thread-reply:%\\'\"', '                \"AND 0\"')" \
+  "test_dashboard"
+
+# A blank line ends a CommonMark HTML block and re-arms markdown for untrusted text.
+run_mutation "dashboard: html_text keeps blank lines (the HTML block ends early)" \
+  "core/dashboard.py" \
+  "('    return html.escape(text or \"\").replace(\"\\\\r\", \"\").replace(\"\\\\n\", \"<br>\")', '    return html.escape(text or \"\")')" \
+  "test_dashboard"
+
+# review B2 — the click must act on the config as it is NOW, never the render-time copy.
+run_mutation "dashboard_write: the click gets all-direct policies (render-time config)" \
+  "scripts/dashboard_write.py" \
+  "('        outbox = _outbox_for(cfg, inst, _adapter_for(cfg, inst))\n        res = outbox.release(key)', '        outbox = Outbox(cfg.outbox_path_for(inst.name), _adapter_for(cfg, inst), {ch.id: \"direct\" for ch in inst.channels})\n        res = outbox.release(key)')" \
+  "test_dashboard_write"
+
+# review B3 — Send is offered only where the adapter can deliver.
+run_mutation "dashboard_write: Send offered on a draft whose adapter cannot send" \
+  "scripts/dashboard_write.py" \
+  "('            if no_send is None:\n                approve.button(', '            if True:\n                approve.button(')" \
+  "test_dashboard_write"
+
+# review S5 — Discard needs no adapter; building one crashes on a half-configured connection.
+run_mutation "dashboard_write: Discard builds the adapter it never needs" \
+  "scripts/dashboard_write.py" \
+  "('        outbox = _outbox_for(cfg, inst, _NoAdapter())\n        outbox.discard(key)', '        outbox = _outbox_for(cfg, inst, _adapter_for(cfg, inst))\n        outbox.discard(key)')" \
+  "test_dashboard_write"
+
+# review F2 — a journal refusal after a PROVEN send is a warning with a retry, never a crash.
+run_mutation "dashboard_write: a journal refusal after a proven send crashes the page" \
+  "scripts/dashboard_write.py" \
+  "('    except sqlite3.Error as ex:', '    except () as ex:')" \
+  "test_dashboard_write"
+
+# review F4 — a reply to an in-thread ask threads under the ROOT the sweep reads.
+run_mutation "dashboard_write: a reply threads under the ask instead of the thread root" \
+  "scripts/dashboard_write.py" \
+  "('        thread = _thread_root(cfg, ch.id, trigger) if in_thread else None', '        thread = trigger if in_thread else None')" \
+  "test_dashboard_write"
+
+# review F5 — a thread-only channel is answerable through Reply.
+run_mutation "dashboard_write: a thread-only channel offers no Reply" \
+  "scripts/dashboard_write.py" \
+  "('            if cpol != \"never\" or tpol != \"never\":\n                replyable[ch.id] = (inst, ch)', '            if cpol != \"never\":\n                replyable[ch.id] = (inst, ch)')" \
+  "test_dashboard_write"
+
+# review F6/R21 — the limits entry names the stranded adapters from the code, not from memory.
+run_mutation "docs: the stranded-adapters list drifts from the shipped tree" \
+  "docs/QUICKSTART.md" \
+  "('\`slack_socket\`, \`telegram\` and \`email\`', '\`telegram\` and \`email\`')" \
+  "test_docs"
+
+# ---------------------------------------------------------------------------
+# ENH-30 follow-up, round 3 — the review lanes' second pass over the fixed tree
+# (edit laundering, tie-only-on-proof, starvation, budget, "+1" replies, eight unpinned
+# UI properties). Each mutation removes one property; a survivor is a finding with no
+# test behind it.
+# ---------------------------------------------------------------------------
+
+# review F9 (blocker) — a late tie stamped at send time launders an edit made while the
+# draft waited at the gate.
+run_mutation "dashboard_write: the tie is stamped at send time, laundering an edit" \
+  "scripts/dashboard_write.py" \
+  "('                               at=row[\"created_at\"] if \"created_at\" in row.keys() else None)', '                               at=None)')" \
+  "test_dashboard_write"
+
+run_mutation "journal: mark_responded ignores the time the answer was written" \
+  "core/journal.py" \
+  "('            (time.time() if at is None else float(at), response_key, channel, str(ts)))', '            (time.time(), response_key, channel, str(ts)))')" \
+  "test_journal"
+
+run_mutation "threads: the thread tie is stamped at sweep time, not the reply's arrival" \
+  "core/threads.py" \
+  "('                                       at=arrivals.get(str(hit[\"ts\"])))', '                                       at=None)')" \
+  "test_threads"
+
+# review F8-A — tie ONLY on proof: an in-flight (unproven) release must never tie.
+run_mutation "dashboard_write: an in-flight release is tied as if proven" \
+  "scripts/dashboard_write.py" \
+  "('        if res.get(\"in_flight\"):\n            # Not proven', '        if False:\n            # Not proven')" \
+  "test_dashboard_write"
+
+# review F8-B — the first proven answer keeps the tie.
+run_mutation "dashboard_write: a later send overwrites the first answer's tie" \
+  "scripts/dashboard_write.py" \
+  "('        if ask is None or ask[\"responded_at\"] is not None:', '        if ask is None:')" \
+  "test_dashboard_write"
+
+# review F8-F — a Send with no journal must not mint journal.db.
+run_mutation "dashboard_write: a Send with no journal mints journal.db" \
+  "scripts/dashboard_write.py" \
+  "('    if row is None or not Path(cfg.journal_path).is_file():', '    if row is None:')" \
+  "test_dashboard_write"
+
+# review F8-H — cancel actually cancels.
+run_mutation "dashboard_write: cancel reply does nothing" \
+  "scripts/dashboard_write.py" \
+  "('def _cancel_reply_clicked():\n    st.session_state.pop(\"reply_to\", None)', 'def _cancel_reply_clicked():\n    pass')" \
+  "test_dashboard_write"
+
+# review F8-E — the placement is stated truthfully, in flash and on the card.
+run_mutation "dashboard_write: every reply is described as in-thread" \
+  "scripts/dashboard_write.py" \
+  "('                 (f\" as a reply to ts {trigger}, in its thread\" if thread', '                 (f\" as a reply to ts {trigger}, in its thread\" if True')" \
+  "test_dashboard_write"
+
+# review N2 — the banner must not promise to record an ask that is already closed.
+run_mutation "dashboard_write: the reply banner outlives an ask answered elsewhere" \
+  "scripts/dashboard_write.py" \
+  "('    if reply_to is not None and (reply_to[\"channel\"], reply_to[\"ts\"]) not in {', '    if False and (reply_to[\"channel\"], reply_to[\"ts\"]) not in {')" \
+  "test_dashboard_write"
+
+# review F7 — a follow-up question is a new ask, never the answer; an unattributed
+# placeholder sender answers nothing.
+run_mutation "threads: a reply that is itself an ask is credited as the answer" \
+  "core/threads.py" \
+  "('        if is_answer is not None and not is_answer(r):\n            continue', '        pass')" \
+  "test_threads"
+
+run_mutation "threads: the unattributed placeholder sender answers an ask" \
+  "core/threads.py" \
+  "('        if not sender or sender == asker or sender in UNATTRIBUTED_SENDERS:', '        if not sender or sender == asker:')" \
+  "test_threads"
+
+run_mutation "schedule: the cycle sweeps without the classifier's verdict" \
+  "core/schedule.py" \
+  "('                    is_answer=lambda m, _src=src: classify(\n                        m.get(\"text\") or \"\", _src.taxonomy,\n                        attachments=m.get(\"attachments\")).kind not in ACTIONABLE_KINDS)', '                    is_answer=None)')" \
+  "test_schedule"
+
+# review F8 — one platform call per thread root, one budget per adapter, 429 stops the source.
+run_mutation "threads: every ask under one root issues its own platform call" \
+  "core/threads.py" \
+  "('        by_root.setdefault(store.thread_root(channel, row[\"ts\"]), []).append(row)', '        by_root.setdefault((store.thread_root(channel, row[\"ts\"]), row[\"ts\"]), []).append(row)')" \
+  "test_threads"
+
+run_mutation "schedule: the sweep budget is per channel, re-spent for every channel" \
+  "core/schedule.py" \
+  "('                    budget -= swept[\"swept\"]', '                    pass')" \
+  "test_schedule"
+
+run_mutation "schedule: a sweep 429 does not stop the rest of that source's sweeps" \
+  "core/schedule.py" \
+  "('                        budget = 0          # the platform said stop; stop for this source', '                        pass')" \
+  "test_schedule"
+
+# review F9 — the window must rotate, or asks beyond the newest few starve.
+run_mutation "threads: the window never rotates (newest-first forever)" \
+  "core/threads.py" \
+  "('    start = start % len(open_asks)\n    rotated = open_asks[start:] + open_asks[:start]', '    start = 0\n    rotated = open_asks')" \
+  "test_threads"
+
+run_mutation "schedule: the scheduler forgets where the sweep window stopped" \
+  "core/schedule.py" \
+  "('                    self._sweep_start[ch] = swept[\"next_start\"]', '                    pass')" \
+  "test_schedule"
+
+# review F12 — a non-orderable id space is refused, never guessed.
+run_mutation "threads: a non-orderable id space is swept as if chronological" \
+  "core/threads.py" \
+  "('        if ts_order(row[\"ts\"])[0] != 0:', '        if False:')" \
+  "test_threads"
+
+# review F11 — the sweep's lookups are indexed.
+run_mutation "store: the thread lookups lose their indexes" \
+  "core/store.py" \
+  "('        self.conn.execute(\"CREATE INDEX IF NOT EXISTS messages_channel_thread \"\n                          \"ON messages (channel_id, thread_id)\")', '        pass')" \
+  "test_store"
 
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"

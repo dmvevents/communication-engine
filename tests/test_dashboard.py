@@ -488,6 +488,20 @@ class DashboardAppTest(unittest.TestCase):
 
 
 
+class HtmlTextTest(unittest.TestCase):
+    """html_text() is what every surface runs untrusted message text through before it
+    lands inside an HTML block: tags escaped, and NO blank line survives (a blank line
+    ends a CommonMark HTML block and re-arms markdown for the rest of the text)."""
+
+    def test_tags_are_escaped_and_blank_lines_collapsed(self):
+        from core.dashboard import html_text
+        out = html_text("a <b>bold</b>\n\n![x](https://evil.example/p.png)\nend")
+        self.assertIn("&lt;b&gt;bold&lt;/b&gt;", out)
+        self.assertNotIn("\n", out, "a newline survived — a blank line would end the block")
+        self.assertIn("<br>", out)
+        self.assertEqual(html_text(None), "")
+
+
 class UnansweredIsAsksOnlyTest(unittest.TestCase):
     """The attention queue's UNANSWERED list is the open ASK backlog, not every row.
 
@@ -537,8 +551,23 @@ class UnansweredIsAsksOnlyTest(unittest.TestCase):
         self.assertEqual(counts["unanswered"], 2,
                          "unanswered counts open ASKS (incl. unclassified), not rows")
         self.assertEqual(counts["answered"], 0)
+        self.assertEqual(counts["answered_by_thread"], 0)
         self.assertEqual(counts["distinct"], 4, "statements still count as messages")
         self.assertEqual(counts["by_kind"]["STATEMENT"], 2)
+
+    def test_answers_by_a_thread_reply_are_counted_apart_from_ours(self):
+        """"Responded" by someone else's in-thread reply is NOT the same fact as an
+        answer the operator sent and proved; a reviewer's "+1, same here" closes an
+        ask too. The surface keeps the two countable apart (independent review S8)."""
+        j = Journal(self.journal)
+        j.record("C_TEAM", "6.0", sender_id="U1", text="is it up?", kind="QUESTION")
+        j.mark_responded("C_TEAM", "6.0", "thread-reply:6.5")
+        j.record("C_TEAM", "7.0", sender_id="U1", text="ship it", kind="EXEC-REQUEST")
+        j.mark_responded("C_TEAM", "7.0", "outbox-key-ours")
+        j.close()
+        _, counts = self.unanswered()
+        self.assertEqual(counts["answered"], 2)
+        self.assertEqual(counts["answered_by_thread"], 1)
 
 
 if __name__ == "__main__":

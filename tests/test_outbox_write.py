@@ -239,5 +239,103 @@ class WriteGate(unittest.TestCase):
                              "not a fact")
 
 
+
+class NoSendAdapter:
+    """A read-only adapter in the contract's shape: capabilities() says send is False and
+    there is no send attribute at all (every shipped live adapter)."""
+
+    def __init__(self):
+        self.touched = 0
+
+    def capabilities(self):
+        return {"read": True, "history": True, "search": False, "send": False,
+                "react": False, "threads": False}
+
+    def read_back(self, target, key):
+        self.touched += 1
+        return False
+
+
+class ReleaseRaceTest(unittest.TestCase):
+    """The click is a CLAIM, not a read-then-write (independent merge review, B1/B3).
+
+    release() used to read STAGED and then UPDATE unconditionally, so two Sends landing
+    between the read and the write both reached the adapter — one approved draft, two
+    messages — and a Discard interleaved with a Send still sent. The flip is now a
+    compare-and-swap on state; the loser reads what the row became and reports it.
+    And a draft whose adapter cannot send is refused BEFORE the flip: flipping first and
+    failing in the adapter wedged the row in INTENT, undiscardable and unrecoverable."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Path(self.tmp.name) / "outbox.db"
+        self.adapter = FakeAdapter()
+
+    def box(self):
+        return Outbox(self.db, self.adapter, {TARGET: "staged"}, send_interval=0.0)
+
+    def test_two_concurrent_releases_deliver_exactly_once(self):
+        a, b = self.box(), self.box()
+        key = a.stage(TARGET, TS, TEXT)["key"]
+        fired = []
+        real = a.policy_for
+
+        def interleave(target, scope="channel"):
+            # Another tab's click lands between a's read and a's flip.
+            if not fired:
+                fired.append(1)
+                b.release(key)
+            return real(target, scope)
+
+        a.policy_for = interleave
+        res = a.release(key)
+        n = sum(1 for d in self.adapter.delivered if d[2] == key)
+        self.assertEqual(n, 1, f"ONE approved draft was delivered {n} times")
+        self.assertTrue(res.get("deduped") or res.get("in_flight"),
+                        "the losing click must report what the row became, not "
+                        "pretend it sent")
+        self.assertEqual(a.get(key)["state"], COMMITTED)
+
+    def test_a_discard_interleaved_with_a_send_sends_nothing(self):
+        a, b = self.box(), self.box()
+        key = a.stage(TARGET, TS, TEXT)["key"]
+        fired = []
+        real = a.policy_for
+
+        def interleave(target, scope="channel"):
+            if not fired:
+                fired.append(1)
+                b.discard(key)
+            return real(target, scope)
+
+        a.policy_for = interleave
+        with self.assertRaises(ReleaseError):
+            a.release(key)
+        self.assertEqual(self.adapter.delivered, [], "a DISCARDED draft was delivered")
+        self.assertEqual(a.get(key)["state"], DISCARDED)
+
+    def test_a_send_interleaved_with_a_discard_keeps_the_delivery_record(self):
+        a, b = self.box(), self.box()
+        key = a.stage(TARGET, TS, TEXT)["key"]
+        b.release(key)                      # delivered first
+        with self.assertRaises(ReleaseError):
+            a.discard(key)                  # must not relabel a delivered row
+        self.assertEqual(a.get(key)["state"], COMMITTED)
+
+    def test_release_refuses_before_the_flip_when_the_adapter_cannot_send(self):
+        ro = NoSendAdapter()
+        ob = Outbox(self.db, ro, {TARGET: "staged"}, send_interval=0.0)
+        key = ob.stage(TARGET, TS, TEXT)["key"]
+        with self.assertRaises(ReleaseError) as ctx:
+            ob.release(key)
+        self.assertIn("send", str(ctx.exception).lower())
+        self.assertEqual(ob.get(key)["state"], STAGED,
+                         "the row left STAGED — a wedge in INTENT is undiscardable")
+        self.assertEqual(ro.touched, 0, "the adapter was touched by a refused release")
+        ob.discard(key)                     # still a draft: still discardable
+        self.assertEqual(ob.get(key)["state"], DISCARDED)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

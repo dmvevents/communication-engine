@@ -115,6 +115,15 @@ def main(argv=None):
               f"unattended={summary['unattended']} "
               f"next-fire<={summary['next_interval']:.0f}s "
               f"answered={summary['answered']}", flush=True)
+        # ENH-30: the thread sweep's refusals, one line each, never folded into "ok".
+        for ch, method in summary["sweep_rate_limited"]:
+            print(f"sweep: RATE-LIMITED channel={ch} method={method} — answers not "
+                  "looked for this cycle", flush=True)
+        for ch in summary["sweep_truncated"]:
+            print(f"sweep: TRUNCATED channel={ch} — more open asks than one cycle "
+                  "sweeps; the oldest wait for a later cycle", flush=True)
+        for ch, ts, msg in summary["sweep_errors"]:
+            print(f"sweep: ERROR channel={ch} ask={ts} {msg}", flush=True)
 
     sched = Scheduler(store=store, journal=journal, owed=owed, escalator=escalator,
                       sources=sources, base_interval=base,

@@ -218,11 +218,22 @@ class Journal:
             "WHERE j.responded_at IS NOT NULL AND r.recorded_at > j.responded_at "
             "GROUP BY j.channel, j.ts").fetchall()
 
-    def mark_responded(self, channel: str, ts: str, response_key: str) -> None:
-        """Tie an inbound ask to the outbox key that answered it."""
+    def mark_responded(self, channel: str, ts: str, response_key: str,
+                       at: float | None = None) -> None:
+        """Tie an inbound ask to the key that answered it — an outbox key, or
+        `thread-reply:<ts>` for an in-thread reply the sweep observed (ENH-30).
+
+        `at` is WHEN THE ANSWER WAS WRITTEN (the draft's created_at; a swept reply's
+        first-arrival time), on the engine clock. Default now, for callers whose answer
+        and tie coincide. Stamping a late tie at tie time launders an edit made in
+        between: edited_after_response() compares revision.recorded_at > responded_at,
+        so a draft written against "deploy to staging?" that lands after the asker
+        edited to "deploy to PROD?" read as a clean answer to PROD (independent review
+        F9, 2026-10-13).
+        """
         self.conn.execute(
             "UPDATE journal SET responded_at=?, response_key=? WHERE channel=? AND ts=?",
-            (time.time(), response_key, channel, str(ts)))
+            (time.time() if at is None else float(at), response_key, channel, str(ts)))
         self.conn.commit()
 
     def get(self, channel: str, ts: str):

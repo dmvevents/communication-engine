@@ -281,9 +281,17 @@ button (the outbox key, tied the moment the send is proven on the target — sta
 alone never ties), or a reply **inside the ask's thread from someone other than the
 asker**, which the reference scheduler sweeps every cycle through the adapter's
 optional `replies()` (`core/threads.py`; the shipped `fake` and `slack` adapters have
-it). A top-level reply in the channel cannot be attributed to the ask it answers, so
-it leaves the ask open — answer in the thread. The scheduler's cycle line reports
-`answered=N`.
+it). A top-level reply posted in the channel by someone else cannot be attributed to the
+ask it answers, so it leaves the ask open — answer in the thread, or from this surface's
+Reply button, which ties the ask itself wherever the reply lands. "Responded" means
+exactly that — somebody else replied in the thread, or you sent an answer — not
+"resolved": a third party's "+1" closes an ask too, and the Journal tab counts those
+apart from answers sent from here. The scheduler's cycle line reports `answered=N` — the
+in-thread ties the sweep made that cycle; answers sent from the surface are tied by the
+surface and never appear in that count — and
+one line per channel whenever the sweep was rate-limited, truncated, or refused by the
+platform for one ask (a deleted ask answers `thread_not_found` forever; it is reported
+and skipped, never allowed to stop the loop).
 
 The dashboard is read-only **by default**. Setting `COMMS_UI_WRITE_ENABLED=true` in
 the environment adds a write surface (`scripts/dashboard_write.py` — the one module
@@ -333,14 +341,24 @@ surface says so instead of implying one.
 
 ## Honest limits
 
-- **Answered state is inferred from threads only.** An ask is marked answered by a send
-  from the write surface or by an in-thread reply from someone other than the asker;
-  "responded" means exactly that, not "resolved". A reply posted top-level in the
-  channel is a message the engine stores and lists, but it cannot be tied to the ask it
-  answers, and the engine never guesses. Adapters without `replies()` (the Telegram
-  and email adapters today) can only reach answered through the write surface.
+- **Answered state has exactly two routes.** An ask is marked answered by a reply sent
+  from the write surface's Reply button (tied by the ask itself, in its thread or
+  top-level as the channel's thread policy allows) or by an in-thread reply from someone
+  other than the asker, swept each scheduler cycle. "Responded" means exactly that, not
+  "resolved": a third party's "+1" closes an ask too, and the dashboard counts
+  thread-closed asks apart from answers sent from here. A reply posted top-level in the
+  channel by anyone else is stored and listed but cannot be tied to the ask, and the
+  engine never guesses. Adapters with neither `replies()` nor send capability — today
+  `slack_socket`, `telegram` and `email` — have no route to answered at all: their asks
+  stay UNANSWERED until a send-capable path exists for that platform.
+- **The thread sweep spends platform calls.** Each open ask costs one
+  `conversations.replies` call per cycle, bounded by `SWEEP_MAX` (25) per channel, newest
+  asks first; a 429 is honoured and reported, and the rest of that channel's sweep waits
+  for the next cycle. Slack's rate tier for `conversations.replies` is far lower for
+  commercially distributed non-Marketplace apps than for an internal app, so a
+  distributed app should expect asks to close more slowly, never faster.
 - Five adapters ship: **`fake`** (in-memory dry-run), **`slack`** — **read-only on purpose**
-  (poll/resolve/health; it exposes no send path at any layer, and `tests/test_slack_adapter.py`
+  (poll / replies / resolve / health; it exposes no send path at any layer, and `tests/test_slack_adapter.py`
   fails if one appears) — **`slack_socket`** (Socket Mode push ingestion, equally
   read-only; push is for latency only: Socket Mode can MISS events, so the socket adapter is
   never the truth — run `scripts/push-poll-parity.py` against the polling store continuously

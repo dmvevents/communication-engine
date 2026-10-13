@@ -466,15 +466,19 @@ class ThreadRepliesTest(SlackAdapterTestCase):
             a.replies("C_ONE", "1.0")
         self.assertEqual(ctx.exception.retry_after, 7)
 
-    def test_history_polling_still_excludes_thread_replies(self):
-        """The reason replies() exists: a thread reply never rides history, so the
-        poll path alone can never see an in-thread answer. Pinned so a future
-        'optimisation' does not quietly make the sweep look redundant."""
-        a = self.make([history([slack_msg("1.0", text="the ask", thread_ts="1.0",
-                                          reply_count=1)])])
+    def test_a_broadcast_reply_served_by_history_is_stored_as_a_thread_reply(self):
+        """History DOES serve one kind of reply: one posted "also send to channel"
+        (subtype thread_broadcast) arrives with thread_ts set. It must land with
+        thread_id = the parent, so the sweep's store-side view of the thread includes
+        it — and nothing in the poll path may strip thread replies (an earlier test
+        here asserted the fixture, not the adapter: review F10)."""
+        a = self.make([history([
+            slack_msg("1.0", text="the ask", thread_ts="1.0", reply_count=1),
+            slack_msg("3.0", user="U_A", text="bump (also sent to channel)",
+                      thread_ts="1.0", subtype="thread_broadcast")])])
         got, _ = a.poll(None)
-        self.assertEqual([m["ts"] for m in got], ["1.0"])
-        self.assertIsNone(got[0]["thread_id"], "a parent is top-level, not a reply")
+        self.assertEqual([(m["ts"], m["thread_id"]) for m in got],
+                         [("1.0", None), ("3.0", "1.0")])
 
 
 if __name__ == "__main__":

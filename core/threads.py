@@ -19,12 +19,22 @@ replied in the thread — not "resolved"; the response key names the reply so th
 can be followed to it. A top-level reply in the channel cannot be attributed to the ask it
 answers and is left alone: the engine never guesses.
 
-Three refusals are load-bearing (each has a mutation in tests/mutation_check.sh):
+Four refusals are load-bearing (each has a mutation in tests/mutation_check.sh):
 
 * an adapter without `replies()` yields None — DECLARED absent, never "nothing new";
 * the sweep is bounded per cycle (newest asks first) and says when it truncated, so a long
   backlog cannot turn one cycle into hundreds of platform calls;
-* a platform 429 stops the sweep and is reported in the result, never swallowed.
+* a platform 429 stops the sweep and is reported in the result, never swallowed;
+* any other platform error on ONE thread (a deleted ask answers thread_not_found, forever)
+  is recorded BY ASK and the sweep moves on — escaping would turn one dead thread into a
+  scheduler crash loop that also leaves every later channel unpolled; swallowing it would
+  be the F-2 silent no-op.
+
+The fetch floor is always the ask itself (R9: the store and the journal absorb every
+re-sighting). The first version used the newest STORED reply as the floor — but the store
+is written inside the sweep and the journal only afterwards by the caller, so a crash between
+the two left a stored reply that was never fetched again and never journaled: the inverted
+dual-write the scheduler forbids for poll(), found by the independent review of 89fd0fa.
 """
 from __future__ import annotations
 
@@ -32,64 +42,113 @@ from .classify import ACTIONABLE_KINDS
 from .ratelimit import RateLimited
 from .store import ts_order
 
-# Threads swept per channel per cycle. Stated rather than unbounded: one open ask is one
-# platform call, and Slack's history tier allows ~50 calls/minute — a backlog of a few
-# hundred asks would make the sweep its own outage. Newest first: the asks most likely to
-# be getting answers right now.
+# Threads swept per ADAPTER per cycle (the reference scheduler spends this one budget across
+# all of a source's channels). Stated rather than unbounded: one open thread is one platform
+# call, and Slack's history tier allows ~50 calls/minute — a backlog of a few hundred asks
+# would make the sweep its own outage. The window ROTATES through the open asks (callers
+# pass the `start` they got back as `next_start`), so no ask starves behind the newest 25.
 SWEEP_MAX = 25
 
+# Adapters map sender-less platform rows (system notices, deleted-message tombstones, some
+# bots) to this placeholder — the store requires a sender. It is truthy, so it must be
+# excluded by name: a tombstone is not an answer.
+UNATTRIBUTED_SENDERS = frozenset({"unknown"})
 
-def answered_by(asker: str | None, replies) -> dict | None:
-    """The earliest reply from someone OTHER than the asker, or None.
 
-    The asker bumping their own thread is not an answer; a reply with no sender cannot be
-    credited to anyone and answers nothing.
+def answered_by(asker: str | None, replies, is_answer=None) -> dict | None:
+    """The earliest reply from someone OTHER than the asker that IS an answer, or None.
+
+    The asker bumping their own thread is not an answer; a reply with no sender, or the
+    adapters' unattributed placeholder, cannot be credited to anyone and answers nothing;
+    and a reply the caller classifies as an ask of its own ("can you also share the
+    logs?") is a new question, not an answer — crediting it closed the original ask and
+    its owed work (independent review F7). `is_answer` is the caller's verdict; the
+    reference scheduler passes its classifier.
     """
     for r in sorted(replies, key=lambda m: ts_order(m["ts"])):
-        if r.get("sender_id") and r["sender_id"] != asker:
-            return r
+        sender = r.get("sender_id")
+        if not sender or sender == asker or sender in UNATTRIBUTED_SENDERS:
+            continue
+        if is_answer is not None and not is_answer(r):
+            continue
+        return r
     return None
 
 
 def sweep(adapter, store, journal, channel: str, *,
-          max_threads: int = SWEEP_MAX) -> dict | None:
+          max_threads: int = SWEEP_MAX, start: int = 0, is_answer=None) -> dict | None:
     """Fetch new replies under this channel's open asks and tie answers to them.
 
     Returns None when the adapter has no `replies()` — the capability is absent and the
     caller must read that as "cannot conclude", never as "nothing new". Otherwise::
 
-        swept         threads actually fetched this call
-        replies       the messages fetched (not yet seen by the store) — journal them
+        swept         threads actually fetched this call (one call per thread ROOT,
+                      however many open asks live under it)
+        next_start    the `start` for the next call — the window rotates through the
+                      open asks (newest first) so none starves behind the newest few
+        replies       every reply fetched this call (re-sightings included — the
+                      journal absorbs them) — journal them
         answered      [(ask_ts, reply_ts), ...] ties made this call
         truncated     True when open asks remained beyond max_threads
         rate_limited  the platform method that answered 429, or None
+        errors        [(ask_ts, 'ExcType: message'), ...] threads the platform refused,
+                      and asks whose ids are not orderable (the sweep refuses to guess)
     """
     if not hasattr(adapter, "replies"):
         return None
     open_asks = [r for r in journal.unanswered(channel) if r["kind"] in ACTIONABLE_KINDS]
     open_asks.sort(key=lambda r: ts_order(r["ts"]), reverse=True)
-    batch = open_asks[:max_threads]
-    result = {"swept": 0, "replies": [], "answered": [],
-              "truncated": len(open_asks) > len(batch), "rate_limited": None}
+    result = {"swept": 0, "replies": [], "answered": [], "truncated": False,
+              "rate_limited": None, "errors": [], "next_start": 0}
+    if not open_asks:
+        return result
+    # The window rotates: start where the last call stopped, wrap around, and hand the
+    # caller the next start — newest-first with a fixed slice starved every ask beyond
+    # the newest few (independent review F9).
+    start = start % len(open_asks)
+    rotated = open_asks[start:] + open_asks[:start]
+    batch = rotated[:max_threads]
+    result["truncated"] = len(open_asks) > len(batch)
+    result["next_start"] = (start + len(batch)) % len(open_asks)
+    # One platform call per thread ROOT, however many open asks live under it.
+    by_root: dict = {}
     for row in batch:
-        root = store.thread_root(channel, row["ts"])
-        known = store.thread_replies(channel, root)
-        # Exclusive floor: the newest reply already stored, else the ask itself. The
-        # store is the cursor — no second cursor table to drift from it.
-        oldest = max([str(row["ts"])] + [str(m["ts"]) for m in known], key=ts_order)
+        if ts_order(row["ts"])[0] != 0:
+            # A non-numeric id space (an email Message-ID) orders lexicographically, not
+            # chronologically: "later than the ask" would be a guess. Refuse by name.
+            result["errors"].append((str(row["ts"]), "non-orderable message id — the "
+                                     "thread sweep needs numeric platform timestamps"))
+            continue
+        by_root.setdefault(store.thread_root(channel, row["ts"]), []).append(row)
+    for root, rows in by_root.items():
+        # Exclusive floor: the OLDEST ask under this root, every cycle (R9). Never the
+        # newest stored reply: the store is written here and the journal only later by
+        # the caller, so a store-derived floor would skip a reply that is stored but
+        # not journaled (the inverted dual-write).
+        oldest = min((str(r["ts"]) for r in rows), key=ts_order)
         try:
             fetched = list(adapter.replies(channel, root, oldest=oldest))
         except RateLimited as ex:
             result["rate_limited"] = ex.method or "replies"
             break
+        except Exception as ex:  # noqa: BLE001 — recorded by ask, never swallowed
+            result["errors"].extend((str(r["ts"]), f"{type(ex).__name__}: {ex}")
+                                    for r in rows)
+            continue
         result["swept"] += 1
         if fetched:
             store.upsert_messages(fetched)
             result["replies"].extend(fetched)
-        later = [m for m in store.thread_replies(channel, root)
-                 if ts_order(m["ts"]) > ts_order(row["ts"])]
-        hit = answered_by(row["sender_id"], later)
-        if hit is not None:
-            journal.mark_responded(channel, row["ts"], f"thread-reply:{hit['ts']}")
-            result["answered"].append((str(row["ts"]), str(hit["ts"])))
+        in_thread = store.thread_replies(channel, root)
+        arrivals = store.arrivals(channel)
+        for row in rows:
+            later = [m for m in in_thread if ts_order(m["ts"]) > ts_order(row["ts"])]
+            hit = answered_by(row["sender_id"], later, is_answer)
+            if hit is not None:
+                # Stamped at the reply's first ARRIVAL (engine clock, comparable with
+                # revision.recorded_at), never at sweep time: an edit sighted between
+                # the reply and this sweep must read as edited AFTER the answer (R23).
+                journal.mark_responded(channel, row["ts"], f"thread-reply:{hit['ts']}",
+                                       at=arrivals.get(str(hit["ts"])))
+                result["answered"].append((str(row["ts"]), str(hit["ts"])))
     return result

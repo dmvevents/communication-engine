@@ -273,7 +273,7 @@ class ConfigSurfaceAppTest(unittest.TestCase):
         self.assertEqual(alerts["channels"], [{"id": "C_HOT",
                                                "reply_policy": "staged"}])
         # The message write surface (ENH-28) now offers the new channel.
-        compose = [s for s in at.selectbox if not s.key]  # the unkeyed compose box
+        compose = [s for s in at.selectbox if s.key == "compose_where"]  # the compose box
         self.assertTrue(any("alerts · C_HOT (policy: staged)" in s.options
                             for s in compose),
                         "the applied channel never reached the compose surface")

@@ -100,7 +100,15 @@ class Store:
         if "attachments" not in cols:
             self.conn.execute("ALTER TABLE messages ADD COLUMN attachments TEXT")
 
-    # ---- messages ---------------------------------------------------------
+    # ---- messages ---------------------------------------------------------        # ENH-30: the thread sweep asks two questions per open ask every cycle
+        # (thread_root, thread_replies); without these both were full table scans
+        # (independent review F11). IF NOT EXISTS keeps an adopter's existing db.
+        self.conn.execute("CREATE INDEX IF NOT EXISTS messages_channel_thread "
+                          "ON messages (channel_id, thread_id)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS messages_channel_ts "
+                          "ON messages (channel_id, ts)")
+        self.conn.commit()
+
     @staticmethod
     def validate(msg: dict) -> None:
         """Raise SchemaError unless msg carries exactly the pinned contract.

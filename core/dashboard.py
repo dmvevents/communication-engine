@@ -40,6 +40,7 @@ The attention queue is SEVERITY-ordered, the spoke UI's one validated UX lesson
 """
 from __future__ import annotations
 
+import html
 import json
 import sqlite3
 from pathlib import Path
@@ -64,6 +65,16 @@ _WHY = {
     "unclassified": ("unclassified — no decision was recorded for this row, so whether "
                      "it is an ask is unknown; shown rather than hidden"),
 }
+
+
+def html_text(text) -> str:
+    """Untrusted message text, made safe to drop inside an HTML block on a Streamlit
+    markdown surface: tags escaped, and every newline turned into <br> — a BLANK line
+    ends a CommonMark HTML block and re-arms markdown for everything after it, so
+    `hi\n\n![x](https://evil/p.png)` would render an image the operator's browser
+    fetches. Both surfaces (the viewer and the write surface) run text through this
+    one function; found by the independent review of ENH-30."""
+    return html.escape(text or "").replace("\r", "").replace("\n", "<br>")
 
 
 class DashboardError(Exception):
@@ -122,6 +133,13 @@ def _journal_view(journal_path: Path):
             ).fetchone()[0],
             "answered": conn.execute(
                 "SELECT count(*) FROM journal WHERE responded_at IS NOT NULL"
+            ).fetchone()[0],
+            # "Responded" by someone else's in-thread reply is a different fact from
+            # an answer the operator sent and proved — a third party's "+1" closes an
+            # ask too (review S8). Kept countable apart; the key prefix is the record.
+            "answered_by_thread": conn.execute(
+                "SELECT count(*) FROM journal WHERE responded_at IS NOT NULL "
+                "AND response_key LIKE 'thread-reply:%'"
             ).fetchone()[0],
             "by_kind": {r[0]: r[1] for r in conn.execute(
                 "SELECT kind, count(*) FROM journal GROUP BY kind")},

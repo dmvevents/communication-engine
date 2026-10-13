@@ -928,13 +928,32 @@ class ConfigSurfaceDocTest(unittest.TestCase):
                       "the doc no longer names the one definition of an ask")
         self.assertIn("staging\nalone never ties", self.quickstart,
                       "the doc stopped saying that staging is not answering")
-        self.assertIn("A top-level reply in the channel cannot be attributed to the ask "
-                      "it answers, so\nit leaves the ask open — answer in the thread.",
+        self.assertIn("A top-level reply posted in the channel by someone else cannot be "
+                      "attributed to the\nask it answers, so it leaves the ask open — answer "
+                      "in the thread, or from this surface's\nReply button",
                       self.quickstart,
                       "the doc dropped the top-level-reply limit — the one answered-state "
                       "surprise an operator meets on day one")
-        self.assertIn("Answered state is inferred from threads only.", self.quickstart,
+        self.assertIn("Answered state has exactly two routes.", self.quickstart,
                       "the honest-limits entry for answered state is gone")
+
+    def test_the_adapters_with_no_route_to_answered_are_named_from_the_code(self):
+        """The limits entry names the adapters whose asks can never close: no replies()
+        for the sweep AND no send surface for the Reply button. Derived from the
+        shipped channels/ tree, so a new adapter (or a new capability) that drifts the
+        list turns this red instead of leaving a stale promise."""
+        from core.config import discover_adapters, load_adapter_class
+        stranded = sorted(
+            name for name in discover_adapters(ROOT / "channels")
+            if not hasattr(load_adapter_class(ROOT / "channels", name), "replies")
+            and not hasattr(load_adapter_class(ROOT / "channels", name), "send"))
+        self.assertTrue(stranded, "the derivation found nothing — it is broken, not the docs")
+        section = self.quickstart.split("Answered state has exactly two routes.", 1)[1]
+        section = section.split("\n- **", 1)[0]
+        named = sorted(set(re.findall(r"`([a-z_]+)`", section)) - {"replies", "SWEEP_MAX"})
+        self.assertEqual(named, stranded,
+                         f"the doc names {named} as having no route to answered; the code "
+                         f"says {stranded}")
 
 
 if __name__ == "__main__":

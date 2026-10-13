@@ -32,8 +32,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import json
+import time
+
+from core.config import load, load_adapter_class  # noqa: E402
 from core.dashboard import snapshot  # noqa: E402
 from core.journal import Journal  # noqa: E402
+from core.outbox import Outbox  # noqa: E402
+from core.reconfig import ConfigStage, remove_auth, update_channel  # noqa: E402
+from core.store import Store  # noqa: E402
 
 SCRIPT = ROOT / "scripts" / "dashboard.py"
 WRITE_MODULE = ROOT / "scripts" / "dashboard_write.py"
@@ -286,7 +293,7 @@ class WriteSurfaceAppTest(_WriteSurfaceBase):
         # the healthy sibling is still composable — the guard skips only the broken one
         self.assertTrue(
             any(any("team · C_CUST" in opt for opt in s.options)
-                for s in at.selectbox if not s.key),
+                for s in at.selectbox if s.key == "compose_where"),
             "the healthy connection lost its compose target")
 
     def test_rendering_the_write_surface_mints_no_state(self):
@@ -346,7 +353,7 @@ class ReplyFromTheSurfaceTest(_WriteSurfaceBase):
             conn.close()
 
     def reply_then_stage(self, at, text):
-        at = self.buttons(at, "reply-C_CUST-1.0")[0].click().run()
+        at = self.buttons(at, "reply|C_CUST|1.0")[0].click().run()
         at.text_area[0].input(text)
         submit = self.buttons(at, "FormSubmitter:compose")
         self.assertEqual(len(submit), 1)
@@ -358,9 +365,9 @@ class ReplyFromTheSurfaceTest(_WriteSurfaceBase):
         os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
         at = self.run_app()
         self.assertFalse(at.exception)
-        self.assertEqual(len(self.buttons(at, "reply-C_CUST-1.0")), 1,
+        self.assertEqual(len(self.buttons(at, "reply|C_CUST|1.0")), 1,
                          "an open ask on a composable channel has no Reply")
-        self.assertEqual(self.buttons(at, "reply-C_RO-"), [],
+        self.assertEqual(self.buttons(at, "reply|C_RO|"), [],
                          "a never-policy channel offered a Reply the gate would refuse")
 
     def test_a_reply_sent_from_the_surface_marks_the_ask_answered(self):
@@ -387,6 +394,34 @@ class ReplyFromTheSurfaceTest(_WriteSurfaceBase):
                      if i["severity"] == "unanswered"]
         self.assertEqual(open_asks, [], "the answered ask is still in the queue")
 
+    def test_ask_text_cannot_inject_markdown_beside_the_reply_button(self):
+        """Ask text is attacker-controlled (anyone who can post in a watched channel).
+        html.escape neutralises tags but not markdown: a row that STARTS with markdown
+        lets `![x](https://evil/p.png)` render as an image the operator's browser fetches,
+        and `[approve here](https://phish)` as a link beside the Reply button. The row
+        must be a CommonMark HTML block (`<div`-led) with no blank line inside, where
+        markdown is inert."""
+        (self.base / "state").mkdir(exist_ok=True)
+        j = Journal(self.base / "state" / "journal.db")
+        j.record("C_CUST", "1.0", sender_id="U_EVIL", kind="QUESTION",
+                 text="see ![x](https://evil.example/p.png)\n\n[approve here]"
+                      "(https://phish.example) <script>alert(1)</script>?")
+        j.close()
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        at = self.run_app()
+        self.assertFalse(at.exception)
+        rows = [str(m.value) for m in at.markdown if "evil.example" in str(m.value)]
+        self.assertTrue(any("padding:2px 0" in r for r in rows),
+                        "the open-asks row did not render")
+        for row in rows:   # the Reply row, the viewer card, the needs-an-answer table
+            self.assertTrue(row.lstrip().startswith("<"),
+                            "untrusted text must sit inside an HTML block so inline "
+                            f"markdown is inert: {row[:60]!r}")
+            self.assertNotIn("\n\n", row, "a blank line ends the HTML block and "
+                                          "re-arms markdown for everything after it")
+            self.assertNotIn("<script>", row, "tags must stay escaped")
+            self.assertIn("&lt;script&gt;", row)
+
     def test_a_free_compose_ties_to_no_ask(self):
         self.seed_ask()
         os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
@@ -412,9 +447,391 @@ class ReplyFromTheSurfaceTest(_WriteSurfaceBase):
         self.assertEqual((row["trigger_ts"], row["thread_id"]), ("1.0", None),
                          "with the thread scope at never the reply must post "
                          "top-level — not be refused, not be silently threaded")
+        successes = "\n".join(str(x.value) for x in at.success)
+        self.assertIn("top-level", successes,
+                      "the flash must say the reply posts top-level here")
+        self.assertNotIn("in its thread", successes,
+                         "the flash described a top-level reply as threaded")
         at = self.buttons(at, "send-")[0].click().run()
         self.assertFalse(at.exception)
         self.assertIsNotNone(self.journal_row()[0])
+
+
+
+def two_channel_base(tmp):
+    """Two composable channels, so a mis-targeted second draft is observable."""
+    base = Path(tmp)
+    shutil.copytree(ROOT / "channels" / "fake", base / "channels" / "fake",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    (base / "settings.json").write_text(
+        '{"engine": {"state_dir": "state"},\n'
+        ' "instances": [{"name": "team", "adapter": "fake",\n'
+        '   "channels": [{"id": "C_A", "reply_policy": "staged"},\n'
+        '                {"id": "C_B", "reply_policy": "staged"},\n'
+        '                {"id": "C_T", "thread_reply_policy": "staged"}]}]}\n')
+    return base
+
+
+@unittest.skipUnless(HAVE_STREAMLIT, "streamlit not installed — the static checks "
+                     "above and tests/test_outbox_write.py still guard the gate")
+class WriteSurfaceReviewTest(_WriteSurfaceBase):
+    """Properties the independent merge review (2026-10-13) found missing or broken:
+    the click must act on the CURRENT config (B2), Send must never be offered where the
+    adapter cannot deliver (B3), Discard must need no adapter (S5), the screen after a
+    stage must be the post-action truth (stale reply banner), a reply to an in-thread
+    ask lands under the thread ROOT, a thread-only channel is answerable, and a journal
+    refusal after a proven send is a warning with a real retry, never a crash."""
+
+    def seed_ask(self, channel, ts, sender="U_ASKER", text=ASK, thread=None,
+                 with_store=False):
+        (self.base / "state").mkdir(exist_ok=True)
+        j = Journal(self.base / "state" / "journal.db")
+        j.record(channel, ts, sender_id=sender, text=text, kind="QUESTION")
+        j.close()
+        if with_store:
+            st_ = Store(self.base / "state" / "messages.db")
+            st_.upsert_messages([{"channel_type": "fake", "channel_id": channel,
+                                  "sender_id": sender, "ts": ts, "text": text,
+                                  "thread_id": thread}])
+            st_.close()
+
+    def rows(self, name="team"):
+        db = self.base / "state" / f"outbox-{name}.db"
+        if not db.is_file():
+            return []
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            return [dict(zip(("key", "state", "target", "trigger_ts", "thread_id", "text"), r))
+                    for r in conn.execute(
+                        "SELECT key, state, target, trigger_ts, thread_id, text FROM outbox "
+                        "ORDER BY created_at")]
+        finally:
+            conn.close()
+
+    def journal_row(self, channel, ts):
+        j = Journal(self.base / "state" / "journal.db")
+        try:
+            r = j.get(channel, ts)
+            return (r["responded_at"], r["response_key"])
+        finally:
+            j.close()
+
+    def stage_text(self, at, text):
+        at.text_area[0].input(text)
+        return self.buttons(at, "FormSubmitter:compose")[0].click().run()
+
+    # ---- B2: the click acts on the config as it is NOW ----------------------------
+    def test_a_click_after_a_demotion_to_never_refuses(self):
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        at = self.compose(self.run_app(), "draft for a channel about to be demoted")
+        settings = self.base / "settings.json"
+        cs = ConfigStage(self.base / "state" / "confstage.db", settings)
+        k = cs.stage(update_channel(json.loads(settings.read_text()), "team", "C_CUST",
+                                    reply_policy=None))["key"]
+        cs.apply(k)
+        cs.close()
+        self.assertEqual(load(settings).instance("team").policies()["C_CUST"], "never")
+        at = self.buttons(at, "send-")[0].click().run()
+        self.assertFalse(at.exception)
+        self.assertEqual(self.rows()[0]["state"], "STAGED",
+                         "a draft was released to a channel whose policy is now never — "
+                         "the click used the config captured at render time")
+        flashes = "\n".join(str(e.value) for e in at.error)
+        self.assertIn("never", flashes)
+
+    # ---- B3: no Send where the adapter cannot deliver; S5: Discard needs no adapter ----
+    SLACK_SETTINGS = ('{"engine": {"state_dir": "state"},\n'
+                      ' "instances": [{"name": "sl", "adapter": "slack",\n'
+                      '   "auth": {"token": "env:WS_TEST_TOK", "channels": "env:WS_TEST_CH"},\n'
+                      '   "channels": [{"id": "C_X", "reply_policy": "staged"}]}]}\n')
+
+    def engine_staged_slack_draft(self):
+        base = Path(tempfile.mkdtemp())
+        shutil.copytree(ROOT / "channels" / "slack", base / "channels" / "slack",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        (base / "settings.json").write_text(self.SLACK_SETTINGS)
+        os.environ.update(WS_TEST_TOK="placeholder-not-a-token", WS_TEST_CH="C_X",
+                          COMMS_SETTINGS=str(base / "settings.json"),
+                          COMMS_UI_WRITE_ENABLED="true")
+        self.addCleanup(lambda: [os.environ.pop(k, None) for k in ("WS_TEST_TOK", "WS_TEST_CH")])
+        cfg = load(base / "settings.json")
+        inst = cfg.instance("sl")
+        (base / "state").mkdir(exist_ok=True)
+        ob = Outbox(cfg.outbox_path_for("sl"),
+                    load_adapter_class(cfg.channels_dir, "slack")(auth=inst.auth),
+                    inst.policies())
+        res = ob.send("C_X", "1700000000.000100", "engine-staged draft")
+        ob.close()
+        self.assertEqual(res["state"], "STAGED")
+        self.base = base
+        return base
+
+    def test_an_engine_staged_draft_on_a_read_only_adapter_is_discard_only(self):
+        self.engine_staged_slack_draft()
+        at = self.run_app()
+        self.assertFalse(at.exception)
+        self.assertEqual(self.buttons(at, "send-"), [],
+                         "Send offered on a draft whose adapter has no send() — one click "
+                         "wedges the row in INTENT")
+        self.assertEqual(len(self.buttons(at, "discard-")), 1)
+        body = "\n".join(str(m.value) for m in at.markdown)
+        self.assertIn("cannot send", body, "the card must say WHY there is no Send")
+        at = self.buttons(at, "discard-")[0].click().run()
+        self.assertFalse(at.exception)
+        self.assertEqual(self.rows("sl")[0]["state"], "DISCARDED")
+
+    def test_discard_on_a_half_configured_connection_does_not_crash(self):
+        base = self.engine_staged_slack_draft()
+        settings = base / "settings.json"
+        cs = ConfigStage(base / "state" / "confstage.db", settings)
+        k = cs.stage(remove_auth(json.loads(settings.read_text()), "sl", "channels"))["key"]
+        cs.apply(k)
+        cs.close()
+        at = self.run_app()
+        self.assertFalse(at.exception)
+        at = self.buttons(at, "discard-")[0].click().run()
+        self.assertFalse(at.exception, "Discard built an adapter it does not need and "
+                                       "crashed on the half-configured connection")
+        self.assertEqual(self.rows("sl")[0]["state"], "DISCARDED")
+
+    # ---- R5: each Send button releases its own draft only ------------------------
+    def test_the_second_card_releases_the_second_draft_only(self):
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        at = self.compose(self.run_app(), "first draft")
+        at = self.compose(at, "second draft")
+        key2 = [r["key"] for r in self.rows() if r["text"] == "second draft"][0]
+        at = [b for b in self.buttons(at, "send-") if b.key == f"send-{key2}"][0].click().run()
+        self.assertFalse(at.exception)
+        self.assertEqual({r["text"]: r["state"] for r in self.rows()},
+                         {"first draft": "STAGED", "second draft": "COMMITTED"})
+
+    # ---- the screen after a stage is the post-action truth ------------------------
+    def test_after_a_reply_is_staged_the_banner_is_gone_and_the_next_draft_is_not_retargeted(self):
+        self.base = two_channel_base(tempfile.mkdtemp())
+        os.environ["COMMS_SETTINGS"] = str(self.base / "settings.json")
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        self.seed_ask("C_B", "7.0")
+        at = self.run_app()
+        at = self.buttons(at, "reply|C_B|7.0")[0].click().run()
+        self.assertTrue(any("replying to" in str(i.value) for i in at.info))
+        at = self.stage_text(at, "confirmed, part 1")
+        self.assertFalse(at.exception)
+        self.assertFalse(any("replying to" in str(i.value) for i in at.info),
+                         "the reply banner survived the stage — the screen shows "
+                         "pre-action state")
+        self.assertEqual(self.buttons(at, "reply_cancel"), [])
+        self.assertEqual(at.selectbox[0].value, "team · C_B (policy: staged)",
+                         "after replying to C_B the selector must show where the NEXT "
+                         "draft goes, and it must be C_B")
+        at = self.stage_text(at, "part 2: and the numbers")
+        self.assertFalse(at.exception)
+        second = [r for r in self.rows() if r["text"].startswith("part 2")][0]
+        self.assertEqual(second["target"], "C_B",
+                         "the second draft was silently re-targeted to another channel")
+        self.assertTrue(second["trigger_ts"].startswith("ui-compose-"))
+        self.assertIsNone(second["thread_id"])
+
+    # ---- a reply to an in-thread ask lands under the thread ROOT ------------------
+    def test_a_reply_to_an_in_thread_ask_is_placed_under_the_thread_root(self):
+        self.base = two_channel_base(tempfile.mkdtemp())
+        os.environ["COMMS_SETTINGS"] = str(self.base / "settings.json")
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        self.seed_ask("C_A", "6.0", text="is the dashboard up?", thread="5.0",
+                      with_store=True)
+        at = self.run_app()
+        at = self.buttons(at, "reply|C_A|6.0")[0].click().run()
+        at = self.stage_text(at, "yes, on 8502")
+        row = self.rows()[0]
+        self.assertEqual((row["trigger_ts"], row["thread_id"]), ("6.0", "5.0"),
+                         "the reply must thread under the ROOT the sweep reads, and the "
+                         "tie must stay keyed by the ask itself")
+
+    # ---- a thread-only channel is answerable, always in its thread ------------------
+    def test_a_thread_only_channel_offers_reply_and_never_a_free_compose(self):
+        self.base = two_channel_base(tempfile.mkdtemp())
+        os.environ["COMMS_SETTINGS"] = str(self.base / "settings.json")
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        self.seed_ask("C_T", "9.0", text="any update on the rollout?")
+        at = self.run_app()
+        self.assertFalse(at.exception)
+        self.assertEqual(len(self.buttons(at, "reply|C_T|9.0")), 1,
+                         "a channel whose THREAD policy allows a reply offered no Reply")
+        self.assertNotIn("C_T", "\n".join(at.selectbox[0].options),
+                         "a thread-only channel must not accept a top-level compose")
+        at = self.buttons(at, "reply|C_T|9.0")[0].click().run()
+        at = self.stage_text(at, "rollout done at 09:00")
+        row = self.rows()[0]
+        self.assertEqual((row["target"], row["trigger_ts"], row["thread_id"]),
+                         ("C_T", "9.0", "9.0"))
+
+    # ---- F9: an edit while the draft waited is never laundered by the Send ----------
+    def test_an_edit_while_the_draft_waited_is_flagged_not_laundered(self):
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        self.seed_ask("C_CUST", "1.0", text="Can you deploy to staging?")
+        at = self.run_app()
+        at = self.buttons(at, "reply|C_CUST|1.0")[0].click().run()
+        at = self.stage_text(at, "yes - deploying to staging now")
+        time.sleep(0.05)
+        j = Journal(self.base / "state" / "journal.db")               # the asker edits
+        j.record("C_CUST", "1.0", sender_id="U_ASKER", text="Can you deploy to PROD?",
+                 kind="QUESTION")
+        j.close()
+        at = self.buttons(at, "send-")[0].click().run()
+        self.assertFalse(at.exception)
+        self.assertEqual(self.rows()[0]["state"], "COMMITTED")
+        snap = snapshot(self.base / "state" / "journal.db", {})
+        flagged = [(i["where"], i["ts"]) for i in snap["attention"]
+                   if i["severity"] == "edited_after_response"]
+        self.assertEqual(flagged, [("C_CUST", "1.0")],
+                         "the ask was edited after the answer was written and the "
+                         "dashboard reads it as cleanly answered — the edit was laundered")
+        responded_at = self.journal_row("C_CUST", "1.0")[0]
+        self.assertIsNotNone(responded_at)
+        self.assertLess(responded_at, Journal(self.base / "state" / "journal.db")
+                        .revisions("C_CUST", "1.0")[-1]["recorded_at"])
+
+    # ---- F8 A: tie ONLY on proof ---------------------------------------------------
+    def test_an_in_flight_row_is_never_tied(self):
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        self.seed_ask("C_CUST", "1.0")
+        at = self.run_app()
+        at = self.buttons(at, "reply|C_CUST|1.0")[0].click().run()
+        at = self.stage_text(at, "on it")
+        key = self.rows()[0]["key"]
+        conn = sqlite3.connect(str(self.base / "state" / "outbox-team.db"))
+        conn.execute("UPDATE outbox SET state='INTENT' WHERE key=?", (key,))
+        conn.commit(); conn.close()
+        at = self.buttons(at, "send-")[0].click().run()
+        self.assertFalse(at.exception)
+        self.assertIsNone(self.journal_row("C_CUST", "1.0")[0],
+                          "an unproven (in-flight) send was recorded as the answer")
+        warnings = "\n".join(str(w.value) for w in at.warning)
+        self.assertIn("in flight", warnings)
+        self.assertNotIn("sent and proven", "\n".join(str(x.value) for x in at.success))
+
+    # ---- F8 B: the first proven answer keeps the tie ---------------------------------
+    def test_the_first_proven_answer_keeps_the_tie(self):
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        self.seed_ask("C_CUST", "1.0")
+        at = self.run_app()
+        at = self.buttons(at, "reply|C_CUST|1.0")[0].click().run()
+        at = self.stage_text(at, "first answer")
+        at = self.buttons(at, "reply|C_CUST|1.0")[0].click().run()
+        at = self.stage_text(at, "second answer")
+        first_key = [r["key"] for r in self.rows() if r["text"] == "first answer"][0]
+        at = [b for b in self.buttons(at, "send-") if b.key == f"send-{first_key}"][0].click().run()
+        first_at, first_tie = self.journal_row("C_CUST", "1.0")
+        at = self.buttons(at, "send-")[0].click().run()          # the second draft
+        self.assertFalse(at.exception)
+        self.assertEqual(self.journal_row("C_CUST", "1.0"), (first_at, first_tie),
+                         "a later send overwrote the first answer's tie")
+
+    # ---- F8 C: a demotion after Reply drops the banner, never crashes ------------------
+    def test_a_demotion_after_reply_drops_the_banner_without_a_crash(self):
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        self.seed_ask("C_CUST", "1.0")
+        at = self.run_app()
+        at = self.buttons(at, "reply|C_CUST|1.0")[0].click().run()
+        self.assertTrue(any("replying to" in str(i.value) for i in at.info))
+        settings = self.base / "settings.json"
+        settings.write_text(settings.read_text().replace('"reply_policy": "staged"', '"label": "ro"'))
+        at = at.run()
+        self.assertFalse(at.exception)
+        self.assertFalse(any("replying to" in str(i.value) for i in at.info),
+                         "the reply banner outlived the channel's demotion")
+
+    # ---- F8 D/E/G/F: the flashes say what happened; no journal is minted -------------
+    def test_a_free_compose_send_flashes_no_tie_and_mints_no_journal(self):
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        at = self.compose(self.run_app(), DRAFT)
+        successes = "\n".join(str(x.value) for x in at.success)
+        self.assertIn("staged", successes)
+        self.assertNotIn("as a reply", successes, "a free compose was described as a reply")
+        at = self.buttons(at, "send-")[0].click().run()
+        self.assertFalse(at.exception)
+        successes = "\n".join(str(x.value) for x in at.success)
+        self.assertIn("sent and proven", successes)
+        self.assertNotIn("recorded as answered", successes,
+                         "a free compose flashed a tie it cannot have made")
+        self.assertFalse((self.base / "state" / "journal.db").is_file(),
+                         "a Send with no journal minted journal.db — the viewer would "
+                         "then show a healthy zero instead of 'No journal file yet'")
+
+    def test_the_reply_flash_and_card_state_the_placement(self):
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        self.seed_ask("C_CUST", "1.0")
+        at = self.run_app()
+        at = self.buttons(at, "reply|C_CUST|1.0")[0].click().run()
+        at = self.stage_text(at, "threaded answer")
+        successes = "\n".join(str(x.value) for x in at.success)
+        self.assertIn("as a reply to ts 1.0, in its thread", successes)
+        cards = "\n".join(str(m.value) for m in at.markdown if "<b>STAGED</b>" in str(m.value))
+        self.assertIn("in reply to ts 1.0", cards)
+        self.assertIn("(in thread 1.0)", cards)
+
+    # ---- F8 H: cancel actually cancels ------------------------------------------------
+    def test_cancel_reply_returns_to_a_free_compose(self):
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        self.seed_ask("C_CUST", "1.0")
+        at = self.run_app()
+        at = self.buttons(at, "reply|C_CUST|1.0")[0].click().run()
+        at = self.buttons(at, "reply_cancel")[0].click().run()
+        self.assertFalse(any("replying to" in str(i.value) for i in at.info),
+                         "cancel did not cancel")
+        at = self.stage_text(at, "a plain message")
+        row = self.rows()[0]
+        self.assertTrue(row["trigger_ts"].startswith("ui-compose-"),
+                        "after cancel the draft still staged as a reply")
+        self.assertIsNone(self.journal_row("C_CUST", "1.0")[0])
+
+    # ---- N2: an ask answered elsewhere drops the banner --------------------------------
+    def test_an_ask_answered_elsewhere_drops_the_reply_banner(self):
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        self.seed_ask("C_CUST", "1.0")
+        at = self.run_app()
+        at = self.buttons(at, "reply|C_CUST|1.0")[0].click().run()
+        j = Journal(self.base / "state" / "journal.db")
+        j.mark_responded("C_CUST", "1.0", "thread-reply:1.5")          # the sweep got there
+        j.close()
+        at = at.run()
+        self.assertFalse(at.exception)
+        self.assertFalse(any("Sending will record" in str(i.value) for i in at.info),
+                         "the banner still promises to record an ask that is closed")
+        infos = "\n".join(str(i.value) for i in at.info)
+        self.assertIn("no longer open", infos)
+
+    # ---- a journal refusal after a PROVEN send: warning, kept open, real retry --------
+    def test_a_journal_lock_after_a_proven_send_warns_and_the_retry_ties(self):
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        self.seed_ask("C_CUST", "1.0")
+        at = self.run_app()
+        at = self.buttons(at, "reply|C_CUST|1.0")[0].click().run()
+        at = self.stage_text(at, "reviewed — go ahead")
+        # BEGIN IMMEDIATE takes the RESERVED lock: readers (the viewer's mode=ro
+        # snapshot) still read, the tie's UPDATE waits out sqlite's busy timeout
+        # and fails — the shape of a long scheduler write transaction.
+        lock = sqlite3.connect(str(self.base / "state" / "journal.db"))
+        lock.execute("BEGIN IMMEDIATE")
+        lock.execute("UPDATE journal SET seen_count=seen_count WHERE 0")
+        try:
+            at = self.buttons(at, "send-")[0].click().run()
+        finally:
+            lock.rollback()
+            lock.close()
+        self.assertFalse(at.exception, "a locked journal crashed the page after the send")
+        self.assertEqual(self.rows()[0]["state"], "COMMITTED", "the send itself happened")
+        self.assertIsNone(self.journal_row("C_CUST", "1.0")[0])
+        warnings = "\n".join(str(w.value) for w in at.warning)
+        self.assertIn("FAILED", warnings, "the failed tie must be said out loud")
+        self.assertEqual(len(self.buttons(at, "reply|C_CUST|1.0")), 1,
+                         "the ask must still offer Reply — that is the retry")
+        at = self.buttons(at, "reply|C_CUST|1.0")[0].click().run()
+        at = self.stage_text(at, "reviewed — go ahead")       # dedupes to the proven row
+        self.assertFalse(at.exception)
+        at_, key = self.journal_row("C_CUST", "1.0")
+        self.assertIsNotNone(at_, "the retry (same text) did not tie the proven answer")
+        self.assertEqual(key, self.rows()[0]["key"])
+        self.assertEqual(len(self.rows()), 1, "the retry minted a second message")
 
 
 if __name__ == "__main__":
