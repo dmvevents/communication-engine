@@ -1139,6 +1139,24 @@ class WriteSurfaceReviewTest(_WriteSurfaceBase):
         self.assertEqual((len(self.buttons(at, "settle-")), len(self.buttons(at, "reapprove-"))), (2, 1),
                          "the parked row's own actions are missing")
 
+    def test_a_free_compose_is_baselined_on_the_newest_listed_ask_not_on_a_statement(self):
+        """Round 4 (R4-3 follow-through): a Reply is baselined on its ask, so the listed-ask
+        query decides only a free compose. There too, a journaled STATEMENT the page never
+        lists must not become the baseline: the newest OPEN ASK the page shows is."""
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        self.seed_ask("C_CUST", "5.0")
+        self.seed_ask("C_CUST", "7.0", text="and the logs?")
+        j = Journal(self.base / "state" / "journal.db")
+        j.record("C_CUST", "9.0", sender_id="U_ASKER", text="never mind, found both", kind="STATEMENT")
+        j.close()
+        self.compose(self.run_app(), "a free compose to the channel")
+        conn = sqlite3.connect(f"file:{self.base / 'state' / 'outbox-team.db'}?mode=ro", uri=True)
+        try:
+            seen = conn.execute("SELECT seen_ts FROM outbox").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(seen, "7.0", "a statement the page never lists became the compose baseline")
+
     def test_a_stale_send_on_a_parked_row_says_nothing_was_sent(self):
         """Review round 3 (R3-6): a Send drawn while the row was STAGED, clicked after a
         recovery run parked it, flashed a green 'sent and proven'. Nothing is sent, and the

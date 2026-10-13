@@ -3351,7 +3351,7 @@ run_mutation "dashboard_write: a stale Send on a parked row flashes 'sent and pr
   "('        if res.get(\"unresolved\"):', '        if False:')" \
   "test_dashboard_write"
 
-run_mutation "dashboard_write: the Reply baseline counts statements the page never lists" \
+run_mutation "dashboard_write: the compose baseline counts statements the page never lists" \
   "scripts/dashboard_write.py" \
   "('f\"SELECT ts FROM journal WHERE channel=? AND responded_at IS NULL AND kind IN ({marks}) \"', 'f\"SELECT ts FROM journal WHERE channel=? AND (responded_at IS NULL AND kind IN ({marks}) OR 1) \"')" \
   "test_dashboard_write"
