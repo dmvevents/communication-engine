@@ -672,6 +672,10 @@ class SlackStubWriteSurfaceTest(_WriteSurfaceBase):
         self.assertIn("DIFFERENT text", errors)
         self.assertIn("MISMATCH", errors)
         self.assertNotIn("recover()", errors, "a mismatch was flashed as 'unproven, run recover()'")
+        # the surface's OWN words, not the outbox exception's: the message IS on the platform,
+        # so this is not a refusal, and the operator is pointed at the card
+        self.assertNotIn("refused", errors, "a delivered-but-mangled post was flashed as a refusal")
+        self.assertIn("the card below needs a human", errors)
         self.assertEqual(self.rows()[0]["state"], "MISMATCH")
         self.assertEqual(len(self.stub.posted(self.DM)), 1)
         cards = "\n".join(str(m.value) for m in at.markdown)
