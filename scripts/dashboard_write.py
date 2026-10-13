@@ -110,6 +110,13 @@ def _placement_for(ch, adapter):
     an adapter that cannot thread, and the banner and the flash repeat it; (None, why)
     when neither placement is open, so no Reply is offered and the row says why."""
     tpol, cpol = _thread_scope_policy(ch), _channel_scope_policy(ch)
+    if ch.is_dm:
+        # ENH-31 guard 6: placement follows the human. A 1:1 DM is answered in the
+        # conversation, top-level — a thread inside a DM is where nobody looks
+        # (measured: 535 DM messages, 0 in-thread).
+        if cpol != "never":
+            return "top-level", "a direct message — replies post in the conversation, top-level"
+        return None, f"{ch.id} is a direct message whose reply_policy is 'never'"
     blocked = thread_block_reason(adapter)
     if tpol != "never" and blocked is None:
         return "thread", None
@@ -149,7 +156,10 @@ def _outbox_for(cfg, inst, adapter):
     create the state it writes, so this is also where the config's directories are
     ensured (the same ensure_dirs the scheduler runs before its first write)."""
     ensure_dirs(cfg)
-    return Outbox(cfg.outbox_path_for(inst.name), adapter, inst.policies())
+    # ENH-31: the instance's marker travels with the outbox, so every guard the
+    # outbox runs (marker, size, redaction, re-read) runs on this surface's sends too.
+    return Outbox(cfg.outbox_path_for(inst.name), adapter, inst.policies(),
+                  marker=inst.send_marker)
 
 
 def _rows(outbox_path, states):
@@ -315,10 +325,10 @@ def _cancel_reply_clicked():
 def _stage_clicked():
     """Form submit — runs before the rerun, so the page the operator sees next shows
     the staged draft at the gate and no leftover reply banner."""
-    text = st.session_state.get("compose_text", "") or ""
+    text = (st.session_state.get("compose_text", "") or "").strip()
     where = st.session_state.get("compose_where")
     reply_to = st.session_state.get("reply_to")
-    if not text.strip():
+    if not text:
         _push_flash("error", "an empty draft stages nothing")
         return
     try:
@@ -355,6 +365,10 @@ def _stage_clicked():
         # draft the adapter cannot place (review D1) — the backstop for a connection
         # edited between that decision and this write.
         adapter = _adapter_for(cfg, inst)
+        # ENH-31 guard 1: the connection's marker is PART of the draft the human will
+        # approve — prepended here, shown on the card, verified again at the click.
+        if inst.send_marker and not text.startswith(inst.send_marker):
+            text = f"{inst.send_marker} {text}"
         if reply_to is not None:
             placement, why = _placement_for(ch, adapter)
             if placement is None:
@@ -573,6 +587,11 @@ def render(cfg):
                 st.caption(f"stage to: **{html.escape(reply_to['channel'])}** — in reply "
                            f"to ts {html.escape(reply_to['ts'])}")
             st.text_area("message", height=100, key="compose_text")
+            markers = sorted({inst.send_marker for inst in cfg.instances if inst.send_marker})
+            if markers:
+                st.caption("messages from a connection with a `send_marker` are prefixed "
+                           f"with it when staged ({', '.join(f'`{m}`' for m in markers)}) — "
+                           "the card below shows the exact text a Send would post")
             st.form_submit_button("Stage draft", on_click=_stage_clicked)
 
     # ---- the gate: staged drafts, one click each ----------------------------

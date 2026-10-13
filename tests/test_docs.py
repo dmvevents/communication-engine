@@ -934,7 +934,7 @@ class ConfigSurfaceDocTest(unittest.TestCase):
                       self.quickstart,
                       "the doc dropped the top-level-reply limit — the one answered-state "
                       "surprise an operator meets on day one")
-        self.assertIn("Answered state has exactly two routes.", self.quickstart,
+        self.assertIn("Answered state has exactly three routes.", self.quickstart,
                       "the honest-limits entry for answered state is gone")
 
     def test_the_adapters_with_no_route_to_answered_are_named_from_the_code(self):
@@ -948,7 +948,7 @@ class ConfigSurfaceDocTest(unittest.TestCase):
             if not hasattr(load_adapter_class(ROOT / "channels", name), "replies")
             and not hasattr(load_adapter_class(ROOT / "channels", name), "send"))
         self.assertTrue(stranded, "the derivation found nothing — it is broken, not the docs")
-        section = self.quickstart.split("Answered state has exactly two routes.", 1)[1]
+        section = self.quickstart.split("Answered state has exactly three routes.", 1)[1]
         section = section.split("\n- **", 1)[0]
         named = sorted(set(re.findall(r"`([a-z_]+)`", section)) - {"replies", "SWEEP_MAX"})
         self.assertEqual(named, stranded,

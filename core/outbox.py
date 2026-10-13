@@ -39,6 +39,8 @@ import sqlite3
 import time
 from pathlib import Path
 
+from core import redact
+
 INTENT, SENT, VERIFIED, COMMITTED, STAGED = (
     "INTENT", "SENT", "VERIFIED", "COMMITTED", "STAGED")
 # ENH-28: a draft a human looked at and rejected. Terminal, and KEPT — deleting the
@@ -100,6 +102,28 @@ def _adapter_label(adapter) -> str:
     return module[len(prefix):] if module.startswith(prefix) else type(adapter).__name__
 
 
+def _accepts_kw(fn, name: str) -> bool:
+    """Does this callable take keyword `name` (named, or **kwargs)? Asked of the
+    SIGNATURE, before the call — see _accepts_thread_id for why not try/except."""
+    if not callable(fn):
+        return False
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == name or p.kind is inspect.Parameter.VAR_KEYWORD for p in params)
+
+
+def _allows_direct(adapter) -> bool:
+    """May the engine post through this adapter without a human click? An adapter
+    declares `capabilities()["direct"]` False when its authorization is a human-gated
+    send only (Slack, 2026-10-13 grant); absent means allowed (the fake, test doubles)."""
+    caps = getattr(adapter, "capabilities", None)
+    if callable(caps):
+        return bool(caps().get("direct", True))
+    return True
+
+
 def _accepts_thread_id(send) -> bool:
     """Can this adapter's send() be given a placement at all?
 
@@ -154,7 +178,7 @@ def idempotency_key(target: str, trigger_ts: str, text: str,
 class Outbox:
     def __init__(self, db_path: str | Path, adapter, policies: dict[str, str] | None = None,
                  *, send_interval: float = 1.0,
-                 clock=time.monotonic, sleep=time.sleep):
+                 clock=time.monotonic, sleep=time.sleep, marker: str | None = None):
         self.conn = sqlite3.connect(str(db_path))
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
@@ -166,6 +190,23 @@ class Outbox:
         self.adapter = adapter
         # Default DENY. A target absent from the policy map cannot be sent to.
         self.policies = policies or {}
+        # ENH-31 guard 1: the prefix every message must start with (config send_marker).
+        # Several senders share one bot identity in the harness; the marker is how a
+        # reader — and the other senders' dedupe — tells the engine's messages apart.
+        self.marker = marker or None
+        # ENH-31: an adapter that declares `direct` OFF (capabilities()["direct"] is
+        # False — Slack's 2026-10-13 grant is a human click only) refuses a direct
+        # policy HERE, at construction, loudly: a policy the adapter forbids must not sit
+        # inert until the first send.
+        if not _allows_direct(adapter):
+            for target, pol in self.policies.items():
+                scopes = pol.values() if isinstance(pol, dict) else (pol,)
+                if "direct" in scopes:
+                    raise PolicyError(
+                        f"reply policy for {target} is 'direct', but adapter "
+                        f"{_adapter_label(adapter)} declares direct sends off "
+                        "(capabilities()['direct'] is false): only 'staged' — a human "
+                        "click — is authorized for it")
         # ENH-13: chat.postMessage allows ~1 message/second PER CHANNEL
         # (docs.slack.dev/apis/web-api/rate-limits), so 1.0 is the default floor —
         # a burst of replies would trade this cheap local wait for a platform 429,
@@ -265,6 +306,58 @@ class Outbox:
             "on its own; a top-level answer is a different draft, allowed only where "
             f"the channel policy allows one{tail}")
 
+    def _check_payload(self, text, exc=SendBlocked):
+        """ENH-31 guards 1, 4, 5 — on the TEXT, before any row exists (stage, direct
+        send) and again before the flip (release): the configured marker prefix, the
+        adapter's size limit, and the BLOCK-tier credential scan. Each names its reason
+        and never echoes a secret."""
+        if self.marker and not text.startswith(self.marker):
+            raise exc(
+                f"the message does not start with the configured marker {self.marker!r} "
+                "— every send from this engine carries it so a reader, and the other "
+                "senders' dedupe, can tell it apart; nothing sent")
+        limit = getattr(self.adapter, "MAX_TEXT_CHARS", None)
+        if limit is not None and len(text) > limit:
+            raise exc(
+                f"{len(text)} characters exceeds this adapter's {limit}-character limit "
+                "— the platform would split it silently and return one ts; shorten it, "
+                "nothing sent")
+        hits = redact.scan(text)
+        if hits:
+            raise exc(
+                f"the message matches the BLOCK-tier credential pattern(s) {hits} — "
+                "refused before it could leave the host; nothing sent")
+
+    def _check_newest(self, row):
+        """ENH-31 guard 2 — at the CLICK: re-read the channel (or the thread) and refuse
+        when anything newer than the draft has arrived. The human approved this text
+        against the conversation as it was when the draft was staged; a newer message
+        means it moved on, and only a human who has re-read can say the text still
+        fits. Names who and when, never the text (a flash renders markdown)."""
+        newest = getattr(self.adapter, "newest", None)
+        if not callable(newest):
+            return
+        latest = newest(row["target"], row["thread_id"])
+        if latest is None:
+            return
+        try:
+            latest_ts = float(latest.get("ts"))
+        except (TypeError, ValueError):
+            return                     # a non-numeric id space cannot be compared
+        if latest_ts > float(row["created_at"]):
+            raise ReleaseError(
+                f"re-read first: {latest.get('sender_id') or 'someone'} posted at ts "
+                f"{latest.get('ts')} after this draft was staged, so the conversation "
+                "moved on — the draft stays STAGED; re-read, then re-stage or discard")
+
+    def _read_back(self, target, key, thread_id):
+        """read_back(target, key), plus thread_id for an adapter whose read_back takes
+        it (Slack: a thread reply is served by conversations.replies, never history)."""
+        rb = self.adapter.read_back
+        if thread_id is not None and _accepts_kw(rb, "thread_id"):
+            return rb(target, key, thread_id=thread_id)
+        return rb(target, key)
+
     def _deliver(self, target, text, key, thread_id):
         """The one place adapter.send() is called, from both the live path and recovery.
 
@@ -329,6 +422,7 @@ class Outbox:
         # delivered is answered from its row, whatever the adapter has since become.
         if row is None:
             self._check_placement(thread_id)        # before the INSERT that is the claim
+            self._check_payload(text)               # marker, size, redaction (ENH-31)
             # This INSERT is also the CLAIM on the ladder below: concurrent senders of
             # the same reply race the SELECT above, and the primary key must arbitrate
             # to exactly one owner. OR IGNORE because the loser's insert is a clean
@@ -387,7 +481,7 @@ class Outbox:
         if _crash_at == "before_readback":
             raise _Crash("crash after SENT, before read-back")
 
-        if not self.adapter.read_back(target, key):
+        if not self._read_back(target, key, thread_id):
             raise SendBlocked(f"read-back could not prove delivery of {key} to {target}")
         self._write(key, state=VERIFIED)
 
@@ -412,7 +506,7 @@ class Outbox:
         for row in rows:
             counts["resumed"] += 1
             key, target = row["key"], row["target"]
-            if self.adapter.read_back(target, key):
+            if self._read_back(target, key, row["thread_id"]):
                 counts["already_delivered"] += 1
             else:
                 # recovery is a burst source too: N undelivered rows for one channel
@@ -424,7 +518,7 @@ class Outbox:
                 receipt = self._deliver(target, row["text"], key, row["thread_id"])
                 self._write(key, receipt=json.dumps(receipt))
                 counts["resent"] += 1
-                if not self.adapter.read_back(target, key):
+                if not self._read_back(target, key, row["thread_id"]):
                     raise SendBlocked(f"re-send of {key} still not provable")
             self._write(key, state=VERIFIED)
             self._write(key, state=COMMITTED)
@@ -478,6 +572,7 @@ class Outbox:
         key = idempotency_key(target, trigger_ts, text, thread_id)
         if self.get(key) is None:               # a new draft, not a replay (review F9)
             self._check_placement(thread_id)        # before the draft exists at all
+            self._check_payload(text)               # marker, size, redaction (ENH-31)
         # Same INSERT-is-the-claim shape as send(): concurrent stagers of the same
         # draft collapse to one row, and re-staging an already-delivered reply must
         # report the delivery, not mint a second visible message.
@@ -527,6 +622,10 @@ class Outbox:
         # takes no thread_id used to fail inside _deliver(), after the flip (review D1).
         self._check_placement(row["thread_id"], ReleaseError,
                               " — the draft stays STAGED; it can only be discarded")
+        # ENH-31: the text guards again (a marker configured after staging, a draft
+        # written by older code), then the pre-send re-read — all before the flip.
+        self._check_payload(row["text"], ReleaseError)
+        self._check_newest(row)
         # Policy is re-resolved at the CLICK, not inherited from staging time: a
         # channel demoted to 'never' since the draft was written must refuse the
         # send, however long the draft sat at the gate.

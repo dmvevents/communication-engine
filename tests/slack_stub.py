@@ -33,6 +33,7 @@ class SlackStub:
         self.fail_next: dict = {}         # method -> error code, consumed once
         self.bot_user = bot_user
         self.slack_escapes = slack_escapes
+        self.truncate_posts_to = None     # store only the first N chars of a post (a planted mismatch)
         self._ts = 1700000000.0
         self._lock = threading.Lock()
         stub = self
@@ -151,9 +152,10 @@ class SlackStub:
         ch, text = form.get("channel", ""), form.get("text", "")
         if not ch or not text:
             return {"ok": False, "error": "no_text" if ch else "channel_not_found"}
+        stored = text if self.truncate_posts_to is None else text[:self.truncate_posts_to]
         m = {"type": "message", "ts": self.next_ts(), "user": self.bot_user,
              "bot_id": "B_STUB", "bot_posted": True,
-             "text": _escape(text) if self.slack_escapes else text}
+             "text": _escape(stored) if self.slack_escapes else stored}
         if form.get("thread_ts"):
             m["thread_ts"] = form["thread_ts"]
         if form.get("metadata"):

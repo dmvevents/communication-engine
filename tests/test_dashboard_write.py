@@ -506,6 +506,20 @@ def nothread_base(tmp):
     return base
 
 
+def marked_base(tmp):
+    """A connection with a send_marker and a DM channel next to a public one (ENH-31)."""
+    base = Path(tmp)
+    shutil.copytree(ROOT / "channels" / "fake", base / "channels" / "fake",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    (base / "settings.json").write_text(
+        '{"engine": {"state_dir": "state"},\n'
+        ' "instances": [{"name": "team", "adapter": "fake", "send_marker": "[AGENT]",\n'
+        '   "channels": [{"id": "C_CUST", "reply_policy": "staged"},\n'
+        '                {"id": "D_SOMEONE", "reply_policy": "staged", '
+        '"thread_reply_policy": "staged"}]}]}\n')
+    return base
+
+
 def two_channel_base(tmp):
     """Two composable channels, so a mis-targeted second draft is observable."""
     base = Path(tmp)
@@ -592,13 +606,21 @@ class WriteSurfaceReviewTest(_WriteSurfaceBase):
                       ' "instances": [{"name": "sl", "adapter": "slack",\n'
                       '   "auth": {"token": "env:WS_TEST_TOK", "channels": "env:WS_TEST_CH"},\n'
                       '   "channels": [{"id": "C_X", "reply_policy": "staged"}]}]}\n')
+    # The socket adapter has no send() at all — since ENH-31 the polling adapter has one
+    # (behind the outbox), so "an adapter that cannot send" is slack_socket here.
+    SOCKET_SETTINGS = ('{"engine": {"state_dir": "state"},\n'
+                       ' "instances": [{"name": "sl", "adapter": "slack_socket",\n'
+                       '   "auth": {"app_token": "env:WS_TEST_APP", "channels": "env:WS_TEST_CH"},\n'
+                       '   "channels": [{"id": "C_X", "reply_policy": "staged"}]}]}\n')
 
-    def engine_staged_slack_draft(self):
+    def engine_staged_slack_draft(self, adapter="slack"):
         base = Path(tempfile.mkdtemp())
-        shutil.copytree(ROOT / "channels" / "slack", base / "channels" / "slack",
+        shutil.copytree(ROOT / "channels" / adapter, base / "channels" / adapter,
                         ignore=shutil.ignore_patterns("__pycache__"))
-        (base / "settings.json").write_text(self.SLACK_SETTINGS)
+        (base / "settings.json").write_text(
+            self.SLACK_SETTINGS if adapter == "slack" else self.SOCKET_SETTINGS)
         os.environ.update(WS_TEST_TOK="placeholder-not-a-token", WS_TEST_CH="C_X",
+                          WS_TEST_APP="placeholder-not-a-token",
                           COMMS_SETTINGS=str(base / "settings.json"),
                           COMMS_UI_WRITE_ENABLED="true")
         self.addCleanup(lambda: [os.environ.pop(k, None) for k in ("WS_TEST_TOK", "WS_TEST_CH")])
@@ -606,7 +628,7 @@ class WriteSurfaceReviewTest(_WriteSurfaceBase):
         inst = cfg.instance("sl")
         (base / "state").mkdir(exist_ok=True)
         ob = Outbox(cfg.outbox_path_for("sl"),
-                    load_adapter_class(cfg.channels_dir, "slack")(auth=inst.auth),
+                    load_adapter_class(cfg.channels_dir, inst.adapter)(auth=inst.auth),
                     inst.policies())
         res = ob.send("C_X", "1700000000.000100", "engine-staged draft")
         ob.close()
@@ -615,7 +637,7 @@ class WriteSurfaceReviewTest(_WriteSurfaceBase):
         return base
 
     def test_an_engine_staged_draft_on_a_read_only_adapter_is_discard_only(self):
-        self.engine_staged_slack_draft()
+        self.engine_staged_slack_draft(adapter="slack_socket")
         at = self.run_app()
         self.assertFalse(at.exception)
         self.assertEqual(self.buttons(at, "send-"), [],
@@ -730,6 +752,54 @@ class WriteSurfaceReviewTest(_WriteSurfaceBase):
         self.assertIn("adapter nothread cannot place a reply in thread 1.0", errors)
         self.assertIn("the draft stays STAGED", errors)
         self.assertEqual(self.rows()[0]["state"], "STAGED")
+
+    # ---- ENH-31: the marker is part of the approved text; a DM reply posts top-level ----
+    def use_marked_base(self):
+        self.tmp2 = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp2.cleanup)
+        self.base = marked_base(self.tmp2.name)
+        os.environ["COMMS_SETTINGS"] = str(self.base / "settings.json")
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+
+    def test_the_connections_marker_is_prepended_at_stage_shown_on_the_card_and_sent(self):
+        """Guard 1 on the surface: the human types the answer, the staged card shows the
+        exact text a Send would post — marker included — and that is what the adapter
+        receives. A reader, and the other senders' dedupe, can tell the engine's
+        messages apart by it."""
+        self.use_marked_base()
+        at = self.run_app()
+        at.selectbox[0].select("team · C_CUST (policy: staged)")
+        at = self.stage_text(at, "the numbers are attached")
+        self.assertFalse(at.exception)
+        rows = self.rows()
+        self.assertEqual([r["text"] for r in rows], ["[AGENT] the numbers are attached"])
+        cards = "\n".join(str(m.value) for m in at.markdown)
+        self.assertIn("[AGENT] the numbers are attached", cards)
+        at = self.buttons(at, "send-")[0].click().run()
+        self.assertFalse(at.exception)
+        self.assertEqual(self.rows()[0]["state"], "COMMITTED")
+        caps = "\n".join(str(c.value) for c in at.caption)
+        self.assertIn("[AGENT]", caps, "the compose form must say the marker is added")
+
+    def test_a_reply_in_a_direct_message_posts_top_level_and_says_so(self):
+        """Guard 6: placement follows the human. A 1:1 DM is answered in the conversation,
+        top-level, even where a thread policy would allow a thread — nobody reads a
+        thread inside a DM (measured: 535 DM messages, 0 in-thread)."""
+        self.use_marked_base()
+        self.seed_ask("D_SOMEONE", "7.0")
+        at = self.run_app()
+        at = self.buttons(at, "reply|")[0].click().run()
+        banner = "\n".join(str(i.value) for i in at.info)
+        self.assertIn("top-level", banner)
+        self.assertIn("direct message", banner)
+        at = self.stage_text(at, "yes — it is at http://127.0.0.1:8502")
+        self.assertFalse(at.exception)
+        self.assertEqual([(r["trigger_ts"], r["thread_id"]) for r in self.rows()],
+                         [("7.0", None)])
+        at = self.buttons(at, "send-")[0].click().run()
+        self.assertFalse(at.exception)
+        self.assertEqual(self.rows()[0]["state"], "COMMITTED")
+        self.assertIsNotNone(self.journal_row("D_SOMEONE", "7.0")[0])
 
     def test_send_is_not_offered_on_a_thread_draft_the_adapter_cannot_place(self):
         """A thread draft staged while the connection could thread, before its adapter

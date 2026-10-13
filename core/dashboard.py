@@ -141,9 +141,25 @@ def _journal_view(journal_path: Path):
                 "SELECT count(*) FROM journal WHERE responded_at IS NOT NULL "
                 "AND response_key LIKE 'thread-reply:%'"
             ).fetchone()[0],
+            # ENH-31 B: a DM ask closed by the other party's next top-level message.
+            "answered_by_dm": conn.execute(
+                "SELECT count(*) FROM journal WHERE responded_at IS NOT NULL "
+                "AND response_key LIKE 'dm-reply:%'"
+            ).fetchone()[0],
             "by_kind": {r[0]: r[1] for r in conn.execute(
                 "SELECT kind, count(*) FROM journal GROUP BY kind")},
         }
+        # Asks closed by SOMEONE ELSE's message — a thread reply or a DM reply — are
+        # listed, not only counted (review S8 / ENH-31 B'): with no answerer list a
+        # bystander's "+1" closes an ask too, and the operator must be able to see
+        # WHICH asks left the queue that way and confirm them.
+        items["closed_by_others"] = [
+            {"where": r["channel"], "ts": r["ts"], "text": r["text"], "kind": r["kind"],
+             "response_key": r["response_key"], "responded_at": r["responded_at"]}
+            for r in conn.execute(
+                "SELECT channel, ts, text, kind, response_key, responded_at FROM journal "
+                "WHERE responded_at IS NOT NULL AND (response_key LIKE 'thread-reply:%' "
+                "OR response_key LIKE 'dm-reply:%') ORDER BY responded_at DESC LIMIT 50")]
         return items, counts
     finally:
         conn.close()
@@ -256,6 +272,7 @@ def snapshot(journal_path: str | Path, outboxes: dict[str, str | Path] | None = 
     Returns::
 
         attention   every item needing a human, in SEVERITY order
+        closed_by_others  asks closed by someone else's thread or DM reply (confirm them)
         missing     paths that do not exist yet — reported, never created
         journal     distinct/unanswered/answered/by_kind counts, or None if missing
         outbox      instance name -> per-state counts, or None if that file is missing
@@ -265,9 +282,11 @@ def snapshot(journal_path: str | Path, outboxes: dict[str, str | Path] | None = 
     missing: list[str] = []
 
     j_items, j_counts = _journal_view(Path(journal_path))
+    closed_by_others: list = []
     if j_items is None:
         missing.append(str(journal_path))
     else:
+        closed_by_others = j_items.pop("closed_by_others", [])
         for sev, found in j_items.items():
             queues[sev].extend(found)
 
@@ -298,4 +317,7 @@ def snapshot(journal_path: str | Path, outboxes: dict[str, str | Path] | None = 
         "journal": j_counts,
         "outbox": outbox_counts,
         "parity": panels,
+        # ENH-31 B': asks a thread reply or a DM reply closed — listed for a human to
+        # confirm, newest first, never only counted.
+        "closed_by_others": closed_by_others,
     }

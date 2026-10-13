@@ -313,8 +313,39 @@ The agent never auto-sends: there is no compose path that skips the gate, and
 `tests/mutation_check.sh` removes the gate one piece at a time to prove a test goes
 red each time. Deny-by-default still binds — a channel at `reply_policy: never` (the
 default) is not composable even with the gate on — and of the shipped adapters only
-`fake` declares send capability, so the whole write cycle is provable offline and no
-live platform gains a send path by flipping the gate.
+`fake` and `slack` declare send capability. `fake`'s makes the whole write cycle provable
+offline; `slack`'s (ENH-31) is **authorized for the aws-do-agent harness only** — its bot
+token, its own channels, policy `staged`, never `direct` (the adapter declares `direct`
+off, so an outbox built for a direct policy refuses at construction) — and flipping the
+gate gives a live channel a send path only where its policy already says `staged`. A token
+granted read-only never writes: its channels stay at `never`.
+
+Every Slack send passes six guards, each refusing **before** the durable INTENT flip, so
+a refused draft stays STAGED and discardable and nothing reaches the platform: (1) the
+connection's `send_marker` (an instance key, e.g. `"[AGENT]"`) is prepended when the draft
+is staged, shown on the card, and required again at the click — several senders share the
+bot identity in the harness, and the marker is how a reader and the other senders' dedupe
+tell the engine's messages apart; (2) the click **re-reads** the channel or thread, and a
+message newer than the draft refuses with who and when ("re-read first") — the human
+approved the text against the conversation as it stood; (3) the read-back after the post
+must find the SAME message: the outbox key rides the message metadata, and the canonical
+text must match exactly, or the row stays SENT, unproven and never re-sent blindly; (4) a
+text over 3,500 characters is refused (Slack silently splits at 4,000 and returns one ts);
+(5) a BLOCK-tier credential shape in the text (`core/redact.py`) is refused by class name,
+never echoed; (6) placement follows the human — in the ask's thread in a channel, top-level
+in a 1:1 direct message (a channel declared `kind: dm`, or inferred from a D-prefixed id).
+Tests exercise all of it against a loopback Slack stub through `COMMS_SLACK_API_BASE`,
+which admits `http://127.0.0.1:<port>` or `http://localhost:<port>` and refuses anything
+else by name at construction — nothing in the suite reaches slack.com.
+
+Who may **close** an ask is the instance's `answerers` list (sender ids — the agent's bot
+user, the operators): with one, only their replies close asks, in threads and in DMs
+alike, so a bystander's "+1" closes nothing; without one, today's rule stands (any
+non-asker whose reply is not itself an ask; the other party of a DM). A reply that
+classifies as a question is never credited, from anyone: a clarifying question is a
+question. The Journal tab lists every ask closed by someone else's thread or DM reply
+under "closed by someone else — confirm", newest first, so the operator can see which
+asks left the queue that way.
 
 The same gate covers **configuration** (`scripts/dashboard_config.py`, over
 `core/reconfig.py`): with it on, the dashboard can also add, edit and remove
@@ -350,10 +381,12 @@ surface says so instead of implying one.
 
 ## Honest limits
 
-- **Answered state has exactly two routes.** An ask is marked answered by a reply sent
+- **Answered state has exactly three routes.** An ask is marked answered by a reply sent
   from the write surface's Reply button (tied by the ask itself, in its thread or
-  top-level as the channel's thread policy allows) or by an in-thread reply from someone
-  other than the asker, swept each scheduler cycle. "Responded" means exactly that, not
+  top-level as the channel's thread policy allows), by an in-thread reply from someone
+  other than the asker — from a listed answerer, when the source names them — swept each
+  scheduler cycle, or, in a 1:1 direct message (declared or inferred), by the next
+  top-level message from an answerer, which closes the most recent open ask before it. "Responded" means exactly that, not
   "resolved": a third party's "+1" closes an ask too, and the dashboard counts
   thread-closed asks apart from answers sent from here. A reply posted top-level in the
   channel by anyone else is stored and listed but cannot be tied to the ask, and the
@@ -375,9 +408,10 @@ surface says so instead of implying one.
   `conversations.replies` is far lower for commercially distributed non-Marketplace apps
   than for an internal app, so a distributed app should expect asks to close more slowly,
   never faster — and at about one call per cycle it needs that window fix first.
-- Five adapters ship: **`fake`** (in-memory dry-run), **`slack`** — **read-only on purpose**
-  (poll / replies / resolve / health; it exposes no send path at any layer, and `tests/test_slack_adapter.py`
-  fails if one appears) — **`slack_socket`** (Socket Mode push ingestion, equally
+- Five adapters ship: **`fake`** (in-memory dry-run), **`slack`** (poll / replies / resolve /
+  health, and one send — `chat.postMessage`, reachable only through `core/outbox` at policy
+  `staged`, authorized for the aws-do-agent harness's bot token only; `tests/test_slack_adapter.py`
+  fails if any other write surface appears) — **`slack_socket`** (Socket Mode push ingestion,
   read-only; push is for latency only: Socket Mode can MISS events, so the socket adapter is
   never the truth — run `scripts/push-poll-parity.py` against the polling store continuously
   before trusting it, and know that **it has not yet run against a live workspace**; that

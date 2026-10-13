@@ -95,29 +95,35 @@ class ContractSurfaceTest(SlackAdapterTestCase):
         cls = load_adapter_class(ROOT / "channels", "slack")
         self.assertTrue(callable(cls))
 
-    def test_capabilities_answer_every_contract_key_and_send_is_false(self):
+    def test_capabilities_answer_every_contract_key_send_on_direct_off(self):
+        """ENH-31: send exists — behind core/outbox, at policy `staged` only. `direct`
+        is declared OFF so an outbox built for a direct policy refuses at construction:
+        the 2026-10-13 grant is a human click, never the engine posting on its own."""
         caps = self.make().capabilities()
-        for k in ("read", "history", "search", "send", "react", "threads"):
+        for k in ("read", "history", "search", "send", "react", "threads", "direct"):
             self.assertIn(k, caps)
         self.assertTrue(caps["read"])
         self.assertTrue(caps["history"])
-        self.assertFalse(caps["send"],
-                         "a read-only adapter advertising send invites the outbox to "
-                         "drive a path that must not exist")
+        self.assertTrue(caps["send"])
+        self.assertTrue(caps["threads"], "replies are placed with thread_ts")
+        self.assertFalse(caps["direct"], "the engine must never post without a human")
+        self.assertFalse(caps["react"])
 
-    def test_no_callable_send_exists_at_any_public_surface(self):
-        """THE acceptance property: the operator authorized the token read-only, so
-        there is nothing named like a send for any caller — outbox included — to find."""
+    def test_send_and_read_back_are_the_only_write_surface(self):
+        """One authorized write (chat.postMessage, through send()) and its proof
+        (read_back). Nothing else public looks like a write: no post/update/delete/
+        react/publish surface for any caller — outbox included — to find."""
         a = self.make()
-        self.assertIsNone(getattr(a, "send", None))
-        self.assertIsNone(getattr(a, "read_back", None),
-                          "read_back is proof-of-delivery; it implies a delivery path")
+        self.assertTrue(callable(a.send))
+        self.assertTrue(callable(a.read_back))
         for name in dir(a):
-            if name.startswith("_"):
+            if name.startswith("_") or name in ("send", "read_back"):
                 continue
-            for banned in ("send", "post", "write", "publish", "react"):
+            for banned in ("send", "post", "write", "publish", "react", "update",
+                           "delete", "upload"):
                 self.assertNotIn(banned, name.lower(),
-                                 f"public attribute {name!r} looks like a send surface")
+                                 f"public attribute {name!r} looks like a write surface")
+        self.assertEqual(self.mod.WRITE_METHODS, frozenset({"chat.postMessage"}))
 
     def test_missing_token_or_channels_refuses_at_construction(self):
         """Half-configured is the worst state to discover during an incident — the
@@ -170,12 +176,12 @@ class ReadOnlyTransportTest(SlackAdapterTestCase):
     """Deny-by-default at the layer every request must pass through. Without this, the
     no-send property above is one convenience wrapper away from being lost."""
 
-    WRITE_METHODS = ("chat.postMessage", "chat.update", "chat.delete", "chat.meMessage",
-                     "reactions.add", "files.upload", "conversations.join")
+    REFUSED_METHODS = ("chat.update", "chat.delete", "chat.meMessage", "chat.scheduleMessage",
+                       "reactions.add", "files.upload", "conversations.join", "pins.add")
 
-    def test_write_methods_are_refused_before_any_io(self):
+    def test_every_write_but_chat_postMessage_is_refused_before_any_io(self):
         a = self.make()
-        for method in self.WRITE_METHODS:
+        for method in self.REFUSED_METHODS:
             with self.assertRaises(self.mod.ReadOnlyViolation, msg=method):
                 a._api(method, channel="C_ONE", text="never")
         self.assertEqual(self.http.requests, [],
@@ -186,6 +192,104 @@ class ReadOnlyTransportTest(SlackAdapterTestCase):
         a = self.make([(200, {}, {"ok": True})])
         a._api("auth.test")
         self.assertEqual(len(self.http.requests), 1)
+
+
+def posted(ts="1700000100.000100", channel="C_ONE"):
+    return (200, {}, {"ok": True, "channel": channel, "ts": ts,
+                      "message": {"type": "message", "ts": ts, "text": "x"}})
+
+
+class SendTest(SlackAdapterTestCase):
+    """The send path (ENH-31 A), adapter side: one chat.postMessage carrying the outbox
+    key in message METADATA, the token in the header, placement via thread_ts; read_back
+    proves the SAME message (key and canonical text) came back; newest() is the pre-send
+    re-read. No guard lives here — the outbox refuses before the INTENT flip."""
+
+    def test_send_posts_once_with_the_key_in_metadata_and_the_token_in_the_header(self):
+        a = self.make([posted()])
+        receipt = a.send("C_ONE", "[AGENT] here: http://127.0.0.1:8502", key="k1",
+                         thread_id="1700000000.000100")
+        self.assertEqual(receipt["ts"], "1700000100.000100")
+        self.assertEqual(len(self.http.requests), 1)
+        url, form = self.http.requests[0]
+        self.assertTrue(url.endswith("/chat.postMessage"))
+        self.assertEqual(form["channel"], "C_ONE")
+        self.assertEqual(form["text"], "[AGENT] here: http://127.0.0.1:8502")
+        self.assertEqual(form["thread_ts"], "1700000000.000100")
+        self.assertEqual(json.loads(form["metadata"])["event_payload"], {"key": "k1"})
+        self.assertNotIn("token", form, "the token travels in the Authorization header only")
+
+    def test_a_top_level_send_carries_no_thread_ts(self):
+        a = self.make([posted()])
+        a.send("C_ONE", "[AGENT] top-level", key="k2")
+        self.assertNotIn("thread_ts", self.http.requests[0][1])
+
+    def test_read_back_proves_key_and_canonical_text_of_what_this_process_sent(self):
+        ts = "1700000100.000100"
+        meta = {"event_type": "comms_engine_reply", "event_payload": {"key": "k1"}}
+        shown = {"type": "message", "ts": ts, "user": "U_BOT", "metadata": meta,
+                 "text": "[AGENT] see &lt;http://127.0.0.1:8502&gt; &amp; reply"}
+        a = self.make([posted(ts), history([shown])])
+        a.send("C_ONE", "[AGENT] see <http://127.0.0.1:8502> & reply", key="k1")
+        self.assertTrue(a.read_back("C_ONE", "k1"))
+        form = self.http.requests[1][1]
+        self.assertEqual((form["latest"], form["oldest"], form["inclusive"],
+                          form["include_all_metadata"]), (ts, ts, "true", "true"))
+
+    def test_read_back_fails_when_the_platform_shows_different_text(self):
+        ts = "1700000100.000100"
+        meta = {"event_type": "comms_engine_reply", "event_payload": {"key": "k1"}}
+        shown = {"type": "message", "ts": ts, "user": "U_BOT", "metadata": meta,
+                 "text": "[AGENT] a TRUNCATED or rewritten"}
+        a = self.make([posted(ts), history([shown])])
+        a.send("C_ONE", "[AGENT] the approved text, in full", key="k1")
+        self.assertFalse(a.read_back("C_ONE", "k1"),
+                         "a read-back that accepts different text proves nothing")
+
+    def test_read_back_fails_when_the_shown_message_carries_another_key(self):
+        ts = "1700000100.000100"
+        meta = {"event_type": "comms_engine_reply", "event_payload": {"key": "OTHER"}}
+        shown = {"type": "message", "ts": ts, "user": "U_BOT", "metadata": meta,
+                 "text": "[AGENT] same text"}
+        a = self.make([posted(ts), history([shown])])
+        a.send("C_ONE", "[AGENT] same text", key="k1")
+        self.assertFalse(a.read_back("C_ONE", "k1"))
+
+    def test_read_back_after_a_restart_searches_the_channel_or_the_thread_by_key(self):
+        """Recovery: a new process holds no ts for the key. The newest page of history
+        (top-level) or the thread (when the caller passes thread_id) is searched."""
+        meta = {"event_type": "comms_engine_reply", "event_payload": {"key": "k9"}}
+        a = self.make([history([{"type": "message", "ts": "5.0", "user": "U_BOT",
+                                 "metadata": meta, "text": "[AGENT] x"}])])
+        self.assertTrue(a.read_back("C_ONE", "k9"))
+        self.assertEqual(self.http.requests[0][1]["include_all_metadata"], "true")
+        a = self.make([history([])])
+        self.assertFalse(a.read_back("C_ONE", "k9"))
+        thread = {"ok": True, "has_more": False, "messages": [
+            {"type": "message", "ts": "1.0", "user": "U_A", "text": "ask?"},
+            {"type": "message", "ts": "2.0", "user": "U_BOT", "thread_ts": "1.0",
+             "metadata": meta, "text": "[AGENT] x"}]}
+        a = self.make([(200, {}, thread)])
+        self.assertTrue(a.read_back("C_ONE", "k9", thread_id="1.0"))
+        self.assertTrue(self.http.requests[0][0].endswith("/conversations.replies"))
+
+    def test_newest_reads_the_channel_top_level_or_one_thread(self):
+        a = self.make([history([slack_msg("9.0", user="U_H", text="newer")])])
+        m = a.newest("C_ONE")
+        self.assertEqual((m["ts"], m["sender_id"]), ("9.0", "U_H"))
+        self.assertEqual(str(self.http.requests[0][1]["limit"]), "1")
+        thread = {"ok": True, "has_more": False, "messages": [
+            slack_msg("1.0", text="ask?"),
+            slack_msg("2.0", user="U_B", text="r1", thread_ts="1.0"),
+            slack_msg("3.0", user="U_C", text="r2", thread_ts="1.0")]}
+        a = self.make([(200, {}, thread)])
+        self.assertEqual(a.newest("C_ONE", thread_id="1.0")["ts"], "3.0")
+        a = self.make([history([])])
+        self.assertIsNone(a.newest("C_ONE"))
+
+    def test_the_size_limit_is_declared_for_the_outbox(self):
+        self.assertEqual(self.mod.MAX_TEXT_CHARS, 3500)
+        self.assertEqual(self.mod.Adapter.MAX_TEXT_CHARS if hasattr(self.mod.Adapter, "MAX_TEXT_CHARS") else self.mod.MAX_TEXT_CHARS, 3500)
 
 
 class PollTest(SlackAdapterTestCase):

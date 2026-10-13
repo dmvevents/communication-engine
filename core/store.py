@@ -207,6 +207,17 @@ class Store:
         return out
 
     # ---- cursors ----------------------------------------------------------
+    def top_level_after(self, channel_id: str, ts: str) -> list:
+        """Top-level messages in this channel newer than `ts`, oldest first — the DM
+        answered-state's candidates (ENH-31 B): a 1:1 DM has no threads in practice, so
+        an answer is the next top-level message by the other party. Numeric platform
+        timestamps only (Slack); the caller restricts this to DM channels."""
+        rows = self.conn.execute(
+            "SELECT * FROM messages WHERE channel_id=? AND thread_id IS NULL "
+            "AND CAST(ts AS REAL) > CAST(? AS REAL) ORDER BY CAST(ts AS REAL)",
+            (channel_id, str(ts))).fetchall()
+        return [dict(r) for r in rows]
+
     def cursor_get(self, instance: str, channel_id: str) -> str | None:
         row = self.conn.execute(
             "SELECT cursor FROM cursors WHERE instance=? AND channel_id=?",

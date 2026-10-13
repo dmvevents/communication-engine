@@ -1,14 +1,21 @@
-"""channels/slack — the read-only Slack adapter (ENH-18).
+"""channels/slack — the Slack adapter (ENH-18 read path; ENH-31 send behind the outbox).
 
-First REAL platform adapter, landed as a pure dir-drop (R11: zero core/ changes). The
-operator authorized the workspace token READ-ONLY, so read-only is enforced in layers,
-not promised in prose:
+First REAL platform adapter, landed as a pure dir-drop (R11: zero core/ changes). Its
+read path was authorized first (2026-08-26, this host's token: read-only, unchanged);
+its send path was authorized on 2026-10-13 for the aws-do-agent harness only — the
+harness's bot token, its SLACK_CHANNELS, policy `staged` (a human click), never
+`direct`. The authorization is enforced in layers, not promised in prose:
 
-* there is no `send`, `read_back`, or any delivery primitive on this class — an outbox
-  pointed at this adapter has nothing to drive;
+* `send()` and `read_back()` exist, but `send()` is reachable only through core/outbox
+  (channels/CONTRACT.md): the outbox's ladder (durable INTENT -> send -> read-back ->
+  COMMITTED) and its pre-flip guards (marker prefix, newest-message re-read, size,
+  redaction scan) stand between any caller and chat.postMessage;
 * `_api`, the one funnel every request passes through, default-DENIES: any Web API
-  method outside READ_METHODS is refused before a byte reaches the wire. Without this,
-  the no-send property would be one convenience wrapper away from being lost.
+  method outside READ_METHODS plus the single WRITE method is refused before a byte
+  reaches the wire. Without this, "one write method" would be one convenience wrapper
+  away from becoming several;
+* `capabilities()["direct"]` is False: an outbox built for a `direct` policy on this
+  adapter refuses at construction, so the engine can never post without a human.
 
 Polling follows channels/CONTRACT.md: gap-free (pagination followed to the end, or
 fail loudly — a silent truncation is a lost message), idempotent from the same cursor,
@@ -79,6 +86,12 @@ READ_METHODS = frozenset({
     "users.info",
     "users.list",
 })
+# The ONE write method, and the only caller of it is send() (ENH-31). chat.update,
+# chat.delete, reactions.*, files.* stay refused: the grant is "post a human-approved
+# reply", nothing else.
+WRITE_METHODS = frozenset({"chat.postMessage"})
+MAX_TEXT_CHARS = 3500     # Slack silently splits >4,000 chars and returns one ts (2026-09-18)
+METADATA_EVENT = "comms_engine_reply"
 
 # Platform id shapes (uppercase-only, so lowercase channel names can never collide —
 # Slack forbids uppercase in channel names). Written so the pattern SOURCE cannot
@@ -98,15 +111,30 @@ class ApiError(RuntimeError):
 
 
 class ReadOnlyViolation(RuntimeError):
-    """A non-read method reached the transport. This adapter is read-only BY
-    AUTHORIZATION (the operator granted the token for reading, 2026-08-26); the
-    correct fix is never to widen this list quietly — send lives behind core/outbox
-    in a future, separately-authorized adapter."""
+    """A method outside the allowlist reached the transport. The allowlist is the
+    read methods plus chat.postMessage (authorized 2026-10-13, harness only, behind the
+    outbox); the correct fix is never to widen it quietly — every method here was
+    authorized by name."""
 
     def __init__(self, method: str):
         super().__init__(
-            f"{method} is not a read method — this adapter is read-only and refuses "
-            f"anything outside its allowlist before any I/O happens")
+            f"{method} is not on this adapter's allowlist (reads + chat.postMessage) — "
+            f"refused before any I/O happens")
+
+
+def _canonical(text: str) -> str:
+    """Slack stores `&`, `<`, `>` escaped and may wrap a URL as `<url>` or `<url|label>`;
+    compare both sides through this so "exact text" means exact CONTENT (ENH-31 guard 3)."""
+    t = (text or "").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    t = re.sub(r"<(https?://[^|>]+)(?:\|[^>]*)?>", r"\1", t)
+    return " ".join(t.split())
+
+
+def _metadata_key(m) -> str | None:
+    meta = m.get("metadata") or {}
+    if meta.get("event_type") != METADATA_EVENT:
+        return None
+    return (meta.get("event_payload") or {}).get("key")
 
 
 def _header(headers: dict, name: str, default=None):
@@ -138,6 +166,8 @@ def _attachments(m):
 
 
 class Adapter:
+    MAX_TEXT_CHARS = MAX_TEXT_CHARS      # read by core/outbox's size guard (ENH-31 guard 4)
+
     def __init__(self, auth=None, http=None, clock=None, env=None):
         auth = auth or {}
         # Resolved at construction so a refused override never reaches _api (ENH-31 C).
@@ -157,13 +187,85 @@ class Adapter:
         self.http = http or self._urllib_http
         self._clock = clock or time.monotonic
         self._holds = {}   # method -> monotonic instant its 429 hold expires (report-only)
+        self._sent = {}    # key -> {"ts", "channel", "text", "thread_id"} this process posted
 
     # ---- contract surface --------------------------------------------------
     def capabilities(self):
-        # send is False and stays False: reply policy for this platform is
-        # deny-by-default and the send authorization simply does not exist yet.
+        # send: through core/outbox only, at policy `staged` — `direct` is declared
+        # OFF, so an outbox built for a direct policy on this adapter refuses at
+        # construction (the 2026-10-13 grant: human click only). threads: a reply is
+        # placed with thread_ts, and conversations.replies serves the thread back.
         return {"read": True, "history": True, "search": False,
-                "send": False, "react": False, "threads": False}
+                "send": True, "direct": False, "react": False, "threads": True}
+
+    # ---- the send path (ENH-31; only core/outbox may call these) ------------------
+    def send(self, channel_id, text, key=None, thread_id=None):
+        """chat.postMessage, once, with the outbox key in the message METADATA — the
+        one place Slack lets a poster attach an idempotency key that read_back() can
+        find again without altering the human-approved text. `thread_id` places the
+        reply in that thread; None posts top-level. No guard lives here: the outbox
+        refuses before the INTENT flip, and this method is the delivery, not the gate."""
+        params = {"channel": channel_id, "text": text,
+                  "metadata": json.dumps({"event_type": METADATA_EVENT,
+                                          "event_payload": {"key": key}})}
+        if thread_id is not None:
+            params["thread_ts"] = str(thread_id)
+        payload = self._api("chat.postMessage", **params)
+        ts = payload.get("ts")
+        if not ts:
+            raise ApiError("chat.postMessage", "ok response carrying no ts")
+        self._sent[key] = {"ts": ts, "channel": channel_id, "text": text,
+                           "thread_id": thread_id}
+        return {"ts": ts, "channel": payload.get("channel", channel_id), "key": key}
+
+    def read_back(self, target, key, thread_id=None):
+        """Proof of delivery BY KEY (channels/CONTRACT.md): the platform shows a message
+        carrying this outbox key in its metadata. For a message this process posted the
+        check is exact — fetched by its ts, key AND canonical text must match (guard 3:
+        a read-back that found "a message" could not tell a truncated or rewritten
+        post from the approved one). For a key this process never posted (recovery
+        after a crash), the newest page of the channel — or the thread, when the
+        caller passes `thread_id` — is searched for the key."""
+        mine = self._sent.get(key)
+        if mine is not None:
+            found = self._fetch_exact(mine["channel"], mine["ts"], mine["thread_id"])
+            return (found is not None and _metadata_key(found) == key
+                    and _canonical(found.get("text", "")) == _canonical(mine["text"]))
+        if thread_id is not None:
+            candidates = self._replies_raw(target, str(thread_id))
+        else:
+            candidates = self._api("conversations.history", channel=target,
+                                   limit=PAGE_LIMIT, include_all_metadata="true"
+                                   ).get("messages", [])
+        return any(_metadata_key(m) == key for m in candidates)
+
+    def newest(self, channel_id, thread_id=None):
+        """The newest message in the channel (top-level) or in one thread, normalized,
+        or None when there is none — the outbox's pre-send re-read (ENH-31 guard 2): a
+        message newer than the draft means the conversation moved on since the human
+        approved the text, and the click must refuse with "re-read first"."""
+        if thread_id is None:
+            page = self._api("conversations.history", channel=channel_id, limit=1)
+            msgs = page.get("messages", [])
+            return self._normalize(channel_id, msgs[0]) if msgs else None
+        replies = [m for m in self._replies_raw(channel_id, str(thread_id))
+                   if m.get("ts") != str(thread_id)]
+        if not replies:
+            return None
+        return self._normalize(channel_id, max(replies, key=lambda m: float(m["ts"])))
+
+    def _fetch_exact(self, channel, ts, thread_id):
+        if thread_id is not None:
+            for m in self._replies_raw(channel, str(thread_id)):
+                if m.get("ts") == ts:
+                    return m
+            return None
+        page = self._api("conversations.history", channel=channel, latest=ts, oldest=ts,
+                         inclusive="true", limit=1, include_all_metadata="true")
+        for m in page.get("messages", []):
+            if m.get("ts") == ts:
+                return m
+        return None
 
     def poll(self, cursor):
         """Gap-free and idempotent: same cursor -> same messages again, never fewer.
@@ -222,7 +324,7 @@ class Adapter:
 
     # ---- transport ----------------------------------------------------------
     def _api(self, method, timeout=30.0, **params):
-        if method not in READ_METHODS:
+        if method not in READ_METHODS and method not in WRITE_METHODS:
             raise ReadOnlyViolation(method)
         status, headers, body = self.http(f"{self._api_base}/{method}", params, timeout)
         try:

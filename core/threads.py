@@ -59,7 +59,7 @@ SWEEP_MAX = 25
 UNATTRIBUTED_SENDERS = frozenset({"unknown"})
 
 
-def answered_by(asker: str | None, replies, is_answer=None) -> dict | None:
+def answered_by(asker: str | None, replies, is_answer=None, answerers=()) -> dict | None:
     """The earliest reply from someone OTHER than the asker that IS an answer, or None.
 
     The asker bumping their own thread is not an answer; a reply with no sender, or the
@@ -68,15 +68,52 @@ def answered_by(asker: str | None, replies, is_answer=None) -> dict | None:
     logs?") is a new question, not an answer — crediting it closed the original ask and
     its owed work (independent review F7). `is_answer` is the caller's verdict; the
     reference scheduler passes its classifier.
+
+    `answerers` (ENH-31, operator decision 2026-10-13): when the source names who may
+    close an ask — the agent's bot user, the operators — only THEIR replies count, so a
+    bystander's "+1" closes nothing (review S8). Empty keeps the any-non-asker rule. The
+    ask-shaped filter applies to answerers too: a listed answerer's clarifying question
+    is a question, not an answer ("follow-up questions never credited").
     """
     for r in sorted(replies, key=lambda m: ts_order(m["ts"])):
         sender = r.get("sender_id")
         if not sender or sender == asker or sender in UNATTRIBUTED_SENDERS:
             continue
+        if answerers and sender not in answerers:
+            continue
         if is_answer is not None and not is_answer(r):
             continue
         return r
     return None
+
+
+def close_dm_asks(store, journal, channel: str, *, answerers=(), is_answer=None) -> list:
+    """The DM answered-state (ENH-31 B): in a 1:1 direct message every message is
+    top-level (measured on the aws-do-agent integration: 535 DM messages, 0 in-thread),
+    so the thread sweep can never close a DM ask. Here each later top-level message
+    that is an answer — by an answerer when the source names them, else by anyone but
+    the asker (the other DM party) — closes the MOST RECENT still-open ask that precedes
+    it, and only that one: a reply addresses the question just asked; an older question
+    stays visibly open for a human to judge. No platform call: the candidates are the
+    polled store. Returns [(ask_ts, message_ts), ...] for the ties made.
+    """
+    open_asks = sorted(open_asks_for(journal, channel), key=lambda r: ts_order(r["ts"]))
+    if not open_asks:
+        return []
+    arrivals = store.arrivals(channel)
+    answered = []
+    for m in store.top_level_after(channel, open_asks[0]["ts"]):
+        preceding = [a for a in open_asks if ts_order(a["ts"]) < ts_order(m["ts"])]
+        if not preceding:
+            continue
+        target = preceding[-1]
+        if answered_by(target["sender_id"], [m], is_answer, answerers) is None:
+            continue
+        journal.mark_responded(channel, target["ts"], f"dm-reply:{m['ts']}",
+                               at=arrivals.get(str(m["ts"])))
+        answered.append((str(target["ts"]), str(m["ts"])))
+        open_asks.remove(target)
+    return answered
 
 
 def open_asks_for(journal, channel: str) -> list:
@@ -89,7 +126,8 @@ def open_asks_for(journal, channel: str) -> list:
 
 
 def sweep(adapter, store, journal, channel: str, *,
-          max_threads: int = SWEEP_MAX, start: int = 0, is_answer=None) -> dict | None:
+          max_threads: int = SWEEP_MAX, start: int = 0, is_answer=None,
+          answerers=()) -> dict | None:
     """Fetch new replies under this channel's open asks and tie answers to them.
 
     Returns None when the adapter has no `replies()` — the capability is absent and the
@@ -166,7 +204,7 @@ def sweep(adapter, store, journal, channel: str, *,
         arrivals = store.arrivals(channel)
         for row in rows:
             later = [m for m in in_thread if ts_order(m["ts"]) > ts_order(row["ts"])]
-            hit = answered_by(row["sender_id"], later, is_answer)
+            hit = answered_by(row["sender_id"], later, is_answer, answerers)
             if hit is not None:
                 # Stamped at the reply's first ARRIVAL (engine clock, comparable with
                 # revision.recorded_at), never at sweep time: an edit sighted between

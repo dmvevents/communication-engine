@@ -511,6 +511,42 @@ class HtmlTextTest(unittest.TestCase):
         self.assertEqual(out, "a[](https://x)<br>b")
 
 
+class ClosedByOthersTest(unittest.TestCase):
+    """ENH-31 B' (review S8): an ask closed by someone else's reply — in its thread, or
+    the next top-level message in a DM — is LISTED for a human to confirm, newest first,
+    and counted apart from answers sent from the surface; with no answerer list a
+    bystander's "+1" closes an ask too, so the operator must see which."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.journal = Path(self.tmp.name) / "journal.db"
+        j = Journal(self.journal)
+        j.record("C_TEAM", "1.0", sender_id="U1", text=ASK, kind="QUESTION")
+        j.record("D_SOMEONE", "2.0", sender_id="U1", text="is it up?", kind="QUESTION")
+        j.record("C_TEAM", "3.0", sender_id="U1", text="and the logs?", kind="QUESTION")
+        j.record("C_TEAM", "4.0", sender_id="U1", text="still open?", kind="QUESTION")
+        j.mark_responded("C_TEAM", "1.0", "thread-reply:1.5", at=10.0)
+        j.mark_responded("D_SOMEONE", "2.0", "dm-reply:2.5", at=20.0)
+        j.mark_responded("C_TEAM", "3.0", "ui:abcdef", at=30.0)         # sent from here
+        j.close()
+
+    def test_thread_and_dm_closures_are_listed_newest_first_and_counted_apart(self):
+        s = snapshot(self.journal, {})
+        self.assertEqual([(c["where"], c["ts"], c["response_key"]) for c in s["closed_by_others"]],
+                         [("D_SOMEONE", "2.0", "dm-reply:2.5"), ("C_TEAM", "1.0", "thread-reply:1.5")],
+                         "a Send from the surface is not 'someone else'; order is newest first")
+        self.assertEqual((s["journal"]["answered_by_thread"], s["journal"]["answered_by_dm"],
+                          s["journal"]["answered"]), (1, 1, 3))
+        self.assertEqual([a["ts"] for a in s["attention"] if a["severity"] == "unanswered"],
+                         ["4.0"])
+
+    def test_a_missing_journal_lists_nothing_and_stays_unknown(self):
+        s = snapshot(Path(self.tmp.name) / "absent.db", {})
+        self.assertEqual(s["closed_by_others"], [])
+        self.assertIsNone(s["journal"])
+
+
 class UnansweredIsAsksOnlyTest(unittest.TestCase):
     """The attention queue's UNANSWERED list is the open ASK backlog, not every row.
 

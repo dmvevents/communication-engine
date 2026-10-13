@@ -187,10 +187,23 @@ with journal_tab:
         st.markdown(f"**{j['distinct']}** distinct messages · "
                     f"**{j['unanswered']}** unanswered · **{j['answered']}** answered "
                     f"({j['answered_by_thread']} closed by someone else's in-thread "
-                    "reply, not by an answer sent from here)")
+                    f"reply and {j['answered_by_dm']} by a direct-message reply, not by "
+                    "an answer sent from here — confirm them below)")
         dom_table(("kind", "count"),
                   [(html.escape(str(k)), n)
                    for k, n in sorted(j["by_kind"].items(), key=lambda kv: str(kv[0]))])
+        closed = snap["closed_by_others"]
+        if closed:
+            # ENH-31 B' (review S8): listed, not only counted — with no answerer list a
+            # bystander's "+1" closes an ask too, and the operator must see WHICH.
+            st.markdown("##### Closed by someone else — confirm")
+            dom_table(("channel", "ts", "kind", "closed by", "text"),
+                      [(html.escape(c["where"]), html.escape(str(c["ts"])),
+                        html.escape(str(c["kind"] or "—")),
+                        html.escape(str(c["response_key"]).replace("thread-reply:", "thread reply ")
+                                    .replace("dm-reply:", "DM reply ")),
+                        html_text(c["text"]))
+                       for c in closed])
         open_asks = [a for a in attention if a["severity"] in
                      ("unanswered", "edited_after_response")]
         if open_asks:

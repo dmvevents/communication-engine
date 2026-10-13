@@ -240,7 +240,8 @@ class Scheduler:
                     # never the answer (review F7); the source's vocabulary decides.
                     is_answer=lambda m, _src=src: classify(
                         m.get("text") or "", _src.taxonomy,
-                        attachments=m.get("attachments")).kind not in ACTIONABLE_KINDS)
+                        attachments=m.get("attachments")).kind not in ACTIONABLE_KINDS,
+                    answerers=src.answerers)
                 if swept is not None:
                     # Charged by ATTEMPT: a refused fetch cost the platform a call too
                     # (review F2 — an all-errors channel was charged nothing, and the
@@ -264,6 +265,14 @@ class Scheduler:
                     if swept["truncated"]:
                         sweep_truncated.append(ch)
                     sweep_errors.extend((ch, ts, msg) for ts, msg in swept["errors"])
+            # ENH-31 B: a 1:1 DM has no threads to sweep; its asks close on the next
+            # top-level message by an answerer. Store-only — no platform call, no budget.
+            for ch in src.dm_channels:
+                answered += len(threads.close_dm_asks(
+                    self.store, self.journal, ch, answerers=src.answerers,
+                    is_answer=lambda m, _src=src: classify(
+                        m.get("text") or "", _src.taxonomy,
+                        attachments=m.get("attachments")).kind not in ACTIONABLE_KINDS))
             # The channel that took the bulk — the one that SPENT the most — goes to the
             # back (review F3: rotating position 0 let a small channel's turn hand the
             # bulk straight back to the same backlog channel); skipped ones go first.

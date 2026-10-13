@@ -53,6 +53,16 @@ class Adapter:
         out.sort(key=lambda m: float(m["ts"]))
         return out
 
+    def newest(self, channel_id, thread_id=None):
+        """Optional capability (channels/CONTRACT.md, ENH-31): the newest message in the
+        channel (top-level) or under one thread, or None — the outbox's pre-send
+        re-read. Deliveries are not messages here (they live in `delivered`), so the
+        engine's own posts never trip its own guard."""
+        pool = [m for m in self.messages if m.get("channel_id") == channel_id
+                and ((m.get("thread_id") == thread_id) if thread_id is not None
+                     else not m.get("thread_id"))]
+        return max(pool, key=lambda m: float(m["ts"])) if pool else None
+
     def send(self, channel_id, text, key=None, thread_id=None):
         """Placement is recorded, not ignored: an adapter that accepts thread_id and
         drops it posts in the main channel while reporting success, which is the one

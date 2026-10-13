@@ -253,13 +253,13 @@ run_mutation "outbox: drop the already-delivered dedupe" \
 # exact 24-auto-reconcile bug: crash after send, then blindly re-send.
 run_mutation "outbox: recovery re-sends without proving prior delivery" \
   "core/outbox.py" \
-  "('            if self.adapter.read_back(target, key):', '            if False:')" \
+  "('            if self._read_back(target, key, row[\"thread_id\"]):', '            if False:')" \
   "test_outbox_faults"
 
 # R1 — read-back verification before claiming success.
 run_mutation "outbox: skip read-back verification" \
   "core/outbox.py" \
-  "('        if not self.adapter.read_back(target, key):', '        if False:')" \
+  "('        if not self._read_back(target, key, thread_id):', '        if False:')" \
   "test_outbox_faults"
 
 # R10 — default DENY. A target absent from the policy map must not be sendable.
@@ -306,7 +306,7 @@ run_mutation "outbox: recovery marks VERIFIED before it re-sends (loss under a r
 # R1 — the duplicate direction, under the sweep instead of the named seams.
 run_mutation "outbox: recovery re-sends blind — the property sweep sees the duplicate" \
   "core/outbox.py" \
-  "('            if self.adapter.read_back(target, key):', '            if False:')" \
+  "('            if self._read_back(target, key, row[\"thread_id\"]):', '            if False:')" \
   "test_outbox_statemachine"
 
 # R2 — liveness half of exactly-once: a retry that is never told 'delivered' retries
@@ -686,7 +686,7 @@ run_mutation "docs: step-6 fresh-state instruction deleted" \
 # it gone, chat.postMessage is one _api call away, in Anton's name.
 run_mutation "slack: transport allowlist deleted (write methods reach the wire)" \
   "channels/slack/adapter.py" \
-  "('        if method not in READ_METHODS:', '        if False:')" \
+  "('        if method not in READ_METHODS and method not in WRITE_METHODS:', '        if False:')" \
   "test_slack_adapter"
 
 # ENH-18 — gap-free polling: stopping at page one silently loses every older message
@@ -2470,7 +2470,7 @@ run_mutation "threads: a reply older than the ask answers it" \
 # SWEEP_MAX is a bound only if the default the scheduler relies on honours it.
 run_mutation "threads: the default sweep is unbounded" \
   "core/threads.py" \
-  "('          max_threads: int = SWEEP_MAX, start: int = 0, is_answer=None) -> dict | None:', '          max_threads: int = 10**9, start: int = 0, is_answer=None) -> dict | None:')" \
+  "('          max_threads: int = SWEEP_MAX, start: int = 0, is_answer=None,\n          answerers=()) -> dict | None:', '          max_threads: int = 10**9, start: int = 0, is_answer=None,\n          answerers=()) -> dict | None:')" \
   "test_threads"
 
 # The sweep's refusals must reach the operator (G4): a dead thread, a 429, a truncation.
@@ -2835,6 +2835,128 @@ run_mutation "config: an empty send_marker is accepted" \
   "core/config.py" \
   "('        if marker is not None and (not isinstance(marker, str) or not marker.strip()):', '        if False:')" \
   "test_config"
+
+# ---- ENH-31 slice A: the gated send — adapter primitives, the outbox's six guards, the surface ----
+run_mutation "slack: send posts without the outbox key in the message metadata" \
+  "channels/slack/adapter.py" \
+  "('                  \"metadata\": json.dumps({\"event_type\": METADATA_EVENT,\n                                          \"event_payload\": {\"key\": key}})}', '                  }')" \
+  "test_slack_adapter"
+
+run_mutation "slack: read_back accepts a message whose text differs" \
+  "channels/slack/adapter.py" \
+  "('                    and _canonical(found.get(\"text\", \"\")) == _canonical(mine[\"text\"]))', '                    and True)')" \
+  "test_slack_adapter"
+
+run_mutation "slack: read_back accepts a message carrying another key" \
+  "channels/slack/adapter.py" \
+  "('            return (found is not None and _metadata_key(found) == key', '            return (found is not None')" \
+  "test_slack_adapter"
+
+run_mutation "slack: direct sends are declared ON" \
+  "channels/slack/adapter.py" \
+  "('                \"send\": True, \"direct\": False, \"react\": False, \"threads\": True}', '                \"send\": True, \"direct\": True, \"react\": False, \"threads\": True}')" \
+  "test_slack_adapter"
+
+run_mutation "slack: newest() returns the oldest reply of a thread" \
+  "channels/slack/adapter.py" \
+  "('        return self._normalize(channel_id, max(replies, key=lambda m: float(m[\"ts\"])))', '        return self._normalize(channel_id, replies[0])')" \
+  "test_slack_adapter"
+
+run_mutation "outbox: the marker guard is gone" \
+  "core/outbox.py" \
+  "('        if self.marker and not text.startswith(self.marker):', '        if False:')" \
+  "test_outbox_write"
+
+run_mutation "outbox: the size guard is gone" \
+  "core/outbox.py" \
+  "('        if limit is not None and len(text) > limit:', '        if False:')" \
+  "test_outbox_write"
+
+run_mutation "outbox: the credential scan finds nothing" \
+  "core/outbox.py" \
+  "('        hits = redact.scan(text)', '        hits = []')" \
+  "test_outbox_write"
+
+run_mutation "outbox: a newer message no longer refuses the click" \
+  "core/outbox.py" \
+  "('        if latest_ts > float(row[\"created_at\"]):', '        if False:')" \
+  "test_outbox_write"
+
+run_mutation "outbox: a direct policy on a direct-off adapter is accepted" \
+  "core/outbox.py" \
+  "('        if not _allows_direct(adapter):', '        if False:')" \
+  "test_outbox_write"
+
+run_mutation "outbox: release() skips the text guards" \
+  "core/outbox.py" \
+  "('        self._check_payload(row[\"text\"], ReleaseError)', '        pass')" \
+  "test_outbox_write"
+
+run_mutation "outbox: a direct send skips the text guards" \
+  "core/outbox.py" \
+  "('            self._check_placement(thread_id)        # before the INSERT that is the claim\n            self._check_payload(text)               # marker, size, redaction (ENH-31)', '            self._check_placement(thread_id)        # before the INSERT that is the claim')" \
+  "test_outbox_write"
+
+run_mutation "outbox: stage() skips the text guards" \
+  "core/outbox.py" \
+  "('            self._check_placement(thread_id)        # before the draft exists at all\n            self._check_payload(text)               # marker, size, redaction (ENH-31)', '            self._check_placement(thread_id)        # before the draft exists at all')" \
+  "test_outbox_write"
+
+run_mutation "outbox: read_back is never told the thread" \
+  "core/outbox.py" \
+  "('        if thread_id is not None and _accepts_kw(rb, \"thread_id\"):', '        if False:')" \
+  "test_outbox_write"
+
+run_mutation "dashboard_write: the connection's marker is not prepended at stage" \
+  "scripts/dashboard_write.py" \
+  "('        if inst.send_marker and not text.startswith(inst.send_marker):', '        if False:')" \
+  "test_dashboard_write"
+
+run_mutation "dashboard_write: a direct message is threaded like a channel" \
+  "scripts/dashboard_write.py" \
+  "('    if ch.is_dm:', '    if False:')" \
+  "test_dashboard_write"
+
+# ---- ENH-31 slice B: the DM answered-state, the shared answerer list, the confirm list ----
+run_mutation "threads: the answerer list is ignored (a bystander closes the ask)" \
+  "core/threads.py" \
+  "('        if answerers and sender not in answerers:', '        if False:')" \
+  "test_schedule"
+
+run_mutation "threads: a DM answer closes the OLDEST open ask, not the most recent" \
+  "core/threads.py" \
+  "('        target = preceding[-1]', '        target = preceding[0]')" \
+  "test_schedule"
+
+run_mutation "threads: the DM rule credits the asker's own follow-up" \
+  "core/threads.py" \
+  "('        if answered_by(target[\"sender_id\"], [m], is_answer, answerers) is None:', '        if False:')" \
+  "test_schedule"
+
+run_mutation "schedule: the DM rule never runs" \
+  "core/schedule.py" \
+  "('            for ch in src.dm_channels:', '            for ch in ():')" \
+  "test_schedule"
+
+run_mutation "schedule: the sweep ignores the source's answerers" \
+  "core/schedule.py" \
+  "('                    answerers=src.answerers)', '                    answerers=())')" \
+  "test_schedule"
+
+run_mutation "dashboard: asks closed by someone else are not listed" \
+  "core/dashboard.py" \
+  "('        closed_by_others = j_items.pop(\"closed_by_others\", [])', '        j_items.pop(\"closed_by_others\", [])')" \
+  "test_dashboard"
+
+run_mutation "dashboard: a Send from the surface is listed as someone else's closure" \
+  "core/dashboard.py" \
+  "('                \"WHERE responded_at IS NOT NULL AND (response_key LIKE \\'thread-reply:%\\' \"\n                \"OR response_key LIKE \\'dm-reply:%\\') ORDER BY responded_at DESC LIMIT 50\")]', '                \"WHERE responded_at IS NOT NULL ORDER BY responded_at DESC LIMIT 50\")]')" \
+  "test_dashboard"
+
+run_mutation "dashboard: DM closures are not counted" \
+  "core/dashboard.py" \
+  "('                \"AND response_key LIKE \\'dm-reply:%\\'\"', '                \"AND 0\"')" \
+  "test_dashboard"
 
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"

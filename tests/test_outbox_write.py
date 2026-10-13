@@ -15,6 +15,7 @@ exists for, entered from the gate side.
 """
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -445,6 +446,161 @@ class ThreadPlacementRefusalTest(unittest.TestCase):
         self.assertEqual((replay["deduped"], replay["state"]), (True, COMMITTED))
         self.assertTrue(box.stage(TARGET, TS, TEXT, thread_id=TS)["deduped"])
         self.assertEqual(self.adapter.delivered, [])
+
+
+class GuardedFake(FakeAdapter):
+    """FakeAdapter plus the ENH-31 primitives: a declared size limit, a pre-send
+    re-read (`newest`), a thread-aware read_back that records the kwarg it was given,
+    and a declaration that direct sends are off."""
+    MAX_TEXT_CHARS = 60
+
+    def __init__(self, direct=False):
+        super().__init__()
+        self.latest = None            # what newest() answers
+        self.newest_calls = []
+        self.read_back_kwargs = []
+        self._direct = direct
+
+    def capabilities(self):
+        return {"read": True, "history": True, "search": False, "send": True,
+                "direct": self._direct, "react": False, "threads": True}
+
+    def newest(self, channel_id, thread_id=None):
+        self.newest_calls.append((channel_id, thread_id))
+        return self.latest
+
+    def read_back(self, target, key, thread_id=None):
+        self.read_back_kwargs.append(thread_id)
+        return super().read_back(target, key)
+
+
+class SendGuardsTest(unittest.TestCase):
+    """The six guards of the gated send (ENH-31 A), each refusing BEFORE the INTENT flip —
+    at stage() and direct send() before any row exists, and at release() before the
+    claim — so a refused draft stays STAGED and discardable, and nothing reaches the
+    adapter. Planted failures: a missing marker, an oversize text, a credential-shaped
+    payload, a message newer than the draft, a direct policy on an adapter that
+    declares direct off."""
+
+    MARKED = "[AGENT] the numbers you asked for are attached."
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = Path(self.tmp.name) / "outbox.db"
+        self.adapter = GuardedFake()
+
+    def box(self, policy="staged", marker="[AGENT]", adapter=None):
+        return Outbox(self.db, adapter or self.adapter, {TARGET: policy},
+                      send_interval=0.0, marker=marker)
+
+    # ---- guard 1: the marker prefix ---------------------------------------------
+    def test_a_draft_without_the_marker_is_refused_at_stage_and_at_direct_send(self):
+        with self.assertRaises(SendBlocked) as cm:
+            self.box().stage(TARGET, TS, "no marker here")
+        self.assertIn("[AGENT]", str(cm.exception))
+        direct = GuardedFake(direct=True)
+        with self.assertRaises(SendBlocked):
+            self.box(policy="direct", adapter=direct).send(TARGET, TS, "no marker here")
+        self.assertEqual((self.box().staged(), self.adapter.delivered, direct.delivered),
+                         ([], [], []))
+        key = self.box().stage(TARGET, TS, self.MARKED)["key"]
+        self.assertEqual(self.box().release(key)["state"], COMMITTED)
+
+    def test_a_marker_configured_after_staging_refuses_the_release_before_the_flip(self):
+        key = self.box(marker=None).stage(TARGET, TS, "staged before the marker existed")["key"]
+        marked = self.box()
+        with self.assertRaises(ReleaseError) as cm:
+            marked.release(key)
+        self.assertIn("marker", str(cm.exception))
+        self.assertEqual(marked.get(key)["state"], STAGED)
+        self.assertEqual(self.adapter.delivered, [])
+        self.assertEqual(marked.discard(key)["state"], DISCARDED)
+
+    # ---- guard 4: the adapter's size limit -----------------------------------------
+    def test_a_text_over_the_adapters_limit_is_refused_before_any_row(self):
+        long = "[AGENT] " + "x" * 60                      # 68 > GuardedFake.MAX_TEXT_CHARS
+        with self.assertRaises(SendBlocked) as cm:
+            self.box().stage(TARGET, TS, long)
+        self.assertIn("60-character limit", str(cm.exception))
+        self.assertEqual(self.box().staged(), [])
+        ok = "[AGENT] " + "x" * 52                       # exactly 60
+        self.assertEqual(self.box().stage(TARGET, TS, ok)["state"], STAGED)
+
+    # ---- guard 5: the BLOCK-tier credential scan -------------------------------------
+    def test_a_credential_shaped_payload_is_refused_and_never_echoed(self):
+        secret = "xo" + "xb-" + "1234567890-abcdefghij"
+        with self.assertRaises(SendBlocked) as cm:
+            self.box().stage(TARGET, TS, f"[AGENT] token: {secret}")
+        self.assertIn("slack-token", str(cm.exception))
+        self.assertNotIn(secret, str(cm.exception), "the refusal echoed the secret")
+        direct = GuardedFake(direct=True)
+        with self.assertRaises(SendBlocked):
+            self.box(policy="direct", adapter=direct).send(TARGET, TS, f"[AGENT] token: {secret}")
+        self.assertEqual((self.adapter.delivered, direct.delivered), ([], []))
+
+    def test_a_legacy_draft_carrying_a_credential_is_refused_at_the_click(self):
+        """A row older than the scan (written by earlier code) is caught at release —
+        the guard runs on the text before the flip, not only at staging."""
+        secret = "AK" + "IA" + "ABCDEFGHIJKLMNOP"
+        box = self.box()
+        key = box.stage(TARGET, TS, self.MARKED)["key"]
+        box.conn.execute("UPDATE outbox SET text=? WHERE key=?",
+                         (f"[AGENT] key {secret}", key))
+        box.conn.commit()
+        with self.assertRaises(ReleaseError) as cm:
+            box.release(key)
+        self.assertIn("aws-access-key", str(cm.exception))
+        self.assertEqual((box.get(key)["state"], self.adapter.delivered), (STAGED, []))
+
+    # ---- guard 2: the pre-send re-read -----------------------------------------------
+    def test_a_message_newer_than_the_draft_refuses_the_click_with_who_and_when(self):
+        box = self.box()
+        key = box.stage(TARGET, TS, self.MARKED)["key"]
+        self.adapter.latest = {"ts": f"{time.time() + 5:.6f}", "sender_id": "U_HUMAN",
+                               "text": "actually never mind"}
+        with self.assertRaises(ReleaseError) as cm:
+            box.release(key)
+        msg = str(cm.exception)
+        self.assertIn("re-read first", msg)
+        self.assertIn("U_HUMAN", msg)
+        self.assertNotIn("never mind", msg, "a flash renders markdown — never the text")
+        self.assertEqual((box.get(key)["state"], self.adapter.delivered), (STAGED, []))
+        self.assertEqual(self.adapter.newest_calls, [(TARGET, None)])
+
+    def test_an_older_newest_message_lets_the_click_through(self):
+        box = self.box()
+        key = box.stage(TARGET, TS, self.MARKED)["key"]
+        self.adapter.latest = {"ts": "1700000000.000100", "sender_id": "U_ASKER"}
+        self.assertEqual(box.release(key)["state"], COMMITTED)
+
+    def test_the_re_read_looks_in_the_drafts_thread(self):
+        box = self.box()
+        key = box.stage(TARGET, TS, self.MARKED, thread_id=TS)["key"]
+        box.release(key)
+        self.assertEqual(self.adapter.newest_calls, [(TARGET, TS)])
+
+    # ---- the adapter's declaration: direct sends off ----------------------------------
+    def test_a_direct_policy_on_an_adapter_declaring_direct_off_is_refused_at_construction(self):
+        for policies in ({TARGET: "direct"}, {TARGET: {"channel": "staged", "thread": "direct"}}):
+            with self.assertRaises(PolicyError, msg=repr(policies)) as cm:
+                Outbox(self.db, GuardedFake(direct=False), policies, send_interval=0.0)
+            self.assertIn("direct", str(cm.exception))
+        Outbox(self.db, GuardedFake(direct=False), {TARGET: "staged"}, send_interval=0.0)
+        Outbox(self.db, GuardedFake(direct=True), {TARGET: "direct"}, send_interval=0.0)
+        Outbox(self.db, FakeAdapter(), {TARGET: "direct"}, send_interval=0.0)   # absent = allowed
+
+    # ---- guard 3's plumbing: the thread travels to read_back ----------------------------
+    def test_read_back_is_given_the_thread_when_it_takes_one(self):
+        box = self.box()
+        key = box.stage(TARGET, TS, self.MARKED, thread_id=TS)["key"]
+        box.release(key)
+        self.assertEqual(self.adapter.read_back_kwargs, [TS])
+        plain = FakeAdapter()                                # read_back(target, key) only
+        box2 = Outbox(Path(self.tmp.name) / "o2.db", plain, {TARGET: "staged"},
+                      send_interval=0.0)
+        self.assertEqual(box2.release(box2.stage(TARGET, TS, TEXT, thread_id=TS)["key"])["state"],
+                         COMMITTED)
 
 
 if __name__ == "__main__":

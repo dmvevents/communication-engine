@@ -107,12 +107,13 @@ class SchedulerHarness(unittest.TestCase):
         self.tmp.cleanup()
 
     def scheduler(self, adapter, channels=("C1",), journal=None, lock_path=None,
-                  escalate_ambiguous=False):
+                  escalate_ambiguous=False, answerers=(), dm_channels=()):
         return Scheduler(
             store=self.store, journal=journal or self.journal, owed=self.owed,
             escalator=self.escalator,
             sources=[Source(name="inst", adapter=adapter, channels=tuple(channels),
-                            escalate_ambiguous=escalate_ambiguous)],
+                            escalate_ambiguous=escalate_ambiguous,
+                            answerers=tuple(answerers), dm_channels=tuple(dm_channels))],
             base_interval=self.BASE, max_interval=self.MAX, lock_path=lock_path,
             clock=lambda: self.now,
             sleep=self._sleep)
@@ -1000,6 +1001,94 @@ class ThreadSweepCycleTest(SchedulerHarness):
         self.assertEqual(summary["sweep_rate_limited"], [("C1", "conversations.replies")])
         self.assertEqual(summary["sweep_skipped"], [],
                          "a channel with no open ask was named SKIPPED")
+
+
+class DmAnsweredStateTest(SchedulerHarness):
+    """ENH-31 B: in a 1:1 direct message every message is top-level (measured: 535 DM
+    messages, 0 in-thread), so the thread sweep could never close a DM ask — every one
+    read UNANSWERED forever. Here the next top-level message that is an answer closes
+    the most recent still-open ask before it; the asker's own follow-ups and anyone's
+    clarifying QUESTIONS close nothing; a configured answerer list restricts who."""
+
+    DM = "D_SOMEONE"
+
+    def dm(self, **kw):
+        adapter = HistoryOnlyFake()
+        sched = self.scheduler(adapter, channels=(self.DM,), dm_channels=(self.DM,), **kw)
+        return adapter, sched
+
+    def test_a_top_level_answer_from_the_other_party_closes_the_dm_ask(self):
+        adapter, sched = self.dm()
+        adapter.seed([msg(self.DM, "1.0", "where is the dashboard?", sender_id="U_HUMAN")])
+        first = sched.cycle()
+        self.assertEqual(first["answered"], 0)
+        adapter.seed([msg(self.DM, "2.0", "it is at http://127.0.0.1:8502",
+                          sender_id="U_BOT")])
+        second = sched.cycle()
+        self.assertEqual(second["answered"], 1, "the DM answer was not counted")
+        row = self.journal.get(self.DM, "1.0")
+        self.assertEqual(row["response_key"], "dm-reply:2.0")
+        self.assertIsNotNone(row["responded_at"])
+        self.assertEqual({r["id"] for r in self.owed.open_items()}, set(),
+                         "the owed work stayed open after the DM ask was answered")
+
+    def test_the_askers_own_follow_up_and_a_clarifying_question_close_nothing(self):
+        adapter, sched = self.dm()
+        adapter.seed([msg(self.DM, "1.0", "where is the dashboard?", sender_id="U_HUMAN")])
+        sched.cycle()
+        adapter.seed([msg(self.DM, "2.0", "still looking for it", sender_id="U_HUMAN"),
+                      msg(self.DM, "3.0", "which dashboard do you mean?", sender_id="U_BOT")])
+        self.assertEqual(sched.cycle()["answered"], 0)
+        self.assertIsNone(self.journal.get(self.DM, "1.0")["responded_at"])
+        # the bot's clarifying question is itself an open ask the human then answers
+        adapter.seed([msg(self.DM, "4.0", "the comms one", sender_id="U_HUMAN")])
+        sched.cycle()
+        self.assertEqual(self.journal.get(self.DM, "3.0")["response_key"], "dm-reply:4.0")
+        self.assertIsNone(self.journal.get(self.DM, "1.0")["responded_at"],
+                          "the original ask is still open — a later question was answered, not it")
+
+    def test_each_answer_closes_the_most_recent_open_ask_before_it(self):
+        adapter, sched = self.dm()
+        adapter.seed([msg(self.DM, "1.0", "where is the dashboard?", sender_id="U_HUMAN"),
+                      msg(self.DM, "2.0", "and where are the logs?", sender_id="U_HUMAN")])
+        sched.cycle()
+        adapter.seed([msg(self.DM, "3.0", "logs: /var/log/comms", sender_id="U_BOT"),
+                      msg(self.DM, "4.0", "dashboard: http://127.0.0.1:8502", sender_id="U_BOT")])
+        self.assertEqual(sched.cycle()["answered"], 2)
+        self.assertEqual(self.journal.get(self.DM, "2.0")["response_key"], "dm-reply:3.0")
+        self.assertEqual(self.journal.get(self.DM, "1.0")["response_key"], "dm-reply:4.0")
+
+    def test_a_configured_answerer_list_restricts_who_closes_an_ask(self):
+        adapter, sched = self.dm(answerers=("U_BOT",))
+        adapter.seed([msg(self.DM, "1.0", "where is the dashboard?", sender_id="U_HUMAN")])
+        sched.cycle()
+        adapter.seed([msg(self.DM, "2.0", "+1, same question", sender_id="U_BYSTANDER")])
+        self.assertEqual(sched.cycle()["answered"], 0, "an unlisted sender closed the ask")
+        adapter.seed([msg(self.DM, "3.0", "it is at http://127.0.0.1:8502", sender_id="U_BOT")])
+        self.assertEqual(sched.cycle()["answered"], 1)
+        self.assertEqual(self.journal.get(self.DM, "1.0")["response_key"], "dm-reply:3.0")
+
+    def test_the_thread_rule_shares_the_answerer_list(self):
+        """Review S8: a bystander's "+1" in the thread closes nothing once the source
+        names its answerers; the agent's reply still does."""
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg("C1", "1.0", "where is the dashboard?")])
+        sched = self.scheduler(adapter, answerers=("U_BOT",))
+        sched.cycle()
+        adapter.seed([msg("C1", "2.0", "+1 same here", sender_id="U_BYSTANDER", thread_id="1.0")])
+        self.assertEqual(sched.cycle()["answered"], 0)
+        adapter.seed([msg("C1", "3.0", "http://127.0.0.1:8502", sender_id="U_BOT", thread_id="1.0")])
+        self.assertEqual(sched.cycle()["answered"], 1)
+        self.assertEqual(self.journal.get("C1", "1.0")["response_key"], "thread-reply:3.0")
+
+    def test_a_channel_not_declared_a_dm_keeps_the_thread_rule_only(self):
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg("C1", "1.0", "where is the dashboard?", sender_id="U_HUMAN")])
+        sched = self.scheduler(adapter)
+        sched.cycle()
+        adapter.seed([msg("C1", "2.0", "it is at http://127.0.0.1:8502", sender_id="U_BOT")])
+        self.assertEqual(sched.cycle()["answered"], 0,
+                         "a top-level reply in a CHANNEL cannot be attributed to the ask")
 
 
 class ReportLinesTest(unittest.TestCase):
