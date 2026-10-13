@@ -46,7 +46,11 @@ from .store import ts_order
 # all of a source's channels). Stated rather than unbounded: one open thread is one platform
 # call, and Slack's history tier allows ~50 calls/minute — a backlog of a few hundred asks
 # would make the sweep its own outage. The window ROTATES through the open asks (callers
-# pass the `start` they got back as `next_start`), so no ask starves behind the newest 25.
+# pass the `start` they got back as `next_start`), so an ask behind the newest few is
+# reached as long as the window is wider than the arrival rate. It is a POSITION in the
+# newest-first list: a one-ask window with a new ask every cycle re-fetches the same ask
+# forever (independent review of #6, S1). A window keyed by ask ts is COMMS-79 item 18,
+# due before any deployment sweeping 25+ channels on one adapter or at ~1 call per cycle.
 SWEEP_MAX = 25
 
 # Adapters map sender-less platform rows (system notices, deleted-message tombstones, some
@@ -97,7 +101,8 @@ def sweep(adapter, store, journal, channel: str, *,
                       that answered 429 — the budget charges this, never `swept` (an
                       all-errors channel was charged nothing; review ENH-33/F2)
         next_start    the `start` for the next call — the window rotates through the
-                      open asks (newest first) so none starves behind the newest few
+                      open asks (newest first); a POSITION, so it reaches every ask only
+                      while the window is wider than the arrival rate (review #6, S1)
         replies       every reply fetched this call (re-sightings included — the
                       journal absorbs them) — journal them
         answered      [(ask_ts, reply_ts), ...] ties made this call

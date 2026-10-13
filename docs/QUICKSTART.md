@@ -367,11 +367,14 @@ surface says so instead of implying one.
   the bulk, never the whole budget, and the bulk moves between channels; a channel a cycle
   did skip (a 429, or more channels than calls) is swept first in the next and named on
   its own `sweep: SKIPPED` line; within a channel the window rotates through the open
-  asks. Window and order are stored, so `--once` runs keep them. A 429 is honoured and
-  reported, and the rest of that adapter's sweep waits for the next cycle. Slack's rate
-  tier for `conversations.replies` is far lower for commercially distributed
-  non-Marketplace apps than for an internal app, so a distributed app should expect asks
-  to close more slowly, never faster.
+  asks — as a position in the newest-first list, so at about one call per cycle with a
+  new ask arriving every cycle it can stick on one ask (COMMS-79 item 18, due before a
+  deployment sweeps 25 or more channels on one adapter or runs at that tier). Window and
+  order are stored, so `--once` runs keep them. A 429 is honoured and reported, and the
+  rest of that adapter's sweep waits for the next cycle. Slack's rate tier for
+  `conversations.replies` is far lower for commercially distributed non-Marketplace apps
+  than for an internal app, so a distributed app should expect asks to close more slowly,
+  never faster — and at about one call per cycle it needs that window fix first.
 - Five adapters ship: **`fake`** (in-memory dry-run), **`slack`** — **read-only on purpose**
   (poll / replies / resolve / health; it exposes no send path at any layer, and `tests/test_slack_adapter.py`
   fails if one appears) — **`slack_socket`** (Socket Mode push ingestion, equally
