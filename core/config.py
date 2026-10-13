@@ -46,9 +46,10 @@ VALID_POLICIES = ("never", "staged", "direct")
 _TOP_KEYS = frozenset(("engine", "instances"))
 _ENGINE_KEYS = frozenset(("state_dir", "channels_dir", "store", "journal", "outbox"))
 _INSTANCE_KEYS = frozenset(("name", "adapter", "channels", "principals", "auth",
-                            "taxonomy", "escalate_ambiguous"))
+                            "taxonomy", "escalate_ambiguous", "answerers", "send_marker"))
 _CHANNEL_KEYS = frozenset(("id", "label", "poll_interval_s", "reply_policy",
-                           "thread_reply_policy", "triggers"))
+                           "thread_reply_policy", "triggers", "kind"))
+VALID_KINDS = ("channel", "dm")
 
 # Shapes that indicate a real credential pasted where an env reference belongs.
 _SECRET_SHAPES = (
@@ -74,8 +75,15 @@ class ChannelConfig:
     # a visible behavioural difference an adopter could not previously configure.
     thread_reply_policy: str | None = None
     triggers: tuple = ()
+    # ENH-31: a 1:1 direct message has no threads in practice (measured: 535 DMs, 0
+    # in-thread), so its answered-state and the placement of a reply follow different
+    # rules. None means "infer from the platform id": Slack DM ids start with D.
+    kind: str | None = None
 
     def __post_init__(self):
+        if self.kind is not None and self.kind not in VALID_KINDS:
+            raise ConfigError(
+                f"channel {self.id}: kind {self.kind!r} is not one of {VALID_KINDS}")
         declared = [("reply_policy", self.reply_policy)]
         if self.thread_reply_policy is not None:      # absent means "as the channel"
             declared.append(("thread_reply_policy", self.thread_reply_policy))
@@ -96,6 +104,14 @@ class ChannelConfig:
             return self.reply_policy
         return {"channel": self.reply_policy, "thread": self.thread_reply_policy}
 
+    @property
+    def is_dm(self) -> bool:
+        """A 1:1 direct message: declared `kind: dm`, or — with no declaration — a
+        Slack-shaped id starting with D (C = public, G = private, D = im)."""
+        if self.kind is not None:
+            return self.kind == "dm"
+        return self.id.startswith("D")
+
 
 @dataclass
 class InstanceConfig:
@@ -109,6 +125,17 @@ class InstanceConfig:
     # (owed:operator) instead of only logging them. Default off: the safe direction is
     # unchanged behaviour plus the journal's visible hedge count.
     escalate_ambiguous: bool = False
+    # ENH-31: who may close an ask. Empty means today's rule — any non-asker whose
+    # reply is not itself an ask; the other party of a DM by default. Set it to the
+    # agent's bot user id (and the operators) so a bystander's "+1" closes nothing.
+    answerers: tuple = ()
+    # ENH-31: the prefix every message this instance sends must start with; a send
+    # without it is refused before the INTENT flip (operator decision 2026-10-13: every
+    # sender carries the same guards). None means no marker is required.
+    send_marker: str | None = None
+
+    def dm_channels(self) -> tuple:
+        return tuple(c.id for c in self.channels if c.is_dm)
 
     def policies(self) -> dict:
         """target id -> policy, for core.outbox. Absent targets are denied by default."""
@@ -331,7 +358,8 @@ def from_dict(raw: dict, base_dir: str | Path, env: dict | None = None) -> Engin
                 poll_interval_s=int(ch.get("poll_interval_s", 60)),
                 reply_policy=ch.get("reply_policy", "never"),   # DEFAULT DENY
                 thread_reply_policy=ch.get("thread_reply_policy"),
-                triggers=tuple(ch.get("triggers", ()))))
+                triggers=tuple(ch.get("triggers", ())),
+                kind=ch.get("kind")))
         auth = {k: resolve_secret(v, env) for k, v in (spec.get("auth") or {}).items()}
         esc = spec.get("escalate_ambiguous", False)
         if not isinstance(esc, bool):
@@ -340,11 +368,26 @@ def from_dict(raw: dict, base_dir: str | Path, env: dict | None = None) -> Engin
             raise ConfigError(
                 f"instance {name!r}: escalate_ambiguous must be a JSON boolean "
                 f"(true/false), got {esc!r}")
+        answerers = spec.get("answerers", ())
+        if (not isinstance(answerers, (list, tuple))
+                or not all(isinstance(a, str) and a.strip() for a in answerers)):
+            # A quoted single id, or an empty string, would silently credit nobody —
+            # the inert-key shape again, on the one list that closes asks.
+            raise ConfigError(
+                f"instance {name!r}: answerers must be a JSON list of non-empty sender "
+                f"ids, got {answerers!r}")
+        marker = spec.get("send_marker")
+        if marker is not None and (not isinstance(marker, str) or not marker.strip()):
+            raise ConfigError(
+                f"instance {name!r}: send_marker must be a non-empty string (the prefix "
+                f"every sent message must start with), got {marker!r}")
         instances.append(InstanceConfig(
             name=name, adapter=adapter, channels=tuple(channels),
             principals=tuple(spec.get("principals", ())), auth=auth,
             taxonomy=spec.get("taxonomy", {}) or {},
-            escalate_ambiguous=esc))
+            escalate_ambiguous=esc,
+            answerers=tuple(a.strip() for a in answerers),
+            send_marker=marker.strip() if marker is not None else None))
 
     if not instances:
         raise ConfigError("no instances configured — the engine would poll nothing")

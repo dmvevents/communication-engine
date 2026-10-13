@@ -33,6 +33,7 @@ went quiet.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import urllib.error
@@ -42,7 +43,30 @@ import urllib.request
 from core.ratelimit import RateLimited
 
 API_BASE = "https://slack.com/api"
+API_BASE_ENV = "COMMS_SLACK_API_BASE"
 PAGE_LIMIT = 200          # Slack's recommended per-page maximum for history/list reads
+
+
+def api_base(env=None) -> str:
+    """The Web API base: Slack's, unless COMMS_SLACK_API_BASE names a LOOPBACK stub.
+
+    The override exists so the whole poll / sweep / send / read-back path can be
+    exercised against a local stub in tests (ENH-31 C) — never to point a live adapter
+    at a third host. So anything but http://127.0.0.1:<port> or http://localhost:<port>
+    (no path, query, or credentials) is refused by name at construction, before any
+    I/O: a workspace token must not be sendable to an address an env var chose.
+    """
+    value = (os.environ if env is None else env).get(API_BASE_ENV, "")
+    if not value:
+        return API_BASE
+    u = urllib.parse.urlparse(value)
+    if (u.scheme != "http" or u.hostname not in ("127.0.0.1", "localhost")
+            or not u.port or u.path not in ("", "/") or u.query or u.fragment
+            or u.username is not None):
+        raise ValueError(
+            f"{API_BASE_ENV} must be http://127.0.0.1:<port> or http://localhost:<port> — "
+            f"a loopback stub for tests, never a third host; refusing {value!r}")
+    return f"http://{u.hostname}:{u.port}"
 
 # Deny-by-default: everything this adapter is allowed to call, exhaustively. Extending
 # the adapter means extending this list IN THE SAME DIFF as the test that uses it.
@@ -114,8 +138,10 @@ def _attachments(m):
 
 
 class Adapter:
-    def __init__(self, auth=None, http=None, clock=None):
+    def __init__(self, auth=None, http=None, clock=None, env=None):
         auth = auth or {}
+        # Resolved at construction so a refused override never reaches _api (ENH-31 C).
+        self._api_base = api_base(env)
         self._token = auth.get("token")
         if not self._token:
             # Same load-time refusal rule as core/config.py: half-configured is the
@@ -198,7 +224,7 @@ class Adapter:
     def _api(self, method, timeout=30.0, **params):
         if method not in READ_METHODS:
             raise ReadOnlyViolation(method)
-        status, headers, body = self.http(f"{API_BASE}/{method}", params, timeout)
+        status, headers, body = self.http(f"{self._api_base}/{method}", params, timeout)
         try:
             payload = json.loads(body) if body else {}
         except ValueError:

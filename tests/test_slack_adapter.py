@@ -130,6 +130,42 @@ class ContractSurfaceTest(SlackAdapterTestCase):
         self.assertIn("channels", str(ctx.exception))
 
 
+class ApiBaseTest(SlackAdapterTestCase):
+    """COMMS_SLACK_API_BASE points the adapter at a LOOPBACK stub for hermetic tests
+    (ENH-31 C). The default is unchanged; anything but http://127.0.0.1:<port> or
+    http://localhost:<port> is refused at construction, by name, before any I/O — the
+    override must never become a way to send a workspace token to a third host."""
+
+    def make_env(self, env, script=()):
+        self.http = FakeHttp(script)
+        return self.mod.Adapter(auth={"token": "tok", "channels": "C_ONE"},
+                                http=self.http, env=env)
+
+    def test_the_default_base_is_slack(self):
+        a = self.make_env({}, [(200, {}, {"ok": True})])
+        a._api("auth.test")
+        self.assertEqual(self.http.requests[0][0], "https://slack.com/api/auth.test")
+
+    def test_a_loopback_base_is_used_for_every_call(self):
+        a = self.make_env({"COMMS_SLACK_API_BASE": "http://127.0.0.1:18999"},
+                          [(200, {}, {"ok": True})])
+        a._api("auth.test")
+        self.assertEqual(self.http.requests[0][0], "http://127.0.0.1:18999/auth.test")
+        a = self.make_env({"COMMS_SLACK_API_BASE": "http://localhost:18999/"},
+                          [(200, {}, {"ok": True})])
+        a._api("auth.test")
+        self.assertEqual(self.http.requests[0][0], "http://localhost:18999/auth.test")
+
+    def test_a_non_loopback_base_is_refused_by_name_before_any_io(self):
+        for bad in ("http://10.0.0.5:8080", "https://127.0.0.1:18999", "http://evil.example",
+                    "http://127.0.0.1", "http://127.0.0.1:1/api", "http://u@127.0.0.1:1",
+                    "http://127.0.0.1:1/?x=1", "ftp://127.0.0.1:1"):
+            with self.assertRaises(ValueError, msg=bad) as ctx:
+                self.make_env({"COMMS_SLACK_API_BASE": bad})
+            self.assertIn("COMMS_SLACK_API_BASE", str(ctx.exception))
+            self.assertEqual(self.http.requests, [], "a refused base still caused I/O")
+
+
 class ReadOnlyTransportTest(SlackAdapterTestCase):
     """Deny-by-default at the layer every request must pass through. Without this, the
     no-send property above is one convenience wrapper away from being lost."""

@@ -2795,6 +2795,47 @@ run_mutation "dashboard: html_text keeps a bare carriage return (CR CR is a blan
   "('    return html.escape(text or \"\").replace(\"\\\\r\", \"\").replace(\"\\\\n\", \"<br>\")', '    return html.escape(text or \"\").replace(\"\\\\n\", \"<br>\")')" \
   "test_dashboard"
 
+# ---- ENH-31 slice C: the loopback-only API base, the payload scan, the config keys ----
+run_mutation "slack: a non-loopback COMMS_SLACK_API_BASE is accepted" \
+  "channels/slack/adapter.py" \
+  "('    if (u.scheme != \"http\" or u.hostname not in (\"127.0.0.1\", \"localhost\")\n            or not u.port or u.path not in (\"\", \"/\") or u.query or u.fragment\n            or u.username is not None):', '    if False:')" \
+  "test_slack_adapter"
+
+run_mutation "slack_socket: a non-loopback COMMS_SLACK_API_BASE is accepted" \
+  "channels/slack_socket/adapter.py" \
+  "('    if (u.scheme != \"http\" or u.hostname not in (\"127.0.0.1\", \"localhost\")\n            or not u.port or u.path not in (\"\", \"/\") or u.query or u.fragment\n            or u.username is not None):', '    if False:')" \
+  "test_socket_adapter"
+
+run_mutation "redact: the payload scan finds nothing" \
+  "core/redact.py" \
+  "('    return [name for name, pat in BLOCK_PATTERNS if pat.search(text)]', '    return []')" \
+  "test_redact"
+
+run_mutation "redact: the private-key class is dropped" \
+  "core/redact.py" \
+  "('    (\"private-key\", re.compile(\"BEGIN [A-Z ]*PRIV\" + \"ATE KEY\")),', '')" \
+  "test_redact"
+
+run_mutation "config: an unknown channel kind is accepted" \
+  "core/config.py" \
+  "('        if self.kind is not None and self.kind not in VALID_KINDS:', '        if False:')" \
+  "test_config"
+
+run_mutation "config: a DM is never inferred from the platform id" \
+  "core/config.py" \
+  "('        return self.id.startswith(\"D\")', '        return False')" \
+  "test_config"
+
+run_mutation "config: answerers accept a bare string (crediting nobody)" \
+  "core/config.py" \
+  "('        if (not isinstance(answerers, (list, tuple))\n                or not all(isinstance(a, str) and a.strip() for a in answerers)):', '        if False:')" \
+  "test_config"
+
+run_mutation "config: an empty send_marker is accepted" \
+  "core/config.py" \
+  "('        if marker is not None and (not isinstance(marker, str) or not marker.strip()):', '        if False:')" \
+  "test_config"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }

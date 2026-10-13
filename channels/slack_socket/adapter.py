@@ -62,7 +62,27 @@ import urllib.request
 from core.ratelimit import RateLimited
 
 API_BASE = "https://slack.com/api"
+API_BASE_ENV = "COMMS_SLACK_API_BASE"
 OPEN_METHOD = "apps.connections.open"
+
+
+def api_base(env=None) -> str:
+    """The Web API base: Slack's, unless COMMS_SLACK_API_BASE names a LOOPBACK stub —
+    the same rule, word for word, as channels/slack/adapter.api_base (ENH-31 C): only
+    http://127.0.0.1:<port> or http://localhost:<port>, refused by name at construction
+    before any I/O, so an app-level token can never be sent to an address an env var
+    chose. Duplicated rather than imported because adapters are independent dir-drops."""
+    value = (os.environ if env is None else env).get(API_BASE_ENV, "")
+    if not value:
+        return API_BASE
+    u = urllib.parse.urlparse(value)
+    if (u.scheme != "http" or u.hostname not in ("127.0.0.1", "localhost")
+            or not u.port or u.path not in ("", "/") or u.query or u.fragment
+            or u.username is not None):
+        raise ValueError(
+            f"{API_BASE_ENV} must be http://127.0.0.1:<port> or http://localhost:<port> — "
+            f"a loopback stub for tests, never a third host; refusing {value!r}")
+    return f"http://{u.hostname}:{u.port}"
 
 # Event-only wrappers that never appear as rows in conversations.history: ingesting
 # one creates a row the poll side can never confirm — a PERMANENT parity divergence.
@@ -303,8 +323,9 @@ class _WebSocketConnection:
 # ---------------------------------------------------------------------------
 
 class Adapter:
-    def __init__(self, auth=None, http=None, connect=None, clock=None):
+    def __init__(self, auth=None, http=None, connect=None, clock=None, env=None):
         auth = auth or {}
+        self._api_base = api_base(env)      # refused here, never in _connections_open
         self._token = auth.get("app_token")
         if not self._token:
             raise ValueError("slack_socket adapter: auth['app_token'] is missing — "
@@ -548,7 +569,7 @@ class Adapter:
 
     # ---- transport ----------------------------------------------------------
     def _connections_open(self, timeout=30.0):
-        status, headers, body = self.http(f"{API_BASE}/{OPEN_METHOD}", {}, timeout)
+        status, headers, body = self.http(f"{self._api_base}/{OPEN_METHOD}", {}, timeout)
         try:
             payload = json.loads(body) if body else {}
         except ValueError:

@@ -117,6 +117,12 @@ class Source:
     # only logging them. Per source, like the taxonomy: whether hedges deserve human
     # eyes depends on the channel's vocabulary and traffic, not on the engine.
     escalate_ambiguous: bool = False
+    # ENH-31: who may close an ask (empty = any non-asker whose reply is not an ask),
+    # shared by the thread rule and the DM rule; and which channels are 1:1 DMs, where
+    # a TOP-LEVEL message from an answerer closes the ask (DMs have no threads in
+    # practice: measured 535 DM messages, 0 in-thread).
+    answerers: tuple = ()
+    dm_channels: tuple = ()
 
 
 class Scheduler:
