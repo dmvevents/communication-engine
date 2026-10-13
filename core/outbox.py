@@ -667,7 +667,25 @@ class Outbox:
                     # Placement comes from the ROW, never from a caller: resuming a
                     # thread reply as a top-level post would break the thread-only
                     # policy after the fact, in public, with no second chance.
-                    receipt = self._deliver(target, row["text"], key, row["thread_id"])
+                    try:
+                        receipt = self._deliver(target, row["text"], key, row["thread_id"])
+                    except (RateLimited, NotPosted, SendBlocked):
+                        # SendBlocked here is _deliver's own refusal BEFORE the adapter (an
+                        # unplaceable thread reply, review D1): nothing was posted, nothing
+                        # to record — the row stays INTENT and is reported by key.
+                        raise
+                    except Exception as ex:  # noqa: BLE001
+                        if getattr(ex, "may_have_landed", True):
+                            # An ambiguous answer to the re-send (internal_error, a 5xx):
+                            # the post MAY have landed, so the re-send is recorded NOW, or
+                            # a platform that keeps no metadata would be posted to on every
+                            # run (round 4, R4-2). The next run proves it or parks it.
+                            self._write(key, resent_at=time.time(), state=SENT)
+                            raise
+                        # A definite refusal the adapter's allowlist did not know: the
+                        # read-back just proved the key absent, so nothing is posted — hand
+                        # the row back like any refusal (round 4, R4-1).
+                        raise NotPosted(f"re-send refused: {ex}") from ex
                     # The ONE permitted re-send is recorded with its receipt, and the row is
                     # SENT like the live path's: a later run that still finds no key parks
                     # it instead of posting a third copy (R2-6). Recorded AFTER the post,
@@ -854,9 +872,13 @@ class Outbox:
         self._check_placement(row["thread_id"], ReleaseError,
                               " — the draft stays STAGED; it can only be discarded")
         # ENH-31: the text guards again (a marker configured after staging, a draft
-        # written by older code), then the pre-send re-read — all before the flip.
+        # written by older code), then the pre-send re-read — all before the flip. The
+        # re-approval of an UNPROVEN row skips the re-read: the human's "I looked; it is not
+        # there" IS the re-read, and the platform may hold the engine's own metadata-less
+        # earlier post, which the re-read could only ever name (round 4, R4-4).
         self._check_payload(row["text"], ReleaseError)
-        self._check_newest(row)
+        if from_state != UNPROVEN:
+            self._check_newest(row)
         # Policy is re-resolved at the CLICK, not inherited from staging time: a
         # channel demoted to 'never' since the draft was written must refuse the
         # send, however long the draft sat at the gate.
@@ -878,8 +900,10 @@ class Outbox:
             # human to click again or discard — such a reply used to strand in INTENT with
             # no Send and no Discard (review N4, round 2 R2-8). The swap is conditional on
             # INTENT: a 429 on the READ-BACK, after the post landed, finds the row SENT and
-            # leaves it there, or the next click would post a duplicate.
-            self._claim(key, INTENT, STAGED)
+            # leaves it there, or the next click would post a duplicate. A re-approved
+            # UNPROVEN row goes back to UNPROVEN, keeping the record that the platform may
+            # already hold it (round 4, R4-8).
+            self._claim(key, INTENT, from_state)
             raise
 
     def discard(self, key: str) -> dict:
@@ -897,12 +921,14 @@ class Outbox:
                 f"{self.get(key)['state']}")
         return {"key": key, "receipt": None, "state": DISCARDED}
 
-    def settle(self, key: str) -> dict:
+    def settle(self, key: str, delivered: bool = False) -> dict:
         """A human looked at the platform and settled a MISMATCH or UNPROVEN row — edited
         or deleted the mangled post, found the reply there after all, or decided it is not
         needed. Terminal and kept (SETTLED); the row leaves triage (round 3, R3-7). Only
         FROM a parked state: a draft is discarded, a delivered row is done, and 'settling'
-        either would misrecord it."""
+        either would misrecord it. `delivered` is the human's reason, echoed back so the
+        surface can tie the ask (the reply IS there) or close it as not needed — settling
+        the row alone left the ask unanswered and its owed work open (round 4, R4-5)."""
         row = self.get(key)
         if row is None:
             raise ReleaseError(f"no outbox row {key!r} to settle")
@@ -910,7 +936,8 @@ class Outbox:
             raise ReleaseError(
                 f"only an UNPROVEN or MISMATCH row can be settled; {key!r} is "
                 f"{self.get(key)['state']}")
-        return {"key": key, "receipt": row["receipt"], "state": SETTLED}
+        return {"key": key, "receipt": row["receipt"], "state": SETTLED,
+                "delivered": bool(delivered)}
 
     def close(self):
         self.conn.close()

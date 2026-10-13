@@ -336,15 +336,15 @@ the marker is how a reader and the other senders' dedupe tell the engine's messa
 (it must be followed by a space or the end of the text, so `[AGENT]glued` and another
 sender's `[AGENT-OTHER]` do not pass); (2) the click **re-reads** the channel or thread and
 refuses, with who and when ("re-read first"), when anything the human has NOT seen has
-arrived — the baseline is the newest OPEN ASK the page listed for that conversation when the
-draft was staged, and at least the ask being answered (the page lists open asks and never
-statements, so a polled "never mind" is unseen and refuses; the journal also lags the
-platform by a poll, so a message the platform holds but no page displayed refuses; a thread
-reply is baselined on the ask itself, since the page shows the ask and never the thread; a
-draft minted by code without a page records the platform's newest), compared platform clock
-against platform clock, with the engine's own earlier posts never counting; staging the same
-text again after a refusal is the acknowledgement, and it advances the baseline exactly to
-the message the refusal named — a later arrival refuses again; (3) a text over
+arrived — a Reply is baselined on the ASK BEING ANSWERED and nothing later (the page lists
+open asks and never statements, so a "never mind" after the ask is unseen and refuses,
+whether or not a newer ask follows it; the journal also lags the platform by a poll, so a
+message the platform holds but no page displayed refuses; a thread reply is baselined on the
+ask itself, not its root; a free compose on the newest open ask the page lists; a draft
+minted by code without a page records the platform's newest), compared platform clock against
+platform clock, with the engine's own earlier posts never counting; staging the same text
+again after a refusal is the acknowledgement, and it advances the baseline exactly to the
+message the refusal named — a later arrival refuses again; (3) a text over
 3,500 characters is refused — Slack silently splits at 4,000 and returns one ts; the guard
 counts the approved text as typed, and whether Slack's split counts the stored,
 entity-escaped form is unverified against the platform, which is what the 500-character
@@ -357,28 +357,37 @@ message carrying the key with other text parks the row as `MISMATCH` — never r
 never committed, and the card says a human must look; no message carrying the key leaves
 the row SENT for `Outbox.recover()`, which re-sends a key the platform does not hold **at
 most once per completed run** (a crash between the re-send and its record can add one more),
-leaves the re-send SENT for the next run to prove, and parks as `UNPROVEN` a row the platform
-still shows no key for on that next run, a row whose target is gone (the thread's parent
-deleted, the channel archived), or an unproven earlier post the platform refuses to re-send —
-while a transient outage is retried, never parked and never posted. It isolates each row,
-honours the bot-token rule, bounds its restart search by the platform ts the human saw, and
-stops on a 429. A 429 on the post itself, or a DEFINITE refusal of the post from the
-adapter's allowlist (`not_in_channel`, `is_archived`, `msg_too_long`, ...), hands the draft
-back to the gate as STAGED, because nothing was posted; an ambiguous answer (`internal_error`,
-a gateway 5xx) leaves the row in flight for recovery's read-back, because the post may have
-landed. `MISMATCH` and `UNPROVEN` rows are triage on the read-only page ("unresolved send",
-right after in-flight sends) and a card on the write surface with two actions: **Settled on
-the platform** (the row is kept as `SETTLED` and leaves triage) and, for `UNPROVEN` only,
-**Send again** once the human has looked and found nothing — one more post through the same
-guards. A stale Send button on a parked row sends nothing and says so.
+records that re-send even when its answer is ambiguous (the post may have landed), leaves it
+SENT for the next run to prove, and parks as `UNPROVEN` a row the platform still shows no key
+for on that next run, a row whose target is gone (the thread's parent deleted, the channel
+archived), or an unproven earlier post the platform refuses to re-send — while a transient
+outage is retried, never parked and never posted. It isolates each row, honours the
+bot-token rule, bounds its restart search by the platform ts the human saw, and stops on a
+429. A 429 on the post itself, or a DEFINITE refusal of the post from the adapter's allowlist
+(`not_in_channel`, `is_archived`, `msg_too_long`, ...), hands the draft back to the gate as
+STAGED, because nothing was posted; an ambiguous answer (`internal_error`, a gateway 5xx)
+leaves the row in flight for recovery's read-back, because the post may have landed; a
+refusal the allowlist does not know keeps the row in flight at the click, and recovery hands
+it back once its own read-back has proven the key absent. `MISMATCH` and `UNPROVEN` rows are
+triage on the read-only page ("unresolved send", right after in-flight sends) and a card on
+the write surface with three actions: **Settled: the reply is there** (the row is kept as
+`SETTLED`, leaves triage, and the ask is recorded as answered by it), **Settled: not needed**
+(the row is kept, the ask is closed as not needed), and, for `UNPROVEN` only, **Send again**
+once the human has looked and found nothing — one more post through the same guards except
+the re-read, because that click IS the re-read (the platform may hold the engine's own
+metadata-less post, which the re-read could only ever name); a 429 or a refusal of that post
+leaves the row `UNPROVEN`. A stale Send button on a parked row sends nothing and says so.
 Placement is the surface's routing rule, not a refusal: in the ask's thread in a channel,
 top-level in a 1:1 direct message (a channel declared `kind: dm`, or inferred from a
 Slack-shaped `D…` id). The outbox ladder and the surface are tested against a loopback
 Slack stub through `COMMS_SLACK_API_BASE` — which admits `http://127.0.0.1:<port>` only
 and refuses a name, a third host or a path before any I/O — and against the fake adapter;
 nothing in the suite reaches slack.com, and CI and the pre-push hook run the suite under a
-loopback-only network guard (`PYTHONPATH=tests/netguard`) that turns any attempt into a red
-test.
+loopback-only network guard (`PYTHONPATH=tests/netguard`) that turns a TCP connect, a bind to
+any non-loopback or all-interfaces address, a UDP send or a name lookup from Python into a
+refusal no `except Exception` can swallow — raw sockets, a child started with `-S`/`-I`, and
+a run without that `PYTHONPATH` are outside it, and the guard's own test fails under CI if
+the guard is not installed.
 
 Who may **close** an ask is the instance's `answerers` list (sender ids — the agent's bot
 user, the operators): with one, only their replies close OTHER people's asks, in threads

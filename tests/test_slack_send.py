@@ -241,6 +241,49 @@ class StubSend(unittest.TestCase):
         self.assertTrue(any("refuses a re-send" in why for _, why in counts["errors"]), counts["errors"])
         self.assertEqual(self.box().recover()["resumed"], 0, "parked, yet touched again")
 
+    def test_an_unlisted_refusal_is_handed_back_once_recovery_has_proven_the_key_absent(self):
+        """Review round 4 (R4-1): the allowlist of refusals cannot be complete. At the click a
+        refusal it does not know keeps the row in flight (nothing is known yet); in recovery,
+        right after a read-back proved the key absent, the same refusal of the re-send is
+        definite — the row goes back to the gate instead of being refused on every run."""
+        # a Slack-shaped refusal the allowlist does not know (any new or unlisted code)
+        self.stub.fail_always["chat.postMessage"] = "org_login_required"
+        box = self.box()
+        key = box.stage(CH, ASK_TS, TEXT, thread_id=ASK_TS)["key"]
+        with self.assertRaises(RuntimeError) as cm:
+            box.release(key)
+        self.assertEqual(type(cm.exception).__name__, "ApiError")
+        self.assertEqual(box.get(key)["state"], INTENT)
+        counts = self.box().recover()
+        self.assertEqual((self.box().get(key)["state"], self.stub.posted(CH)), (STAGED, []))
+        self.assertTrue(any("re-send refused" in why for _, why in counts["errors"]), counts["errors"])
+        self.assertEqual(self.box().recover()["resumed"], 0)
+
+    def test_an_ambiguous_answer_to_recoverys_own_re_send_is_recorded_so_the_next_run_parks(self):
+        """Review round 4 (R4-2): the re-send LANDED but Slack answered internal_error, and
+        the platform keeps no metadata. Unrecorded, every run re-sent again — unbounded
+        posting under a double fault. The re-send is recorded on an ambiguous answer, so the
+        next run parks the row: two posts in all."""
+        from core.outbox import UNPROVEN, _Crash
+        self.stub.drop_post_metadata = True
+        box = self.box()
+        key = box.stage(CH, ASK_TS, TEXT, thread_id=ASK_TS)["key"]
+        with self.assertRaises(_Crash):
+            box.release(key, _crash_at="after_intent")             # never posted at all
+        self.stub.land_and_fail_next["chat.postMessage"] = "internal_error"
+        counts = self.box().recover()                              # run 1: re-send lands, answer ambiguous
+        self.assertEqual(len(self.posts()), 1)
+        row = self.box().get(key)
+        self.assertEqual(row["state"], SENT)
+        self.assertIsNotNone(row["resent_at"], "the ambiguous re-send was not recorded")
+        self.assertTrue(any("internal_error" in why for _, why in counts["errors"]))
+        counts = self.box().recover()                              # run 2: still no key -> parked
+        self.assertEqual((self.box().get(key)["state"], counts["unproven"], len(self.posts())),
+                         (UNPROVEN, 1, 1))
+        for _ in range(3):
+            self.assertEqual(self.box().recover()["resumed"], 0)
+        self.assertEqual(len(self.posts()), 1, "recovery posted again")
+
     def test_a_crash_before_read_back_on_a_truncated_post_recovers_to_mismatch(self):
         """Review R2-7 (Y11), the restart half of F3: a new process must compare the
         approved text too, or it COMMITs the mangled post it finds by key."""

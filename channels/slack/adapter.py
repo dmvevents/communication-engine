@@ -47,7 +47,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from core.delivery import ENGINE_EVENT_TYPE, DeliveryMismatch, NotPosted, TargetGone
+from core.delivery import (AMBIGUOUS_POST_ANSWERS, ENGINE_EVENT_TYPE, DeliveryMismatch,
+                           NotPosted, TargetGone)
 from core.ratelimit import RateLimited
 
 API_BASE = "https://slack.com/api"
@@ -96,12 +97,17 @@ NOT_POSTED_ERRORS = frozenset({
     "invalid_form_data", "invalid_post_type", "missing_post_type", "user_is_bot",
     "as_user_not_supported", "team_access_not_granted", "ekm_access_denied",
     "not_authed", "invalid_auth", "account_inactive", "token_revoked", "token_expired",
-    "no_permission", "missing_scope",
+    "no_permission", "missing_scope", "not_allowed_token_type", "messages_tab_disabled",
+    "team_not_found", "posting_to_general_channel_denied",
+    "slack_connect_file_link_sharing_blocked", "slack_connect_canvas_sharing_blocked",
+    "slack_connect_lists_sharing_blocked", "slack_connect_team_blocked",
 })
 # Read-back answers that mean the target is gone for good (the thread's parent deleted,
-# the channel gone or archived): recovery parks such a row for a human at once instead of
-# retrying forever; every other read-back error is transient and retried (round 3, R3-5).
-TARGET_GONE_ERRORS = frozenset({"thread_not_found", "channel_not_found", "is_archived"})
+# the channel archived): recovery parks such a row for a human at once instead of retrying
+# forever; every other read-back error is transient and retried (round 3, R3-5).
+# channel_not_found is NOT here: Slack also answers it for a private channel the token
+# temporarily cannot see (round 4, R4-8), so it is retried like an outage.
+TARGET_GONE_ERRORS = frozenset({"thread_not_found", "is_archived"})
 
 # Deny-by-default: everything this adapter is allowed to call, exhaustively. Extending
 # the adapter means extending this list IN THE SAME DIFF as the test that uses it.
@@ -257,7 +263,13 @@ class Adapter:
                 # (review round 2, R2-8).
                 raise NotPosted(f"chat.postMessage refused by the platform: {ex.error}") from ex
             # internal_error, fatal_error, a non-JSON 5xx: the post MAY have landed. The row
-            # stays in flight and recovery's read-back decides (round 3, R3-3).
+            # stays in flight and recovery's read-back decides (round 3, R3-3). An ok:false
+            # the allowlist does not know is marked as a refusal (may_have_landed False) so
+            # that recovery, once a read-back has proven the key absent, can hand the row
+            # back instead of retrying it forever (round 4, R4-1); at the CLICK, where
+            # nothing is known yet, it still stays in flight.
+            ex.may_have_landed = (ex.error in AMBIGUOUS_POST_ANSWERS
+                                  or ex.error.startswith("HTTP "))
             raise
         ts = payload.get("ts")
         if not ts:

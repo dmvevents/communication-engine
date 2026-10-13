@@ -692,6 +692,73 @@ class SlackStubWriteSurfaceTest(_WriteSurfaceBase):
         self.assertIn("U_ASKER", flashes)
         self.assertEqual((self.rows()[0]["state"], self.stub.posted(self.DM)), ("STAGED", []))
 
+    def test_settling_a_parked_reply_as_delivered_answers_the_ask(self):
+        """Review round 4 (R4-5): settling the row alone left the ask unanswered, its owed
+        work escalating and its Reply still offered. The human's reason acts on the ask:
+        'the reply is there' ties it to this row; 'not needed' closes it as such."""
+        self.stub.truncate_posts_to = 20                            # a MISMATCH after the click
+        at = self.reply_and_stage(self.run_app(), self.REPLY)
+        at = self.buttons(at, "send-")[0].click().run()
+        (row,) = self.rows()
+        self.assertEqual((row["state"], self.responded()), ("MISMATCH", (None, None)))
+        self.assertEqual(len(self.buttons(at, "reply|")), 1, "the ask should still be open here")
+        at = self.buttons(at, f"settle-delivered-{row['key']}")[0].click().run()
+        self.assertFalse(at.exception)
+        self.assertIn("recorded as answered", "\n".join(str(x.value) for x in at.success))
+        self.assertEqual(self.rows()[0]["state"], "SETTLED")
+        self.assertEqual(self.responded()[1], row["key"], "the ask was not tied to the settled row")
+        self.assertEqual(self.buttons(at, "reply|"), [], "a settled ask still offers Reply")
+        self.assertEqual(len(self.stub.posted(self.DM)), 1)
+
+    def test_a_newer_open_ask_does_not_mask_a_statement_between_it_and_the_ask_answered(self):
+        """Review round 4 (R4-3): ask 1, then "never mind the first one", then ask 2 — all
+        journaled, the statement never listed. The reply to ask 1 is baselined on ask 1, so
+        the statement refuses the click, whatever the page lists after it."""
+        never_mind = self.stub.seed(self.DM, "never mind the first one, found it", user="U_ASKER")
+        ask2 = self.stub.seed(self.DM, "and where are the logs?", user="U_ASKER")
+        j = Journal(self.base / "state" / "journal.db")
+        j.record(self.DM, never_mind, sender_id="U_ASKER", text="never mind the first one, found it",
+                 kind="STATEMENT")
+        j.record(self.DM, ask2, sender_id="U_ASKER", text="and where are the logs?", kind="QUESTION")
+        j.close()
+        at = self.run_app()
+        reply = [b for b in self.buttons(at, "reply|") if self.ASK_TS in b.key]
+        self.assertEqual(len(reply), 1)
+        at = reply[0].click().run()
+        at.text_area[0].input(self.REPLY)
+        at = self.buttons(at, "FormSubmitter:compose")[0].click().run()
+        self.assertFalse(at.exception)
+        (row,) = self.rows()
+        self.assertEqual(row["seen_ts"], self.ASK_TS, "a newer listed ask became the baseline, "
+                                                      "masking the statement before it")
+        at = self.buttons(at, "send-")[0].click().run()
+        flashes = "\n".join(str(x.value) for x in list(at.error) + list(at.warning))
+        self.assertIn("re-read first", flashes)
+        self.assertEqual((self.rows()[0]["state"], self.stub.posted(self.DM)), ("STAGED", []))
+
+    def test_send_again_passes_when_the_conversation_moved_on_because_the_click_is_the_re_read(self):
+        """Review round 4 (R4-4): the canonical UNPROVEN row — a post the platform holds
+        without its metadata — reads as a newer message from the bot, so the re-read refused
+        "Send again" forever and its advice could not be followed. The click is the re-read."""
+        self.stub.drop_post_metadata = True
+        at = self.reply_and_stage(self.run_app(), self.REPLY)
+        at = self.buttons(at, "send-")[0].click().run()             # posts; read-back cannot prove
+        (row,) = self.rows()
+        self.assertEqual((row["state"], len(self.stub.posted(self.DM))), ("SENT", 1))
+        conn = sqlite3.connect(self.base / "state" / "outbox-team.db")
+        conn.execute("UPDATE outbox SET state='UNPROVEN', resent_at=1 WHERE key=?", (row["key"],))
+        conn.commit()
+        conn.close()
+        self.stub.drop_post_metadata = False                        # the human looked: not there
+        at = self.run_app()
+        at = self.buttons(at, f"reapprove-{row['key']}")[0].click().run()
+        self.assertFalse(at.exception)
+        flashes = "\n".join(str(x.value) for x in list(at.error) + list(at.warning))
+        self.assertNotIn("re-read first", flashes, "the human's own 'send again' was refused as unread")
+        self.assertIn("sent again and proven", "\n".join(str(x.value) for x in at.success))
+        self.assertEqual((self.rows()[0]["state"], len(self.stub.posted(self.DM))), ("COMMITTED", 2))
+        self.assertIsNotNone(self.responded()[0])
+
     def test_a_polled_statement_the_page_never_lists_still_refuses_the_click(self):
         """Review round 3 (R3-4): the page lists open asks, never statements. A polled
         "never mind, found it" was journaled, taken as the baseline, and the reply posted
@@ -1066,9 +1133,10 @@ class WriteSurfaceReviewTest(_WriteSurfaceBase):
         cards = "\n".join(str(m.value) for m in at.markdown)
         self.assertIn("UNPROVEN", cards)
         self.assertIn("send it again", cards)
-        self.assertIn("mark it settled", cards)
+        self.assertIn("settle it as delivered", cards)
+        self.assertIn("settle it as not needed", cards)
         self.assertIn("Needs a human", cards)
-        self.assertEqual((len(self.buttons(at, "settle-")), len(self.buttons(at, "reapprove-"))), (1, 1),
+        self.assertEqual((len(self.buttons(at, "settle-")), len(self.buttons(at, "reapprove-"))), (2, 1),
                          "the parked row's own actions are missing")
 
     def test_a_stale_send_on_a_parked_row_says_nothing_was_sent(self):
@@ -1106,15 +1174,15 @@ class WriteSurfaceReviewTest(_WriteSurfaceBase):
         conn.commit()
         conn.close()
         at = self.run_app()
-        self.assertEqual(len(self.buttons(at, "settle-")), 2)
+        self.assertEqual(len(self.buttons(at, "settle-")), 4, "two settle reasons per parked row")
         self.assertEqual([b.key for b in self.buttons(at, "reapprove-")], [f"reapprove-{first}"],
                          "Send again must be offered for UNPROVEN only — a MISMATCH is on the platform")
-        at = self.buttons(at, f"settle-{second}")[0].click().run()
+        at = self.buttons(at, f"settle-notneeded-{second}")[0].click().run()
         self.assertFalse(at.exception)
-        self.assertIn("settled", "\n".join(str(x.value) for x in at.success))
+        self.assertIn("not needed", "\n".join(str(x.value) for x in at.success))
         states = {r["key"]: r["state"] for r in self.rows()}
         self.assertEqual(states[second], "SETTLED")
-        self.assertEqual(len(self.buttons(at, "settle-")), 1, "a settled row still has a card")
+        self.assertEqual(len(self.buttons(at, "settle-")), 2, "a settled row still has a card")
         at = self.buttons(at, f"reapprove-{first}")[0].click().run()
         self.assertFalse(at.exception)
         self.assertIn("sent again and proven", "\n".join(str(x.value) for x in at.success))

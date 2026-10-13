@@ -13,8 +13,10 @@ invariants (`tests/test_slack_adapter.py`, `tests/test_slack_send.py`), not prom
   (a message carrying the key with other text parks the row as MISMATCH, never re-sent; a
   DEFINITE ok:false refusal of the post — the adapter's `NOT_POSTED_ERRORS` — raises
   `core.delivery.NotPosted` and the draft returns to the gate, while `internal_error`,
-  `fatal_error` and a non-JSON 5xx stay `ApiError`, the row stays in flight and recovery's
-  read-back decides, because the post may have landed) stand between any caller and
+  `fatal_error`, `service_unavailable`, `request_timeout` and a non-JSON 5xx stay `ApiError`
+  with `may_have_landed` set, the row stays in flight and recovery's read-back decides; an
+  ok:false the allowlist does not know is a refusal recovery hands back once absence is
+  proven) stand between any caller and
   `chat.postMessage`; `capabilities()["direct"]` is `false`, so a `direct` policy refuses at
   outbox construction and again at the send seam, and `capabilities()["send"]` is true for
   a bot token (`xoxb-`) only — a user token would post in a person's name, so its drafts
@@ -26,7 +28,8 @@ invariants (`tests/test_slack_adapter.py`, `tests/test_slack_send.py`), not prom
 - `COMMS_SLACK_API_BASE` points the adapter at a loopback stub for tests
   (`http://127.0.0.1:<port>` only — a name such as `localhost` resolves wherever /etc/hosts
   says, so it is refused like any third host, by name, before any I/O) — nothing in the
-  test suite reaches slack.com, enforced by the loopback-only guard in `tests/netguard`.
+  test suite reaches slack.com, enforced by the loopback-only guard in `tests/netguard`
+  (TCP, UDP and name lookups from Python; not raw sockets or `-S`/`-I` children).
 
 ## What is implemented
 
@@ -36,7 +39,7 @@ invariants (`tests/test_slack_adapter.py`, `tests/test_slack_send.py`), not prom
 | `resolve(ref)` | id → name via `conversations.info` / `users.info`; name → id by paging `conversations.list` / `users.list`. Unresolvable refs raise. |
 | `health()` | `auth.test`. Can FAIL (bad token → `auth_ok: false`; network down → `reachable: false`) and reports any active 429 hold in `detail`. |
 | `send(channel_id, text, key, thread_id?)` | one `chat.postMessage`, the outbox key in the message **metadata** (`event_type: comms_engine_reply`) so `read_back` can find it without altering the approved text; `thread_ts` places a thread reply. No guard lives here — the outbox refuses before the INTENT flip. |
-| `read_back(channel_id, key, thread_id?, text?, since?)` | three answers. True: a message carries this outbox key in its metadata and its canonical text equals the approved text (Slack escapes `&`, `<`, `>`, wraps a typed URL as `<url>` and auto-links a bare domain or an email as `<target\|label>`, so both sides are canonicalized to the content the human typed). False: no message carries the key. `core.delivery.DeliveryMismatch`: a message carries the key with other text. For a message this process posted the fetch is exact (history with `inclusive`, or the thread via `conversations.replies`, both asking for metadata); after a restart the outbox passes the row's `text` and `since` (the platform ts the human saw, else its `created_at`), and history is searched from `since` minus a margin to the end, every page. `thread_not_found`, `channel_not_found` and `is_archived` raise `core.delivery.TargetGone`, which recovery parks at once; any other error is transient and retried. |
+| `read_back(channel_id, key, thread_id?, text?, since?)` | three answers. True: a message carries this outbox key in its metadata and its canonical text equals the approved text (Slack escapes `&`, `<`, `>`, wraps a typed URL as `<url>` and auto-links a bare domain or an email as `<target\|label>`, so both sides are canonicalized to the content the human typed). False: no message carries the key. `core.delivery.DeliveryMismatch`: a message carries the key with other text. For a message this process posted the fetch is exact (history with `inclusive`, or the thread via `conversations.replies`, both asking for metadata); after a restart the outbox passes the row's `text` and `since` (the platform ts the human saw, else its `created_at`), and history is searched from `since` minus a margin to the end, every page. `thread_not_found` and `is_archived` raise `core.delivery.TargetGone`, which recovery parks at once; any other error — `channel_not_found` included, since Slack also answers it for a private channel the token temporarily cannot see — is transient and retried. |
 | `newest(channel_id, thread_id?)` | the newest top-level message, or the newest reply of a thread, that this engine did NOT post (its own carry the metadata) — the outbox's pre-send re-read, and the baseline it records when a draft is staged. |
 | `capabilities()` | `{read: true, history: true, search: false, send: <true for a bot token only>, direct: false, react: false, threads: true}` — honest, not aspirational. |
 

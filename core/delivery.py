@@ -32,6 +32,16 @@ class NotPosted(RuntimeError):
     duplicate), and only a read-back can tell, so those stay plain adapter errors."""
 
 
+# chat.postMessage answers Slack documents as possibly applied in part, plus any non-JSON or
+# 5xx body: the post MAY have landed. Every other ok:false answer is a definite refusal.
+# Shared by the adapter (which decides what to raise) and recovery (which, right after a
+# read-back proved the key absent, treats an unlisted definite refusal as one — round 4,
+# R4-1: an allowlist of refusals can never be complete, and a refusal it missed stranded an
+# approved reply in flight forever).
+AMBIGUOUS_POST_ANSWERS = frozenset({"internal_error", "fatal_error", "service_unavailable",
+                                    "request_timeout"})
+
+
 class TargetGone(RuntimeError):
     """A read-back (or re-send) failed because the target itself is gone for good: the
     thread's parent was deleted, the channel no longer exists or is archived. Recovery

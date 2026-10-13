@@ -875,6 +875,47 @@ class SendGuardsTest(unittest.TestCase):
         self.assertEqual((counts["already_delivered"], box.get(key)["state"], len(adapter.delivered)),
                          (1, COMMITTED, 1))
 
+    def test_send_again_is_the_re_read_and_a_refusal_of_it_keeps_the_row_parked(self):
+        """Review round 4 (R4-4, R4-8, W4): the canonical UNPROVEN row's own metadata-less
+        post is newer than its baseline, so the same re-read refused "Send again" forever;
+        the human's click IS the re-read. A 429 or a definite refusal of that post returns
+        the row to UNPROVEN, not to a plain draft. A MISMATCH row is never re-approved."""
+        from core.delivery import NotPosted
+        from core.outbox import MISMATCH, UNPROVEN
+        self.adapter.latest = {"ts": "100.0", "sender_id": "U_ASKER"}
+        box = self.box()
+        key = box.stage(TARGET, TS, self.MARKED)["key"]
+        box.conn.execute("UPDATE outbox SET state='UNPROVEN' WHERE key=?", (key,))
+        box.conn.commit()
+        self.adapter.latest = {"ts": "101.0", "sender_id": "U_BOT"}     # our own metadata-less post
+
+        class RefusesOnce(GuardedFake):
+            def __init__(self):
+                super().__init__()
+                self.refuse = True
+
+            def send(self, target, text, key=None, thread_id=None):
+                if self.refuse:
+                    self.refuse = False
+                    raise NotPosted("chat.postMessage refused by the platform: not_in_channel")
+                return super().send(target, text, key=key, thread_id=thread_id)
+        adapter = RefusesOnce()
+        adapter.latest = {"ts": "101.0", "sender_id": "U_BOT"}
+        box = self.box(adapter=adapter)
+        with self.assertRaises(NotPosted):
+            box.release(key, reapprove=True)
+        self.assertEqual((box.get(key)["state"], adapter.delivered), (UNPROVEN, []),
+                         "a refused re-approval turned the parked row into a plain draft")
+        self.assertEqual(box.release(key, reapprove=True)["state"], COMMITTED,
+                         "the re-read refused the human's own 'send again'")
+        self.assertEqual(len(adapter.delivered), 1)
+        key2 = box.stage(TARGET, "2.0", self.MARKED)["key"]
+        box.conn.execute("UPDATE outbox SET state='MISMATCH' WHERE key=?", (key2,))
+        box.conn.commit()
+        res = box.release(key2, reapprove=True)
+        self.assertEqual((res.get("unresolved"), res["state"], len(adapter.delivered)),
+                         (True, MISMATCH, 1), "a MISMATCH row was re-sent on re-approval")
+
     def test_settle_and_reapprove_are_the_human_exits_from_a_parked_row(self):
         """Review round 3 (R3-6, R3-7): a plain click on a parked row sends nothing and says
         'unresolved'; settle() retires it (SETTLED, kept, no longer triage) from UNPROVEN or

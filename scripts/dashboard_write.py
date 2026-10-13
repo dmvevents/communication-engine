@@ -134,18 +134,20 @@ def _seen_ts_for(cfg, channel_id, thread, ask_ts=None):
     conversation they are answering (review round 2, R2-5: the outbox's own fallback is
     the platform's newest at staging time, which may be a message no page displayed).
 
-    The page lists OPEN ASKS — never statements, which are journaled but routed `logged`
-    and not shown (round 3, R3-4: the newest journaled row took a polled "never mind" as
-    seen). So a top-level reply is baselined on the newest open ask the page lists for the
-    channel, and at least on the ask being answered; a thread reply on the ask itself (the
-    page shows the ask and never the thread, so any later reply in the thread is unseen and
-    the first click names it — round 3, R3-8: baselining on the root named the very ask
-    being answered). None (the outbox falls back to the platform) only for a free compose
-    with no journal yet."""
+    A Reply is baselined on the ASK BEING ANSWERED, and nothing later: the page lists open
+    asks, never statements, so a "never mind" after the ask is unseen whether or not a newer
+    ask follows it (round 3 R3-4, round 4 R4-3 — taking the newest listed ask as the baseline
+    let a statement between two asks pass); a thread reply likewise on the ask itself, not
+    its root (round 3, R3-8). The click then refuses once, naming the newest later message,
+    and the acknowledgement covers exactly that. A free compose has no ask: the newest open
+    ask the page lists for the channel is the baseline, or None (the outbox falls back to the
+    platform) with no journal yet."""
+    if ask_ts is not None:
+        return str(ask_ts)
     if thread is not None:
-        return str(ask_ts) if ask_ts is not None else str(thread)
+        return str(thread)
     if not Path(cfg.journal_path).is_file():
-        return str(ask_ts) if ask_ts is not None else None
+        return None
     conn = open_ro(cfg.journal_path)
     try:
         marks = ",".join("?" * len(ACTIONABLE_KINDS))
@@ -154,15 +156,7 @@ def _seen_ts_for(cfg, channel_id, thread, ask_ts=None):
             "ORDER BY CAST(ts AS REAL) DESC LIMIT 1", (channel_id, *ACTIONABLE_KINDS)).fetchone()
     finally:
         conn.close()
-    newest_listed = str(row[0]) if row else None
-    if ask_ts is None:
-        return newest_listed
-    if newest_listed is None:
-        return str(ask_ts)
-    try:
-        return newest_listed if float(newest_listed) > float(ask_ts) else str(ask_ts)
-    except (TypeError, ValueError):
-        return str(ask_ts)
+    return str(row[0]) if row else None
 
 
 def _adapter_for(cfg, inst):
@@ -568,9 +562,14 @@ def _reapprove_clicked(inst_name, key):
             outbox.close()
 
 
-def _settle_clicked(inst_name, key):
-    """The card's "settled": the human looked at the platform and resolved it there. The
-    row is kept as SETTLED and leaves triage (round 3, R3-7). Needs no adapter."""
+def _settle_clicked(inst_name, key, delivered):
+    """The card's two "settled" buttons: the human looked at the platform and either found
+    the reply THERE (`delivered`: the ask is tied to this row, as a proven send would have
+    tied it) or decided it is NOT needed (the ask is closed as such, under a key that says
+    so). Either way the row is kept as SETTLED and leaves triage, and the ask leaves the
+    unanswered queue on the human's decision — settling the row alone left the ask open,
+    its owed work escalating and its Reply still offered (round 3 R3-7, round 4 R4-5). Needs
+    no adapter."""
     try:
         cfg = _fresh_cfg()
     except ConfigError as ex:
@@ -584,9 +583,14 @@ def _settle_clicked(inst_name, key):
     outbox = None
     try:
         outbox = _outbox_for(cfg, inst, _NoAdapter())
-        res = outbox.settle(key)
-        _push_flash("success", f"settled — kept in the outbox as {res['state']}, no longer "
-                               "listed; nothing was sent")
+        res = outbox.settle(key, delivered=delivered)
+        row = outbox.get(key)
+        tied = _tie_or_warn(cfg, row, key if delivered else f"settled-not-needed:{key}")
+        what = ("the reply is on the platform — the ask is recorded as answered by it"
+                if delivered else "not needed — the ask is closed as such")
+        _push_flash("success", f"settled ({what}); kept in the outbox as {res['state']}, no "
+                               f"longer listed; nothing was sent"
+                               + ("" if tied is None else f"; ask {tied} closed"))
     except ReleaseError as ex:
         _push_flash("error", f"refused: {ex}")
     except Exception as ex:  # noqa: BLE001
@@ -795,9 +799,11 @@ def render(cfg):
                        "showed no message carrying its key on the run after its one re-send, "
                        "or the target is gone, or an unproven post could not be re-sent. "
                        "Nothing more is sent by itself and nothing is recorded as answered. "
-                       "Look for the text above on the platform: if it is there, or no longer "
-                       "needed, mark it settled; if it is not there and still needed, send "
-                       "it again. Needs a human.")
+                       "Look for the text above on the platform: if it is there, settle it as "
+                       "delivered (the ask is then answered by it); if it is not needed, settle "
+                       "it as not needed (the ask is closed); if it is not there and still "
+                       "needed, send it again — that click counts as your re-read. Needs a "
+                       "human.")
             st.markdown(
                 "<div style='border:1px solid rgba(128,128,128,.3);border-left:"
                 "3px solid #8f1d1d;border-radius:8px;padding:10px 14px;margin:2px 0'>"
@@ -807,13 +813,15 @@ def render(cfg):
                 f"{html_text(row['text'])}</div>"
                 f"<div style='color:#8f1d1d;font-size:.85rem;margin-top:4px'>{why}</div></div>",
                 unsafe_allow_html=True)
-            again, settle = st.columns([1, 1])
+            again, there, gone = st.columns([1, 1, 1])
             if row["state"] == UNPROVEN and inst_no_send is None:
                 again.button("Send again (I looked; it is not there)",
                              key=f"reapprove-{row['key']}", on_click=_reapprove_clicked,
                              args=(inst.name, row["key"]))
-            settle.button("Settled on the platform", key=f"settle-{row['key']}",
-                          on_click=_settle_clicked, args=(inst.name, row["key"]))
+            there.button("Settled: the reply is there", key=f"settle-delivered-{row['key']}",
+                         on_click=_settle_clicked, args=(inst.name, row["key"], True))
+            gone.button("Settled: not needed", key=f"settle-notneeded-{row['key']}",
+                        on_click=_settle_clicked, args=(inst.name, row["key"], False))
     if not any_staged:
         st.markdown("_no drafts at the gate_")
 

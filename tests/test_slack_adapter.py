@@ -307,18 +307,22 @@ class SendTest(SlackAdapterTestCase):
                 self.assertNotIsInstance(cm.exception, NotPosted)
 
     def test_a_gone_target_on_read_back_is_target_gone_and_an_outage_is_not(self):
-        """Review round 3 (R3-5): thread_not_found / channel_not_found / is_archived mean the
-        reply can never be placed — recovery parks on them; anything else is transient."""
+        """Review round 3 (R3-5): thread_not_found / is_archived mean the reply can never be
+        placed — recovery parks on them; anything else is transient, channel_not_found
+        included, since Slack also answers it for a private channel the token temporarily
+        cannot see (round 4, R4-8)."""
         from core.delivery import TargetGone
-        for error in ("thread_not_found", "channel_not_found", "is_archived"):
+        for error in ("thread_not_found", "is_archived"):
             with self.subTest(error=error):
                 a = self.make([(200, {}, {"ok": False, "error": error})])
                 with self.assertRaises(TargetGone):
                     a.read_back("C_ONE", "k9", thread_id="1.0")
-        a = self.make([(200, {}, {"ok": False, "error": "service_unavailable"})])
-        with self.assertRaises(self.mod.ApiError) as cm:
-            a.read_back("C_ONE", "k9", thread_id="1.0")
-        self.assertNotIsInstance(cm.exception, TargetGone)
+        for error in ("service_unavailable", "channel_not_found"):
+            with self.subTest(error=error):
+                a = self.make([(200, {}, {"ok": False, "error": error})])
+                with self.assertRaises(self.mod.ApiError) as cm:
+                    a.read_back("C_ONE", "k9", thread_id="1.0")
+                self.assertNotIsInstance(cm.exception, TargetGone)
 
     def test_a_thread_read_back_asks_for_message_metadata(self):
         """Review F2: conversations.replies serves metadata only when asked, exactly like

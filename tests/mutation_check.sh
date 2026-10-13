@@ -3057,7 +3057,7 @@ run_mutation "dashboard_write: a MISMATCH is flashed as a refusal (the surface's
 
 run_mutation "outbox: a 429 on the click strands the approved draft in INTENT" \
   "core/outbox.py" \
-  "('            self._claim(key, INTENT, STAGED)\\n            raise', '            raise')" \
+  "('            self._claim(key, INTENT, from_state)\\n            raise', '            raise')" \
   "test_outbox_write"
 
 run_mutation "outbox: the seam accepts any policy value that is not never as a send" \
@@ -3222,7 +3222,7 @@ run_mutation "outbox: the restart search is bounded by the host clock again" \
 
 run_mutation "outbox: a refused post strands the approved draft in INTENT" \
   "core/outbox.py" \
-  "('        except (RateLimited, NotPosted):', '        except RateLimited:')" \
+  "('        except (RateLimited, NotPosted):\\n            # A 429, or an ok:false refusal of the post itself', '        except RateLimited:\\n            # A 429, or an ok:false refusal of the post itself')" \
   "test_slack_send"
 
 run_mutation "outbox: recovery's refused re-send strands the row" \
@@ -3232,7 +3232,7 @@ run_mutation "outbox: recovery's refused re-send strands the row" \
 
 run_mutation "outbox: the 429 hand-back is unconditional (a 429 on the read-back re-stages a posted row)" \
   "core/outbox.py" \
-  "('            self._claim(key, INTENT, STAGED)\\n            raise', '            self._write(key, state=STAGED)\\n            raise')" \
+  "('            self._claim(key, INTENT, from_state)\\n            raise', '            self._write(key, state=STAGED)\\n            raise')" \
   "test_outbox_write"
 
 run_mutation "outbox: recovery stops passing the approved text (a restart commits a mangled post)" \
@@ -3358,12 +3358,12 @@ run_mutation "dashboard_write: the Reply baseline counts statements the page nev
 
 run_mutation "dashboard_write: a thread Reply is baselined on the root, not on the ask" \
   "scripts/dashboard_write.py" \
-  "('        return str(ask_ts) if ask_ts is not None else str(thread)', '        return str(thread)')" \
+  "('    if ask_ts is not None:\\n        return str(ask_ts)\\n    if thread is not None:\\n        return str(thread)', '    if ask_ts is not None and thread is None:\\n        return str(ask_ts)\\n    if thread is not None:\\n        return str(thread)')" \
   "test_dashboard_write"
 
 run_mutation "dashboard_write: the settle action records nothing" \
   "scripts/dashboard_write.py" \
-  "('        res = outbox.settle(key)', '        res = {\"state\": \"SETTLED\"}')" \
+  "('        res = outbox.settle(key, delivered=delivered)', '        res = {\"state\": \"SETTLED\", \"delivered\": delivered}')" \
   "test_dashboard_write"
 
 # ---- the operator tool has no in-app publish control (aws-do-agent UI review, CO-Deploy) ----
@@ -3376,6 +3376,57 @@ run_mutation "dashboard: the repo's Streamlit config offers the Deploy menu" \
   ".streamlit/config.toml" \
   "('\\n[client]\\ntoolbarMode = \"viewer\"\\n', '\\n[client]\\ntoolbarMode = \"auto\"\\n')" \
   "test_dashboard"
+
+# ---- ENH-31 review round 4 (R4-1 .. R4-8) ----
+run_mutation "outbox: an ambiguous answer to the re-send is never recorded (every run posts again)" \
+  "core/outbox.py" \
+  "('                            self._write(key, resent_at=time.time(), state=SENT)\\n                            raise', '                            raise')" \
+  "test_slack_send"
+
+run_mutation "outbox: a refusal the allowlist did not know is retried forever after proven absence" \
+  "core/outbox.py" \
+  "('                        raise NotPosted(f\"re-send refused: {ex}\") from ex', '                        raise')" \
+  "test_slack_send"
+
+run_mutation "slack: an unlisted refusal of the post is marked as possibly landed" \
+  "channels/slack/adapter.py" \
+  "('            ex.may_have_landed = (ex.error in AMBIGUOUS_POST_ANSWERS\\n                                  or ex.error.startswith(\"HTTP \"))', '            ex.may_have_landed = True')" \
+  "test_slack_send"
+
+run_mutation "outbox: send again runs the re-read that can only name our own post" \
+  "core/outbox.py" \
+  "('        if from_state != UNPROVEN:\\n            self._check_newest(row)', '        self._check_newest(row)')" \
+  "test_outbox_write"
+
+run_mutation "outbox: a refused re-approval turns the parked row into a plain draft" \
+  "core/outbox.py" \
+  "('            self._claim(key, INTENT, from_state)\\n            raise', '            self._claim(key, INTENT, STAGED)\\n            raise')" \
+  "test_outbox_write"
+
+run_mutation "outbox: reapprove re-sends a MISMATCH row too" \
+  "core/outbox.py" \
+  "('        if reapprove and row[\"state\"] == UNPROVEN:\\n            from_state = UNPROVEN', '        if reapprove and row[\"state\"] in (UNPROVEN, MISMATCH):\\n            from_state = row[\"state\"]')" \
+  "test_outbox_write"
+
+run_mutation "dashboard_write: a Reply is baselined on the newest listed ask, not on the ask answered" \
+  "scripts/dashboard_write.py" \
+  "('    if ask_ts is not None:\\n        return str(ask_ts)\\n    if thread is not None:', '    if ask_ts is not None and thread is not None:\\n        return str(ask_ts)\\n    if thread is not None:')" \
+  "test_dashboard_write"
+
+run_mutation "dashboard_write: settling as delivered does not tie the ask" \
+  "scripts/dashboard_write.py" \
+  "('        tied = _tie_or_warn(cfg, row, key if delivered else f\"settled-not-needed:{key}\")', '        tied = None')" \
+  "test_dashboard_write"
+
+run_mutation "netguard: the refusal is an Exception a best-effort handler can swallow" \
+  "tests/netguard/sitecustomize.py" \
+  "('class NetworkRefused(BaseException):', 'class NetworkRefused(RuntimeError):')" \
+  "test_netguard"
+
+run_mutation "netguard: an empty host on bind (every interface) is loopback again" \
+  "tests/netguard/sitecustomize.py" \
+  "('LOOPBACK = {\"127.0.0.1\", \"::1\", \"localhost\"}', 'LOOPBACK = {\"127.0.0.1\", \"::1\", \"localhost\", \"\"}')" \
+  "test_netguard"
 
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
