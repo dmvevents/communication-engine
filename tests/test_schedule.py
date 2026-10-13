@@ -939,7 +939,7 @@ class ThreadSweepCycleTest(SchedulerHarness):
             res = threads.sweep(adapter, self.store, self.journal, "C1",
                                 start=self.store.sweep_start_get("inst", "C1"))
             self.store.sweep_start_set("inst", "C1", res["next_start"])
-        fetched = {root for _, root in adapter.sweep_log} - set()
+        fetched = {root for _, root in adapter.sweep_log}
         self.assertEqual(fetched, {f"{i}.0" for i in range(1, 6)},
                          f"with one call per cycle only {sorted(fetched)} were ever fetched")
 
