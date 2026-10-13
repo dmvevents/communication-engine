@@ -87,6 +87,9 @@ def report_lines(summary) -> list:
                  "channel" if why == "rate-limited" else
                  "this adapter's thread budget was spent before it reached this channel")
         lines.append(f"sweep: SKIPPED channel={ch} — {cause}; it is swept first next cycle")
+    for ch, why in summary.get("dm_refused", ()):
+        # the DM rule declined a whole channel; an empty answered count would hide it
+        lines.append(f"dm-rule: REFUSED channel={ch} — {why}")
     return lines
 
 

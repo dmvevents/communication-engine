@@ -132,6 +132,18 @@ class AnsweredByTest(unittest.TestCase):
         self.assertIsNone(answered_by(bot, [{"sender_id": human, "ts": "3.0", "text": "which?"}],
                                       is_answer, (bot,)))
 
+    def test_the_engines_own_post_never_answers(self):
+        """Review round 2 (R2-3): the engine's delivery is tied to ITS ask by the surface's
+        proof; the sweep crediting it would close another ask under the same root with one
+        reply — or record a MISMATCH post as an answer."""
+        import json
+        meta = {"event_type": "comms_engine_reply", "event_payload": {"key": "k1"}}
+        engine = {"sender_id": "U_BOT", "ts": "2.0", "text": "[AGENT] here",
+                  "raw": json.dumps({"ts": "2.0", "metadata": meta})}
+        plain = {"sender_id": "U_BOT", "ts": "3.0", "text": "here", "raw": json.dumps({"ts": "3.0"})}
+        self.assertIsNone(answered_by("U_HUMAN", [engine]))
+        self.assertEqual(answered_by("U_HUMAN", [engine, plain])["ts"], "3.0")
+
     def test_a_reply_without_a_sender_cannot_answer(self):
         replies = [dict(msg("C1", "2.0", "x", thread="1.0"), sender_id=None)]
         self.assertIsNone(answered_by("U_ASKER", replies))
@@ -371,6 +383,12 @@ class SweepTest(SweepHarness):
         self.store.upsert_messages([msg(ch, reply_id, "here you go", sender="U_OTHER")])
         self.assertEqual(close_dm_asks(self.store, self.journal, ch), [])
         self.assertEqual(self.responded(ask_id, channel=ch), (None, None))
+        # ...and the refusal is NAMED to the caller (review R2-13), as the sweep's are
+        refusals = []
+        self.assertEqual(close_dm_asks(self.store, self.journal, ch, refusals=refusals), [])
+        self.assertEqual(len(refusals), 1)
+        self.assertEqual(refusals[0][0], ch)
+        self.assertIn("non-orderable", refusals[0][1])
 
     def test_an_engine_post_is_recognised_by_its_stored_metadata_only(self):
         """The DM rule skips a message the engine itself delivered (review F1 addendum);
@@ -385,6 +403,10 @@ class SweepTest(SweepHarness):
         self.assertFalse(_is_engine_post({"raw": "not json"}))
         self.assertFalse(_is_engine_post({"raw": None}))
         self.assertFalse(_is_engine_post({}))
+        # a raw that parses to a non-object, or a non-object metadata, is not one either —
+        # and must not crash the cycle (review R2-14)
+        for raw in ("123", "[1, 2]", "true", '{"metadata": "x"}', '{"metadata": [1]}'):
+            self.assertFalse(_is_engine_post({"raw": raw}), raw)
 
     def test_a_non_orderable_id_space_is_refused_by_name(self):
         """Email Message-IDs are strings; ts_order's string fallback is lexicographic,

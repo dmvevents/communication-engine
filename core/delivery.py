@@ -20,3 +20,11 @@ ENGINE_EVENT_TYPE = "comms_engine_reply"
 
 class DeliveryMismatch(RuntimeError):
     """A message with this key is on the platform; its text is not the approved text."""
+
+
+class NotPosted(RuntimeError):
+    """The platform ANSWERED the post with a refusal (Slack: an ok:false such as
+    not_in_channel, is_archived, msg_too_long), so nothing is on the platform. The outbox
+    hands such a draft back to the gate instead of leaving it in INTENT with no exit
+    (independent review of ENH-31, round 2, R2-8). A timeout or a connection error is NOT
+    this: the post may have landed, and only a read-back can tell."""

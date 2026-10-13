@@ -47,7 +47,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from core.delivery import ENGINE_EVENT_TYPE, DeliveryMismatch
+from core.delivery import ENGINE_EVENT_TYPE, DeliveryMismatch, NotPosted
 from core.ratelimit import RateLimited
 
 API_BASE = "https://slack.com/api"
@@ -223,7 +223,13 @@ class Adapter:
                                           "event_payload": {"key": key}})}
         if thread_id is not None:
             params["thread_ts"] = str(thread_id)
-        payload = self._api("chat.postMessage", **params)
+        try:
+            payload = self._api("chat.postMessage", **params)
+        except ApiError as ex:
+            # Slack ANSWERED with ok:false (not_in_channel, is_archived, msg_too_long, ...):
+            # nothing was posted, so the outbox may hand the draft back to the gate instead
+            # of leaving it in INTENT (review round 2, R2-8). A timeout is not this.
+            raise NotPosted(f"chat.postMessage refused by the platform: {ex.error}") from ex
         ts = payload.get("ts")
         if not ts:
             raise ApiError("chat.postMessage", "ok response carrying no ts")
@@ -348,6 +354,9 @@ class Adapter:
         """Cheap liveness via auth.test. CAN fail (contract rule 5), and reports any
         active 429 hold so 'the poller went quiet' is diagnosable from health output."""
         detail_suffix = self._hold_detail()
+        if self._api_base != API_BASE:
+            # a leftover test variable on a live host must be visible (review N5)
+            detail_suffix += f"; API base override active: {self._api_base}"
         try:
             who = self._api("auth.test", timeout=5.0)
         except ApiError as ex:
@@ -421,8 +430,12 @@ class Adapter:
         return out
 
     def _history(self, channel, oldest):
-        """Every message newer than `oldest` (exclusive), oldest-first, ALL pages."""
-        out = [self._normalize(channel, m) for m in self._history_raw(channel, oldest)]
+        """Every message newer than `oldest` (exclusive), oldest-first, ALL pages. Asks for
+        message metadata: the stored raw must carry the engine's own delivery marker, or
+        the DM rule and the sweep cannot tell the engine's post from a human's and hand it
+        to the next older open ask (independent review of ENH-31, round 2, R2-1)."""
+        out = [self._normalize(channel, m)
+               for m in self._history_raw(channel, oldest, with_metadata=True)]
         out.sort(key=lambda m: float(m["ts"]))
         return out
 
@@ -438,7 +451,9 @@ class Adapter:
         The parent rides the first page of conversations.replies and is dropped here:
         it is the message being answered, not an answer.
         """
-        raw = self._replies_raw(channel, thread_ts, oldest)
+        # metadata on request, so a stored reply the engine itself posted is recognisable
+        # as such by the sweep (review round 2, R2-1 / R2-3)
+        raw = self._replies_raw(channel, thread_ts, oldest, with_metadata=True)
         out = [self._normalize(channel, m) for m in raw if m.get("ts") != thread_ts]
         out.sort(key=lambda m: float(m["ts"]))
         return out

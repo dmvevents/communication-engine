@@ -46,6 +46,7 @@ class SlackStub:
         self.bot_user = bot_user
         self.slack_escapes = slack_escapes
         self.truncate_posts_to = None     # store only the first N chars of a post (a planted mismatch)
+        self.drop_post_metadata = False   # the post lands, its metadata does not (an unprovable send)
         # Real-time ts by default (review F4: a stub minting ts from 2023 made every
         # stub message older than any draft, so no guard-2 path was ever exercised);
         # seed(ts=...) still pins a message where a test wants it.
@@ -178,7 +179,7 @@ class SlackStub:
              "text": _slackify(stored) if self.slack_escapes else stored}
         if form.get("thread_ts"):
             m["thread_ts"] = form["thread_ts"]
-        if form.get("metadata"):
+        if form.get("metadata") and not self.drop_post_metadata:
             m["metadata"] = json.loads(form["metadata"])
         self.channels.setdefault(ch, []).append(m)
         return {"ok": True, "channel": ch, "ts": m["ts"], "message": self._public(m, True)}

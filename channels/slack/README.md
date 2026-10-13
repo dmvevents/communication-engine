@@ -7,10 +7,12 @@ its own channels, policy `staged` (a human click), never `direct`. Both are test
 invariants (`tests/test_slack_adapter.py`, `tests/test_slack_send.py`), not promises:
 
 - `send()` is reachable only through `core/outbox.py`, whose ladder (durable INTENT → send →
-  read-back → COMMITTED), pre-flip refusals (marker, re-read against what the human saw
-  when staging, 3,500-character size guard, BLOCK-tier credential scan, the policy re-read
-  at the click) and post-send exact canonical read-back (a message carrying the key with
-  other text parks the row as MISMATCH, never re-sent) stand between any caller and
+  read-back → COMMITTED), pre-flip refusals (marker, re-read against what the page showed
+  the human when staging, 3,500-character size guard, BLOCK-tier credential scan, the policy
+  re-read at the click — default deny at every seam) and post-send exact canonical read-back
+  (a message carrying the key with other text parks the row as MISMATCH, never re-sent; an
+  ok:false answer to the post raises `core.delivery.NotPosted` and the draft returns to the
+  gate) stand between any caller and
   `chat.postMessage`; `capabilities()["direct"]` is `false`, so a `direct` policy refuses at
   outbox construction and again at the send seam, and `capabilities()["send"]` is true for
   a bot token (`xoxb-`) only — a user token would post in a person's name, so its drafts

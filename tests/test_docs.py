@@ -999,6 +999,18 @@ class SendPathDocsTest(unittest.TestCase):
         self.assertIn("five refusals", self.text)
         self.assertIn(f"`{MISMATCH}`", self.text, "the third read-back answer is undocumented")
 
+    def test_the_answered_state_claims_are_scoped_to_the_rule_they_hold_for(self):
+        """Review round 2 (R2-9, R2-6): "a message closes at most one ask, ever" is true of
+        the DM rule and false of the thread sweep (one reply closes every open ask under its
+        root, by design); recovery's bound and the UNPROVEN state must be stated where the
+        adopter reads about recovery."""
+        from core.outbox import UNPROVEN
+        self.assertNotIn("A message closes at most\none ask, ever", self.text)
+        self.assertIn("In a direct message a message closes at most one ask, ever", self.text)
+        self.assertIn("one reply\ncan close several people's asks", self.text)
+        self.assertIn(f"`{UNPROVEN}`", self.text, "recovery's terminal state is undocumented")
+        self.assertIn("at\nmost once", self.text, "recovery's re-send bound is undocumented")
+
     def test_localhost_is_not_documented_as_an_accepted_stub_host(self):
         for doc in (QUICKSTART, ROOT / "channels" / "slack" / "README.md"):
             self.assertNotIn("http://localhost", doc.read_text(),

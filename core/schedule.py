@@ -185,7 +185,7 @@ class Scheduler:
         now = self.clock()
         polled = fresh = answered = 0
         sweep_rate_limited, sweep_truncated, sweep_errors = [], [], []
-        sweep_skipped = []
+        sweep_skipped, dm_refused = [], []
         for src in self.sources:
             for ch in src.channels:
                 cursor = self.store.cursor_get(src.name, ch)
@@ -275,7 +275,8 @@ class Scheduler:
                     self.store, self.journal, ch, answerers=src.answerers,
                     is_answer=lambda m, _src=src: classify(
                         m.get("text") or "", _src.taxonomy,
-                        attachments=m.get("attachments")).kind not in ACTIONABLE_KINDS))
+                        attachments=m.get("attachments")).kind not in ACTIONABLE_KINDS,
+                    refusals=dm_refused))        # named, like the sweep's (round 2, R2-13)
             # The channel that took the bulk — the one that SPENT the most — goes to the
             # back (review F3: rotating position 0 let a small channel's turn hand the
             # bulk straight back to the same backlog channel); skipped ones go first.
@@ -293,7 +294,7 @@ class Scheduler:
                 "unattended": unattended, "next_interval": self._interval,
                 "sweep_rate_limited": sweep_rate_limited,
                 "sweep_truncated": sweep_truncated, "sweep_errors": sweep_errors,
-                "sweep_skipped": sweep_skipped}
+                "sweep_skipped": sweep_skipped, "dm_refused": dm_refused}
 
     def _sweep_order_for(self, src) -> list:
         """This cycle's sweep order for one source, read from the store (so it survives

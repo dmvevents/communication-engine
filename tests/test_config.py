@@ -28,23 +28,26 @@ def cfg(instance_extra=None, channel_extra=None, channels=None):
 class KindTest(unittest.TestCase):
     def test_kind_is_inferred_from_a_slack_shaped_id_when_absent(self):
         real_shape = "D" + "7" * 10          # built at runtime: the gate refuses literal ids
-        c = cfg(channels=[{"id": "D_SOMEONE_DM"}, {"id": "C_CUST"}, {"id": "G_PRIV"},
-                          {"id": real_shape}])
+        mixed = "D0" + "A" * 9
+        c = cfg(channels=[{"id": real_shape}, {"id": "C_CUST"}, {"id": "G_PRIV"},
+                          {"id": mixed}])
         inst = c.instances[0]
         self.assertEqual([ch.is_dm for ch in inst.channels], [True, False, False, True])
-        self.assertEqual(inst.dm_channels(), ("D_SOMEONE_DM", real_shape))
+        self.assertEqual(inst.dm_channels(), (real_shape, mixed))
 
     def test_the_inference_is_bound_to_slacks_id_shape_not_to_a_bare_d(self):
         """Review N3: the email adapter's channel ids are mailbox names, and the DM rule
         would run on a mailbox called Drafts or Done. Only a Slack-shaped id (D plus 8+
         uppercase letters, digits or underscores) infers a DM; anything else is declared."""
+        letters_only = "D" + "A" * 10                      # DEPLOYMENTS-shaped (round 2, R2-12)
         c = cfg(channels=[{"id": "Drafts"}, {"id": "Deleted Items"}, {"id": "Done"},
-                          {"id": "D1234567"}, {"id": "Drafts", "kind": "dm"}][:4])
+                          {"id": "D1234567"}, {"id": "DELETED_ITEMS"}, {"id": "D_SOMEONE"},
+                          {"id": letters_only}])
         self.assertEqual([ch.is_dm for ch in c.instances[0].channels],
-                         [False, False, False, False])
+                         [False] * 7, "a NAME was taken for a Slack im id")
         self.assertEqual(c.instances[0].dm_channels(), ())
-        declared = cfg(channels=[{"id": "Drafts", "kind": "dm"}])
-        self.assertTrue(declared.instances[0].channels[0].is_dm)
+        declared = cfg(channels=[{"id": "Drafts", "kind": "dm"}, {"id": "D_SOMEONE", "kind": "dm"}])
+        self.assertEqual([ch.is_dm for ch in declared.instances[0].channels], [True, True])
 
     def test_an_explicit_kind_overrides_the_inference_both_ways(self):
         c = cfg(channels=[{"id": "D_LOOKS_LIKE_DM", "kind": "channel"},

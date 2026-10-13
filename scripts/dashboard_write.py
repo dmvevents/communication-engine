@@ -65,10 +65,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.config import ConfigError, ensure_dirs, load, load_adapter_class  # noqa: E402
 from core.dashboard import html_text, open_ro, snapshot  # noqa: E402
+from core.delivery import NotPosted  # noqa: E402
 from core.journal import Journal  # noqa: E402
 from core.outbox import (COMMITTED, DISCARDED, Outbox, PolicyError,  # noqa: E402
-                         MISMATCH, ReleaseError, SENT, SendBlocked, STAGED, VERIFIED,
-                         thread_block_reason)
+                         MISMATCH, ReleaseError, SENT, SendBlocked, STAGED, UNPROVEN,
+                         VERIFIED, thread_block_reason)
 
 
 # ---- config, fresh at every action --------------------------------------------
@@ -125,6 +126,27 @@ def _placement_for(ch, adapter):
     if cpol != "never":
         return "top-level", why
     return None, f"{ch.id} answers only in threads, and {why}"
+
+
+def _seen_ts_for(cfg, channel_id, thread):
+    """Guard 2's baseline: the newest platform ts this page SHOWED the human for the
+    conversation they are answering (review round 2, R2-5: the outbox's own fallback is
+    the platform's newest at staging time, which may be a message no page displayed). The
+    page lists the journal, so a top-level reply is baselined on the newest journaled ts in
+    the channel; a thread reply on its root — the page shows the ask, never the thread, so
+    any reply already in it is unseen and the first click names it. None (the outbox falls
+    back to the platform) only when there is no journal yet."""
+    if thread is not None:
+        return str(thread)
+    if not Path(cfg.journal_path).is_file():
+        return None
+    conn = open_ro(cfg.journal_path)
+    try:
+        row = conn.execute("SELECT ts FROM journal WHERE channel=? "
+                           "ORDER BY CAST(ts AS REAL) DESC LIMIT 1", (channel_id,)).fetchone()
+        return str(row[0]) if row else None
+    finally:
+        conn.close()
 
 
 def _adapter_for(cfg, inst):
@@ -378,7 +400,8 @@ def _stage_clicked():
                 return
             thread = _thread_root(cfg, ch.id, trigger) if placement == "thread" else None
         outbox = _outbox_for(cfg, inst, adapter)
-        res = outbox.stage(ch.id, trigger, text, thread_id=thread)
+        res = outbox.stage(ch.id, trigger, text, thread_id=thread,
+                           seen_ts=_seen_ts_for(cfg, ch.id, thread))
     except PolicyError as ex:
         _push_flash("error", f"refused: {ex}")
         return
@@ -463,6 +486,13 @@ def _release_clicked(inst_name, key):
                                    "do NOT re-send; run Outbox.recover()")
         else:
             _push_flash("error", f"refused: {ex}")
+    except NotPosted as ex:
+        # The platform ANSWERED the post with a refusal (the bot is not in the channel,
+        # the channel is archived, the text is too long for it): nothing was posted, and
+        # the outbox handed the draft back to the gate (review round 2, R2-8).
+        state = outbox.get(key)["state"] if outbox is not None else "?"
+        _push_flash("error", f"the platform refused the post — {ex}; nothing was posted, "
+                             f"the draft is {state} again: fix the cause, then Send or Discard")
     except Exception as ex:  # noqa: BLE001 — the page must say what the row is now
         state = "?"
         if outbox is not None:
@@ -609,7 +639,7 @@ def render(cfg):
     for inst in cfg.instances:
         outbox_path = cfg.outbox_path_for(inst.name)
         drafts = _rows(outbox_path, (STAGED,))
-        mismatched = _rows(outbox_path, (MISMATCH,))
+        mismatched = _rows(outbox_path, (MISMATCH, UNPROVEN))
         if not drafts and not mismatched:
             continue
         # Send is offered only where the adapter can deliver: a click on a draft whose
@@ -659,22 +689,32 @@ def render(cfg):
             reject.button("Discard", key=f"discard-{row['key']}",
                           on_click=_discard_clicked, args=(inst.name, row["key"]))
         # ENH-31 guard 3: rows the platform holds with text that is not the approved
-        # text. Terminal until a human acts — no Send (it is there), no Discard (it was
-        # delivered); the card says what to do.
+        # text (MISMATCH), and rows recovery could not settle — re-sent once and still
+        # unprovable, or a read-back that keeps failing (UNPROVEN, round 2 R2-6). Terminal
+        # until a human acts — no Send, no Discard; the card says what to do.
         for row in mismatched:
             any_staged = True
+            if row["state"] == MISMATCH:
+                why = ("delivered with DIFFERENT text — the platform shows a message carrying "
+                       "this draft's key whose text is not the text above. Nothing more will "
+                       "be sent and nothing is recorded as answered; compare the two on the "
+                       "platform, then edit or delete there. Needs a human.")
+            else:
+                why = ("UNPROVEN — recovery re-sent this approved text once, or its read-back "
+                       "kept failing, and the platform still shows no message carrying its "
+                       "key. Nothing more will be sent and nothing is recorded as answered; "
+                       "look for the text above on the platform and settle it there. If it "
+                       "is not there and still needed, stage it again with changed text — "
+                       "the same text IS this row. Needs a human.")
             st.markdown(
                 "<div style='border:1px solid rgba(128,128,128,.3);border-left:"
                 "3px solid #8f1d1d;border-radius:8px;padding:10px 14px;margin:2px 0'>"
-                f"<b>{MISMATCH}</b> · {html.escape(row['target'])} · instance "
+                f"<b>{html.escape(row['state'])}</b> · {html.escape(row['target'])} · instance "
                 f"{html.escape(inst.name)} · key <code>{html.escape(row['key'][:12])}…</code>"
                 "<div style='font-size:.9rem;margin-top:4px'>approved text: "
                 f"{html_text(row['text'])}</div>"
-                "<div style='color:#8f1d1d;font-size:.85rem;margin-top:4px'>delivered with "
-                "DIFFERENT text — the platform shows a message carrying this draft's key "
-                "whose text is not the text above. Nothing more will be sent and nothing is "
-                "recorded as answered; compare the two on the platform, then edit or delete "
-                "there. Needs a human.</div></div>", unsafe_allow_html=True)
+                f"<div style='color:#8f1d1d;font-size:.85rem;margin-top:4px'>{why}</div></div>",
+                unsafe_allow_html=True)
     if not any_staged:
         st.markdown("_no drafts at the gate_")
 

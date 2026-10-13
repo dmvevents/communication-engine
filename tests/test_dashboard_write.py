@@ -120,7 +120,7 @@ def slack_stub_base(tmp):
         '   "auth": {"token": "env:UI_TEST_SLACK_TOKEN", '
         '"channels": "env:UI_TEST_SLACK_CHANNELS"},\n'
         '   "channels": [{"id": "C_CUST", "thread_reply_policy": "staged"},\n'
-        '                {"id": "D_SOMEONE", "reply_policy": "staged"}]}]}\n')
+        '                {"id": "D_SOMEONE", "kind": "dm", "reply_policy": "staged"}]}]}\n')
     return base
 
 
@@ -531,7 +531,7 @@ def marked_base(tmp):
         '{"engine": {"state_dir": "state"},\n'
         ' "instances": [{"name": "team", "adapter": "fake", "send_marker": "[AGENT]",\n'
         '   "channels": [{"id": "C_CUST", "reply_policy": "staged"},\n'
-        '                {"id": "D_SOMEONE", "reply_policy": "staged", '
+        '                {"id": "D_SOMEONE", "kind": "dm", "reply_policy": "staged", '
         '"thread_reply_policy": "staged"}]}]}\n')
     return base
 
@@ -658,6 +658,39 @@ class SlackStubWriteSurfaceTest(_WriteSurfaceBase):
         self.assertEqual(post["metadata"]["event_payload"]["key"], self.rows()[0]["key"])
         self.assertNotIn("thread_ts", post, "a DM reply is top-level")
         self.assertIsNotNone(self.responded()[0], "the proven reply did not tie the ask")
+
+    def test_a_refused_post_returns_the_draft_to_the_gate_and_says_why(self):
+        """Review R2-8: Slack answered ok:false (the bot is not in the DM); nothing was
+        posted. The draft is back at the gate with Send and Discard, and the flash says
+        what the platform said — not a generic exception with 'row state is now INTENT'."""
+        at = self.reply_and_stage(self.run_app(), self.REPLY)
+        self.stub.fail_next["chat.postMessage"] = "not_in_channel"
+        at = self.buttons(at, "send-")[0].click().run()
+        self.assertFalse(at.exception)
+        errors = "\n".join(str(x.value) for x in at.error)
+        self.assertIn("refused the post", errors)
+        self.assertIn("not_in_channel", errors)
+        self.assertNotIn("row state is now", errors)
+        self.assertEqual(self.rows()[0]["state"], "STAGED")
+        self.assertEqual(self.stub.posted(self.DM), [])
+        self.assertEqual((len(self.buttons(at, "send-")), len(self.buttons(at, "discard-"))), (1, 1))
+
+    def test_the_baseline_is_what_the_page_showed_not_what_the_platform_holds(self):
+        """Review R2-5 case A: the page lists the journal, which lags the platform by a
+        poll. A message the asker posted after the last poll was never on the page, so it
+        must refuse the click — the old baseline (the platform's newest at staging) would
+        have recorded it as seen and posted over it."""
+        self.stub.seed(self.DM, "never mind, found it", user="U_ASKER")   # unpolled, unseen
+        at = self.reply_and_stage(self.run_app(), self.REPLY)
+        self.assertFalse(at.exception)
+        (row,) = self.rows()
+        self.assertEqual(row["seen_ts"], self.ASK_TS, "the baseline is the platform's newest, "
+                                                      "not the newest ts the page showed")
+        at = self.buttons(at, "send-")[0].click().run()
+        flashes = "\n".join(str(x.value) for x in list(at.error) + list(at.warning))
+        self.assertIn("re-read first", flashes)
+        self.assertIn("U_ASKER", flashes)
+        self.assertEqual((self.rows()[0]["state"], self.stub.posted(self.DM)), ("STAGED", []))
 
     def test_a_mangled_post_is_parked_as_mismatch_on_the_surface_and_nothing_more_is_sent(self):
         """Guard 3's third answer on the shipped path (review F3): the platform holds a
@@ -952,6 +985,25 @@ class WriteSurfaceReviewTest(_WriteSurfaceBase):
         self.assertFalse(at.exception)
         self.assertEqual(self.rows()[0]["state"], "COMMITTED")
         self.assertIsNotNone(self.journal_row("D_SOMEONE", "7.0")[0])
+
+    def test_an_unproven_row_is_shown_as_needing_a_human_with_no_buttons(self):
+        """Review R2-6: recovery re-sent once and still could not prove the post; the row is
+        UNPROVEN, terminal for the engine. The card says what to do, including how to send
+        it after all (changed text — the same text IS this row), and offers no button."""
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        at = self.compose(self.run_app(), "approved text, never provably posted")
+        key = self.rows()[0]["key"]
+        conn = sqlite3.connect(self.base / "state" / "outbox-team.db")
+        conn.execute("UPDATE outbox SET state='UNPROVEN' WHERE key=?", (key,))
+        conn.commit()
+        conn.close()
+        at = self.run_app()
+        self.assertFalse(at.exception)
+        self.assertEqual((self.buttons(at, "send-"), self.buttons(at, "discard-")), ([], []))
+        cards = "\n".join(str(m.value) for m in at.markdown)
+        self.assertIn("UNPROVEN", cards)
+        self.assertIn("changed text", cards)
+        self.assertIn("Needs a human", cards)
 
     def test_a_draft_staged_before_the_marker_was_configured_is_refused_at_the_click(self):
         """Review X7: the marker is verified again at the click BY THE OUTBOX THE SURFACE

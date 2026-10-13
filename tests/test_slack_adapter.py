@@ -164,6 +164,17 @@ class ApiBaseTest(SlackAdapterTestCase):
         a._api("auth.test")
         self.assertEqual(self.http.requests[0][0], "http://127.0.0.1:18999/auth.test")
 
+    def test_health_says_when_an_api_base_override_is_active(self):
+        """Review N5: a leftover test variable on a live host must be visible — health()
+        is what the operator reads."""
+        a = self.make_env({"COMMS_SLACK_API_BASE": "http://127.0.0.1:18999"},
+                          [(200, {}, {"ok": True, "user": "comms-bot"})])
+        detail = a.health()["detail"]
+        self.assertIn("override active", detail)
+        self.assertIn("127.0.0.1:18999", detail)
+        a = self.make_env({}, [(200, {}, {"ok": True, "user": "comms-bot"})])
+        self.assertNotIn("override", a.health()["detail"])
+
     def test_a_non_loopback_base_is_refused_by_name_before_any_io(self):
         for bad in ("http://10.0.0.5:8080", "https://127.0.0.1:18999", "http://evil.example",
                     "http://127.0.0.1", "http://127.0.0.1:1/api", "http://u@127.0.0.1:1",
@@ -330,6 +341,8 @@ class SendTest(SlackAdapterTestCase):
         self.assertEqual(c("[AGENT] see <http://docs.example|docs.example>"), c("[AGENT] see docs.example"))
         self.assertEqual(c("[AGENT] mail <mailto:ops@example.com|ops@example.com>"), c("[AGENT] mail ops@example.com"))
         self.assertEqual(c("[AGENT] <http://127.0.0.1:8502/?a=1&amp;b=2>"), c("[AGENT] http://127.0.0.1:8502/?a=1&b=2"))
+        self.assertEqual(c("[AGENT] mail <mailto:ops@example.com>"), c("[AGENT] mail ops@example.com"),
+                         "an unlabelled mailto link (typed as such) keeps its scheme — review R2-7 Y2")
         self.assertNotEqual(c("[AGENT] see docs.example"), c("[AGENT] see docs.other"))
 
     def test_newest_reads_the_channel_top_level_or_one_thread(self):
@@ -354,9 +367,25 @@ class SendTest(SlackAdapterTestCase):
                                  "metadata": meta, "text": "[AGENT] our reply"},
                                 slack_msg("8.0", user="U_H", text="the human's last word")])])
         self.assertEqual(a.newest("C_ONE")["ts"], "8.0")
+        self.assertGreaterEqual(int(self.http.requests[0][1]["limit"]), 2,
+                                "one message cannot show what hides behind our own post "
+                                "(review R2-7 Y3)")
         a = self.make([history([{"type": "message", "ts": "9.0", "user": "U_BOT",
                                  "metadata": meta, "text": "[AGENT] our reply"}])])
         self.assertIsNone(a.newest("C_ONE"))
+
+    def test_newest_in_a_thread_asks_for_metadata_and_skips_this_engines_own_reply(self):
+        """Review R2-7 (Y5): the thread re-read must ask for metadata, or the engine's own
+        earlier thread reply refuses the next one ("re-read first: U_BOT posted...")."""
+        meta = {"event_type": "comms_engine_reply", "event_payload": {"key": "k1"}}
+        thread = {"ok": True, "has_more": False, "messages": [
+            slack_msg("1.0", text="ask?"),
+            slack_msg("2.0", user="U_H", text="the human's last word", thread_ts="1.0"),
+            {"type": "message", "ts": "3.0", "user": "U_BOT", "thread_ts": "1.0",
+             "metadata": meta, "text": "[AGENT] our earlier reply"}]}
+        a = self.make([(200, {}, thread)])
+        self.assertEqual(a.newest("C_ONE", thread_id="1.0")["ts"], "2.0")
+        self.assertEqual(self.http.requests[0][1]["include_all_metadata"], "true")
 
     def test_send_is_declared_only_for_a_bot_token(self):
         """Review N1: the grant is the harness's BOT identity. A user token would post in

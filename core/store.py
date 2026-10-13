@@ -198,11 +198,14 @@ class Store:
         return row[0] if row and row[0] else str(ts)
 
     def thread_replies(self, channel_id: str, thread_id: str) -> list:
-        """Every stored reply under one thread, oldest-first (ts, sender_id, text)."""
+        """Every stored reply under one thread, oldest-first (ts, sender_id, text, raw). The
+        raw payload rides along so the sweep can recognise the engine's own delivery by its
+        metadata and never credit it (review round 2, R2-3: without it the surface's reply
+        to one ask closed every other open ask under the same root)."""
         rows = self.conn.execute(
-            "SELECT ts, sender_id, text FROM messages WHERE channel_id=? AND thread_id=?",
+            "SELECT ts, sender_id, text, raw FROM messages WHERE channel_id=? AND thread_id=?",
             (channel_id, str(thread_id))).fetchall()
-        out = [{"ts": r[0], "sender_id": r[1], "text": r[2]} for r in rows]
+        out = [{"ts": r[0], "sender_id": r[1], "text": r[2], "raw": r[3]} for r in rows]
         out.sort(key=lambda m: ts_order(m["ts"]))
         return out
 

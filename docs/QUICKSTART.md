@@ -38,7 +38,7 @@ Edit it. The only things you must change:
 | `instances[].channels[].id` | the channel/chat IDs you want watched |
 | `instances[].channels[].reply_policy` | `never` (default), `staged`, or `direct` |
 | `instances[].channels[].thread_reply_policy` | optional; same three values, applied only to replies **inside a thread**. Omit it and a thread is governed by `reply_policy` like anything else |
-| `instances[].channels[].kind` | optional; `dm` or `channel`. A 1:1 direct message is answered top-level and closed by the DM rule (step 9). Omitted, a Slack-shaped `D…` id infers `dm` and any other id is a channel |
+| `instances[].channels[].kind` | optional; `dm` or `channel`. A 1:1 direct message is answered top-level and closed by the DM rule (step 9). Omitted, only a Slack-shaped im id infers `dm` (`D`, then eight or more uppercase letters and digits with at least one digit and no underscore); any other id — a mailbox or channel name in any case — is a channel unless declared |
 | `instances[].answerers` | optional; the sender ids whose replies may close OTHER people's asks (the agent's bot user, the operators). Omitted, any non-asker's answer closes an ask |
 | `instances[].send_marker` | optional; a prefix (e.g. `"[AGENT]"`) every send from this connection must carry — prepended when a draft is staged, required again at the click |
 | `instances[].principals` | the user IDs whose messages matter |
@@ -336,9 +336,14 @@ the marker is how a reader and the other senders' dedupe tell the engine's messa
 (it must be followed by a space or the end of the text, so `[AGENT]glued` and another
 sender's `[AGENT-OTHER]` do not pass); (2) the click **re-reads** the channel or thread and
 refuses, with who and when ("re-read first"), when anything the human has NOT seen has
-arrived — the baseline is the platform's newest message recorded when the draft was staged
-(platform clock against platform clock; the engine's own earlier posts never count), and
-staging the same text again is the acknowledgement that re-arms the click; (3) a text over
+arrived — the baseline is the newest message the page SHOWED when the draft was staged (the
+page lists the journal, which lags the platform by a poll, so a message the platform holds
+but no page displayed refuses; a thread reply is baselined on its root, since the page shows
+the ask and never the thread; a draft minted by code without a page records the platform's
+newest), compared platform clock against platform clock, with the engine's own earlier posts
+never counting; staging the same text again after a refusal is the acknowledgement, and it
+advances the baseline exactly to the message the refusal named — a later arrival refuses
+again; (3) a text over
 3,500 characters is refused — Slack silently splits at 4,000 and returns one ts; the guard
 counts the approved text as typed, and whether Slack's split counts the stored,
 entity-escaped form is unverified against the platform, which is what the 500-character
@@ -349,9 +354,16 @@ declares them on, which Slack does not. After the post the **read-back** must fi
 message: the outbox key rides the message metadata and the canonical text must match. A
 message carrying the key with other text parks the row as `MISMATCH` — never re-sent,
 never committed, and the card says a human must look; no message carrying the key leaves
-the row SENT for `Outbox.recover()`, which re-sends only what the platform does not hold,
-isolates each row (one dead thread cannot wedge the others) and stops on a 429. A 429 on
-the post itself hands the draft back to the gate as STAGED, because nothing was posted.
+the row SENT for `Outbox.recover()`, which re-sends a key the platform does not hold **at
+most once** — a row it still cannot prove, or whose read-back keeps failing (a thread whose
+parent is gone), is parked as `UNPROVEN` after at most three runs, never retried forever —
+isolates each row, honours the bot-token rule, bounds its restart search by the platform ts
+the human saw, and stops on a 429. A 429 on the post itself, or the platform refusing the
+post (`not_in_channel`, `is_archived`, `msg_too_long`), hands the draft back to the gate as
+STAGED, because nothing was posted. `MISMATCH` and `UNPROVEN` rows are triage on the
+read-only page ("unresolved send", right after in-flight sends) and a card with no button on
+the write surface; the same text IS that row, so a reply that is still needed is staged
+again with changed text.
 Placement is the surface's routing rule, not a refusal: in the ask's thread in a channel,
 top-level in a 1:1 direct message (a channel declared `kind: dm`, or inferred from a
 Slack-shaped `D…` id). The outbox ladder and the surface are tested against a loopback
@@ -368,11 +380,16 @@ whose reply is not itself an ask; the other party of a DM) — note that a multi
 channel declared `kind: dm` with no answerer list closes an ask on anyone's next
 statement. In the thread sweep and the DM rule a reply that classifies as a question is
 never credited, from anyone: a clarifying question is a question (the write surface's
-Reply ties the text the human chose to send, whatever its shape). A message closes at most
-one ask, ever, and the engine's own deliveries are never re-credited to an older ask. The
-Journal tab lists every ask closed by someone else's thread or DM reply under "closed by
-someone else — review", newest first, so the operator can see which asks left the queue
-that way; there is no reopen action there — the journal row is the record to inspect.
+Reply ties the text the human chose to send, whatever its shape). The engine's own
+deliveries are never credited by the sweep or the DM rule — the poll stores their metadata,
+and only the surface's proof ties them, so a mangled (`MISMATCH`) post never becomes an
+answer. In a direct message a message closes at most one ask, ever. In a thread the sweep
+ties every open ask under the root to its first qualifying reply, by design, so one reply
+can close several people's asks; the Journal tab flags it ("also closed N other asks"), and
+whether to narrow that is an open decision. The Journal tab lists every ask closed by
+someone else's thread or DM reply under "closed by someone else — review", newest first, so
+the operator can see which asks left the queue that way; there is no reopen action there —
+the journal row is the record to inspect.
 
 The same gate covers **configuration** (`scripts/dashboard_config.py`, over
 `core/reconfig.py`): with it on, the dashboard can also add, edit and remove
@@ -413,10 +430,12 @@ surface says so instead of implying one.
   top-level as the channel's thread policy allows), by an in-thread reply from someone
   other than the asker — from a listed answerer, when the source names them — swept each
   scheduler cycle, or, in a 1:1 direct message (declared or inferred), by the next
-  top-level message that is an answer, which closes the most recent open ask before it,
-  once — a message closes at most one ask, ever, and the engine's own deliveries are never
-  re-credited; a reply inside a DM's thread is not credited (0 of 535 DM messages measured
-  in-thread), and DM asks spend no thread-sweep budget. "Responded" means exactly that, not
+  top-level message that is an answer, which closes the most recent open ask it can answer
+  (never its own sender's), once — in a DM a message closes at most one ask, ever; in a
+  thread one reply closes every open ask under its root, by design, flagged on the Journal
+  tab — and the engine's own deliveries are never credited by either rule; a reply inside a
+  DM's thread is not credited (0 of 535 DM messages measured in-thread), and DM asks spend no
+  thread-sweep budget. "Responded" means exactly that, not
   "resolved": a third party's "+1" closes an ask too, and the dashboard counts
   thread-closed asks apart from answers sent from here. A reply posted top-level in the
   channel by anyone else is stored and listed but cannot be tied to the ask, and the

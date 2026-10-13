@@ -47,8 +47,8 @@ from pathlib import Path
 
 from .classify import ACTIONABLE_KINDS
 
-SEVERITY = ("engine_lost", "in_flight", "edited_after_response", "staged",
-            "unanswered")
+SEVERITY = ("engine_lost", "in_flight", "unresolved_send", "edited_after_response",
+            "staged", "unanswered")
 
 _WHY = {
     "engine_lost": ("the platform still serves messages this engine LOST — the one "
@@ -57,6 +57,11 @@ _WHY = {
                     "incomplete until this is 0"),
     "in_flight": ("a send may have died mid-flight — run Outbox.recover(); only its "
                   "read-back can tell 'sent, unrecorded' from 'never sent'"),
+    "unresolved_send": ("an approved send recovery could not settle — MISMATCH (delivered "
+                        "with text that is not the approved text) or UNPROVEN (re-sent once "
+                        "and still unprovable, or its read-back keeps failing); nothing more "
+                        "is sent and nothing is recorded as answered — look on the platform "
+                        "and settle it there"),
     "edited_after_response": ("edited AFTER we answered — the reply on the channel "
                               "may answer text that no longer exists"),
     "staged": ("draft waiting at the operator gate — nothing sends until a human "
@@ -160,6 +165,15 @@ def _journal_view(journal_path: Path):
                 "SELECT channel, ts, text, kind, response_key, responded_at FROM journal "
                 "WHERE responded_at IS NOT NULL AND (response_key LIKE 'thread-reply:%' "
                 "OR response_key LIKE 'dm-reply:%') ORDER BY responded_at DESC LIMIT 50")]
+        # One reply closing SEVERAL asks is the signature the list exists to show (review
+        # N9): the sweep ties every open ask under a root to its first qualifying reply, by
+        # design. Counted over the whole journal, not only the 50 listed.
+        shared = {r[0]: r[1] for r in conn.execute(
+            "SELECT response_key, count(*) FROM journal WHERE responded_at IS NOT NULL "
+            "AND (response_key LIKE 'thread-reply:%' OR response_key LIKE 'dm-reply:%') "
+            "GROUP BY response_key HAVING count(*) > 1")}
+        for c in items["closed_by_others"]:
+            c["also_closed"] = shared.get(c["response_key"], 1) - 1
         return items, counts
     finally:
         conn.close()
@@ -174,7 +188,7 @@ def _outbox_view(name: str, outbox_path: Path):
         return None, None
     conn = open_ro(outbox_path)
     try:
-        items = {"in_flight": [], "staged": []}
+        items = {"in_flight": [], "unresolved_send": [], "staged": []}
         for r in conn.execute(
                 "SELECT target, trigger_ts, text, state FROM outbox "
                 "WHERE state IN ('INTENT','SENT') ORDER BY created_at"):
@@ -182,6 +196,16 @@ def _outbox_view(name: str, outbox_path: Path):
                 "severity": "in_flight", "instance": name, "where": r["target"],
                 "ts": r["trigger_ts"], "text": r["text"], "kind": None,
                 "state": r["state"], "why": _WHY["in_flight"]})
+        # A MISMATCH or UNPROVEN row is terminal for the engine but not for the human: it
+        # can double-message someone exactly like an in-flight row, so it is triage, not a
+        # count in a side tab (review round 2, R2-3: the page read ALL CLEAR over one).
+        for r in conn.execute(
+                "SELECT target, trigger_ts, text, state FROM outbox "
+                "WHERE state IN ('MISMATCH','UNPROVEN') ORDER BY created_at"):
+            items["unresolved_send"].append({
+                "severity": "unresolved_send", "instance": name, "where": r["target"],
+                "ts": r["trigger_ts"], "text": r["text"], "kind": None,
+                "state": r["state"], "why": _WHY["unresolved_send"]})
         for r in conn.execute(
                 "SELECT target, trigger_ts, text FROM outbox "
                 "WHERE state='STAGED' ORDER BY created_at"):

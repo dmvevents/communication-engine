@@ -50,13 +50,13 @@ _INSTANCE_KEYS = frozenset(("name", "adapter", "channels", "principals", "auth",
 _CHANNEL_KEYS = frozenset(("id", "label", "poll_interval_s", "reply_policy",
                            "thread_reply_policy", "triggers", "kind"))
 VALID_KINDS = ("channel", "dm")
-# A Slack-shaped direct-message id: D plus at least eight uppercase letters, digits or
-# underscores (a real im id is D plus ten uppercase letters and digits; the suite's
-# stylized ids are D_SOMEONE).
-# Inference is bound to this SHAPE so a mailbox named "Drafts", "Deleted Items" or
-# "Done" (the email adapter's channel ids are mailbox names) is not taken for a DM
-# (review N3); any other adapter's DM is declared with `kind: dm`.
-_SLACK_DM_ID = re.compile(r"D[A-Z0-9_]{8,}")
+# A Slack-shaped direct-message id: D, then eight or more uppercase letters and digits,
+# at least one of them a digit, no underscore (a real im id is D plus ten such characters).
+# Inference is bound to this SHAPE so a mailbox or channel NAME is never taken for a DM —
+# not "Drafts" or "Deleted Items" (review N3), and not DEPLOYMENTS or DELETED_ITEMS
+# either (round 2, R2-12). The suite's stylized D_SOMEONE ids therefore declare
+# `kind: dm`, as any non-Slack adapter's DM must.
+_SLACK_DM_ID = re.compile(r"D(?=[A-Z0-9]*[0-9])[A-Z0-9]{8,}")
 
 # Shapes that indicate a real credential pasted where an env reference belongs.
 _SECRET_SHAPES = (
@@ -114,9 +114,9 @@ class ChannelConfig:
     @property
     def is_dm(self) -> bool:
         """A 1:1 direct message: declared `kind: dm`, or — with no declaration — a
-        Slack-shaped id, D plus 8+ uppercase letters, digits or underscores (C = public,
-        G = private, D = im). Any other id shape — a mailbox name, a lowercase or spaced
-        id — is a channel unless declared."""
+        Slack-shaped id: D, then 8+ uppercase letters and digits with at least one digit
+        and no underscore (C = public, G = private, D = im). Any other id — a mailbox or
+        channel name in any case, a stylized D_SOMEONE — is a channel unless declared."""
         if self.kind is not None:
             return self.kind == "dm"
         return bool(_SLACK_DM_ID.fullmatch(self.id))

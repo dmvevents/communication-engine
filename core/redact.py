@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import re
 
-# (class, pattern). Each pattern's literal prefix is split so the source cannot match.
+# (class, pattern). Each pattern's literal prefix is split so the source cannot match. The
+# classes are the sanitize gate's credential tier (scripts/sanitize-gate.sh); the assignment
+# class here is case-insensitive and admits spaces around the sign, wider than the gate's.
+
 BLOCK_PATTERNS = (
     # every Slack token family (bot, user, app-config, refresh, client, ...): xox?-
     ("slack-token", re.compile("xo" + "x[a-z]-[0-9A-Za-z-]{8,}")),

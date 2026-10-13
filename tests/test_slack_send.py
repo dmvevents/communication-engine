@@ -120,6 +120,66 @@ class StubSend(unittest.TestCase):
                         thread_id=ASK_TS)["key"]
         self.assertEqual(box.release(key)["state"], COMMITTED)
 
+    # ---- review round 2: bounded recovery, refused posts, the restart half of F3 ----------
+    def test_an_unprovable_send_is_re_sent_once_and_then_parked(self):
+        """Review R2-6: the post lands but the platform drops its metadata, so no read-back
+        can ever find the key. recover() used to post another copy on EVERY run — the
+        exact thing the surface told the operator to run. Now: one re-send, then UNPROVEN."""
+        from core.outbox import UNPROVEN
+        self.stub.drop_post_metadata = True
+        box = self.box()
+        key = box.stage(CH, ASK_TS, TEXT, thread_id=ASK_TS)["key"]
+        with self.assertRaises(SendBlocked):
+            box.release(key)
+        self.assertEqual((box.get(key)["state"], len(self.posts())), (SENT, 1))
+        counts = self.box().recover()                           # run 1: the one re-send
+        self.assertEqual((counts["resent"], counts["unproven"]), (1, 1))
+        self.assertEqual((self.box().get(key)["state"], len(self.posts())), (UNPROVEN, 2))
+        for _ in range(3):                                      # later runs: nothing
+            self.assertEqual(self.box().recover()["resumed"], 0)
+        self.assertEqual(len(self.posts()), 2, "recovery posted a third copy")
+
+    def test_a_refused_post_hands_the_draft_back_to_the_gate(self):
+        """Review R2-8: Slack answered ok:false (the bot is not in the channel), so nothing
+        was posted — like a 429, the approval returns to STAGED instead of stranding in
+        INTENT with no Send and no Discard."""
+        from core.delivery import NotPosted
+        from core.outbox import DISCARDED
+        self.stub.fail_next["chat.postMessage"] = "not_in_channel"
+        box = self.box()
+        key = box.stage(CH, ASK_TS, TEXT, thread_id=ASK_TS)["key"]
+        with self.assertRaises(NotPosted) as cm:
+            box.release(key)
+        self.assertIn("not_in_channel", str(cm.exception))
+        self.assertEqual((box.get(key)["state"], self.stub.posted(CH)), (STAGED, []))
+        self.assertEqual(box.discard(key)["state"], DISCARDED)
+
+    def test_a_refused_re_send_in_recovery_hands_an_intent_row_back(self):
+        from core.outbox import _Crash
+        box = self.box()
+        key = box.stage(CH, ASK_TS, TEXT, thread_id=ASK_TS)["key"]
+        with self.assertRaises(_Crash):
+            box.release(key, _crash_at="after_intent")
+        self.stub.fail_next["chat.postMessage"] = "is_archived"
+        counts = self.box().recover()
+        self.assertEqual([k for k, _ in counts["errors"]], [key])
+        self.assertIn("is_archived", counts["errors"][0][1])
+        self.assertEqual((self.box().get(key)["state"], self.stub.posted(CH)), (STAGED, []))
+
+    def test_a_crash_before_read_back_on_a_truncated_post_recovers_to_mismatch(self):
+        """Review R2-7 (Y11), the restart half of F3: a new process must compare the
+        approved text too, or it COMMITs the mangled post it finds by key."""
+        from core.outbox import MISMATCH, _Crash
+        self.stub.truncate_posts_to = 20
+        box = self.box()
+        key = box.stage(CH, ASK_TS, TEXT, thread_id=ASK_TS)["key"]
+        with self.assertRaises(_Crash):
+            box.release(key, _crash_at="before_readback")
+        counts = self.box().recover()                           # a new process
+        self.assertEqual((counts["mismatched"], counts["resent"]), (1, 0))
+        self.assertEqual((self.box().get(key)["state"], len(self.posts())), (MISMATCH, 1),
+                         "a restart committed, or re-sent, a mangled post")
+
     # ---- guards 1, 4, 5 on the real adapter -----------------------------------------------
     def test_the_text_guards_refuse_before_any_post(self):
         box = self.box()

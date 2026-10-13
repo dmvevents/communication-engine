@@ -253,7 +253,7 @@ run_mutation "outbox: drop the already-delivered dedupe" \
 # exact 24-auto-reconcile bug: crash after send, then blindly re-send.
 run_mutation "outbox: recovery re-sends without proving prior delivery" \
   "core/outbox.py" \
-  "('                if self._read_back(target, key, row[\"thread_id\"], row[\"text\"],\\n                                   since=row[\"created_at\"]):', '                if False:')" \
+  "('                if self._read_back(target, key, row[\"thread_id\"], row[\"text\"], since=since):', '                if False:')" \
   "test_outbox_faults"
 
 # R1 — read-back verification before claiming success.
@@ -300,13 +300,13 @@ run_mutation "outbox: an in-flight row falls through to a second live send" \
 # the reply (VERIFIED rows are never resumed).
 run_mutation "outbox: recovery marks VERIFIED before it re-sends (loss under a recovery crash)" \
   "core/outbox.py" \
-  "('                else:\\n                    # recovery is a burst source too', '                else:\\n                    self._write(key, state=VERIFIED)\\n                    # recovery is a burst source too')" \
+  "('                else:\\n                    if not _can_send(self.adapter):', '                else:\\n                    self._write(key, state=VERIFIED)\\n                    if not _can_send(self.adapter):')" \
   "test_outbox_statemachine"
 
 # R1 — the duplicate direction, under the sweep instead of the named seams.
 run_mutation "outbox: recovery re-sends blind — the property sweep sees the duplicate" \
   "core/outbox.py" \
-  "('                if self._read_back(target, key, row[\"thread_id\"], row[\"text\"],\\n                                   since=row[\"created_at\"]):', '                if False:')" \
+  "('                if self._read_back(target, key, row[\"thread_id\"], row[\"text\"], since=since):', '                if False:')" \
   "test_outbox_statemachine"
 
 # R2 — liveness half of exactly-once: a retry that is never told 'delivered' retries
@@ -1057,7 +1057,7 @@ run_mutation "outbox: placement drops out of the idempotency key" \
 # not persisting it makes the outbox unable to answer which placement was used.
 run_mutation "outbox: the row stops recording which scope was used" \
   "core/outbox.py" \
-  "('                 policy, scope, thread_id, time.time(), time.time()))', '                 policy, \"channel\", None, time.time(), time.time()))')" \
+  "('                 policy, scope, thread_id, time.time(), time.time(), seen))', '                 policy, \"channel\", None, time.time(), time.time(), seen))')" \
   "test_outbox_threads"
 
 # ENH-3 — an adopter's existing outbox.db predates the thread columns; CREATE TABLE IF NOT
@@ -1601,7 +1601,7 @@ run_mutation "dashboard: staged drafts leave the operator gate" \
 # ENH-8 — severity order: the banner exists so the double-message risk is read FIRST.
 run_mutation "dashboard: the unanswered backlog outranks a crashed send" \
   "core/dashboard.py" \
-  "('SEVERITY = (\"engine_lost\", \"in_flight\", \"edited_after_response\", \"staged\",\n            \"unanswered\")', 'SEVERITY = (\"engine_lost\", \"unanswered\", \"edited_after_response\", \"staged\",\n            \"in_flight\")')" \
+  "('SEVERITY = (\"engine_lost\", \"in_flight\", \"unresolved_send\", \"edited_after_response\",\\n            \"staged\", \"unanswered\")', 'SEVERITY = (\"engine_lost\", \"unanswered\", \"unresolved_send\", \"edited_after_response\",\\n            \"staged\", \"in_flight\")')" \
   "test_dashboard"
 
 # ENH-8/R23 — an edit after our answer means the visible reply may answer text that no
@@ -1810,7 +1810,7 @@ run_mutation "parity: raw divergence counts return to the head of the panel" \
 # 'nothing below this line can be trusted'.
 run_mutation "dashboard: a proven loss no longer outranks a crashed send" \
   "core/dashboard.py" \
-  "('SEVERITY = (\"engine_lost\", \"in_flight\", \"edited_after_response\", \"staged\",', 'SEVERITY = (\"in_flight\", \"engine_lost\", \"edited_after_response\", \"staged\",')" \
+  "('SEVERITY = (\"engine_lost\", \"in_flight\", \"unresolved_send\", \"edited_after_response\",', 'SEVERITY = (\"in_flight\", \"engine_lost\", \"unresolved_send\", \"edited_after_response\",')" \
   "test_dashboard"
 
 # ENGINE_LOST goes nonzero and no attention item fires — the panel exists but the
@@ -2107,7 +2107,7 @@ run_mutation "outbox: stage() falls through to the adapter (compose auto-sends)"
 # implies someone could later approve a send the policy forbids.
 run_mutation "outbox: stage() accepts a never-policy target" \
   "core/outbox.py" \
-  "('        if self.policy_for(target, scope) == \"never\":', '        if False:')" \
+  "('        self._check_policy(target, scope, PolicyError, \"stage\")', '        pass')" \
   "test_outbox_write"
 
 # ENH-28 — the approval must be durable BEFORE the adapter: without the flip, a
@@ -2151,7 +2151,7 @@ run_mutation "outbox: release() flips a draft whose adapter cannot send" \
 # staging must refuse, however long the draft sat at the gate.
 run_mutation "outbox: release() honours the policy from staging time, not the click" \
   "core/outbox.py" \
-  "('        if self.policy_for(row[\"target\"], row[\"scope\"]) == \"never\":', '        if False:')" \
+  "('        self._check_policy(row[\"target\"], row[\"scope\"], PolicyError, \"release\")', '        pass')" \
   "test_outbox_write"
 
 # ENH-28 — discard() must refuse anything that is not a draft: 'discarding' a
@@ -2188,7 +2188,7 @@ run_mutation "dashboard.py (shell): a junk gate value is silently accepted" \
 # the R22 cues and the ENH-9 signal once died).
 run_mutation "dashboard_write: the compose form sends instead of staging" \
   "scripts/dashboard_write.py" \
-  "('        res = outbox.stage(ch.id, trigger, text, thread_id=thread)', '        res = outbox.stage(ch.id, trigger, text, thread_id=thread); res = _outbox_for(cfg, inst, _adapter_for(cfg, inst)).release(res[\"key\"])')" \
+  "('        res = outbox.stage(ch.id, trigger, text, thread_id=thread,\\n                           seen_ts=_seen_ts_for(cfg, ch.id, thread))', '        res = outbox.stage(ch.id, trigger, text, thread_id=thread,\\n                           seen_ts=_seen_ts_for(cfg, ch.id, thread)); res = _outbox_for(cfg, inst, _adapter_for(cfg, inst)).release(res[\"key\"])')" \
   "test_dashboard_write"
 
 # ENH-28 — rendering reads, actions write: a missing outbox is the normal fresh
@@ -2615,7 +2615,7 @@ run_mutation "threads: the unattributed placeholder sender answers an ask" \
 
 run_mutation "schedule: the cycle sweeps without the classifier's verdict" \
   "core/schedule.py" \
-  "('                    is_answer=lambda m, _src=src: classify(\n                        m.get(\"text\") or \"\", _src.taxonomy,\n                        attachments=m.get(\"attachments\")).kind not in ACTIONABLE_KINDS)', '                    is_answer=None)')" \
+  "('                    is_answer=lambda m, _src=src: classify(\\n                        m.get(\"text\") or \"\", _src.taxonomy,\\n                        attachments=m.get(\"attachments\")).kind not in ACTIONABLE_KINDS,\\n                    refusals=dm_refused))', '                    is_answer=None,\\n                    refusals=dm_refused))')" \
   "test_schedule"
 
 # review F8 — one platform call per thread root, one budget per adapter, 429 stops the source.
@@ -3049,7 +3049,7 @@ run_mutation "dashboard_write: a re-read acknowledgement is reported as a plain 
   "('    if res.get(\"re_read\"):', '    if False:')" \
   "test_dashboard_write"
 
-run_mutation "dashboard_write: a MISMATCH is flashed as 'SENT, unproven — run recover()'" \
+run_mutation "dashboard_write: a MISMATCH is flashed as a refusal (the surface's own branch is gone)" \
   "scripts/dashboard_write.py" \
   "('        if state == MISMATCH:', '        if False:')" \
   "test_dashboard_write"
@@ -3071,7 +3071,7 @@ run_mutation "outbox: a direct policy sends through an adapter declaring direct 
 
 run_mutation "outbox: re-staging does not refresh what the human saw" \
   "core/outbox.py" \
-  "('(seen_ts, time.time(), key, STAGED))', '(row[\"seen_ts\"], time.time(), key, STAGED))')" \
+  "('                    \"WHERE key=? AND state=?\", (row[\"refused_ts\"], time.time(), key, STAGED))', '                    \"WHERE key=? AND state=?\", (row[\"seen_ts\"], time.time(), key, STAGED))')" \
   "test_outbox_write"
 
 run_mutation "outbox: the click compares with the host clock, not with what the human saw" \
@@ -3132,6 +3132,172 @@ run_mutation "docs: the write-surface paragraph counts six pre-flip guards again
   "docs/QUICKSTART.md" \
   "('Every Slack send passes five refusals **before** the durable INTENT flip and one proof\\nafter the post,', 'Every Slack send passes six guards, each refusing **before** the durable INTENT flip,')" \
   "test_docs"
+
+# ---- ENH-31 review round 2 (R2-1 .. R2-15, Y2/Y3/Y5/Y8/Y11, N5, N9) ----
+run_mutation "slack: the poll never asks for message metadata (the engine's own post reads as a human's)" \
+  "channels/slack/adapter.py" \
+  "('               for m in self._history_raw(channel, oldest, with_metadata=True)]', '               for m in self._history_raw(channel, oldest)]')" \
+  "test_slack_stub_e2e"
+
+run_mutation "slack: the sweep's replies never ask for message metadata" \
+  "channels/slack/adapter.py" \
+  "('        raw = self._replies_raw(channel, thread_ts, oldest, with_metadata=True)', '        raw = self._replies_raw(channel, thread_ts, oldest)')" \
+  "test_slack_stub_e2e"
+
+run_mutation "threads: the sweep credits the engine's own post as an answer" \
+  "core/threads.py" \
+  "('        if _is_engine_post(r):\\n            # The engine\\'s own delivery', '        if False:\\n            # The engine\\'s own delivery')" \
+  "test_threads"
+
+run_mutation "threads: a raw that parses to a non-object crashes the DM rule" \
+  "core/threads.py" \
+  "('    if not isinstance(payload, dict):          # a raw that parses to 123, a list, true\\n        return False', '    if False:\\n        return False')" \
+  "test_threads"
+
+run_mutation "threads: the DM rule's refusal is not named to the caller" \
+  "core/threads.py" \
+  "('        if refusals is not None:\\n            refusals.append(', '        if False:\\n            refusals.append(')" \
+  "test_threads"
+
+run_mutation "schedule: the DM rule's refusals are dropped from the cycle summary" \
+  "core/schedule.py" \
+  "('                \"sweep_skipped\": sweep_skipped, \"dm_refused\": dm_refused}', '                \"sweep_skipped\": sweep_skipped, \"dm_refused\": []}')" \
+  "test_schedule"
+
+run_mutation "scheduler: a DM-rule refusal prints no line" \
+  "scripts/scheduler.py" \
+  "('    for ch, why in summary.get(\"dm_refused\", ()):', '    for ch, why in ():')" \
+  "test_schedule"
+
+run_mutation "outbox: the click accepts any policy value that is not never" \
+  "core/outbox.py" \
+  "('        self._check_policy(row[\"target\"], row[\"scope\"], PolicyError, \"release\")', '        if self.policy_for(row[\"target\"], row[\"scope\"]) == \"never\":\\n            raise PolicyError(\"never\")')" \
+  "test_outbox_write"
+
+run_mutation "outbox: stage() accepts any policy value that is not never" \
+  "core/outbox.py" \
+  "('        self._check_policy(target, scope, PolicyError, \"stage\")', '        if self.policy_for(target, scope) == \"never\":\\n            raise PolicyError(\"never\")')" \
+  "test_outbox_write"
+
+run_mutation "outbox: a refusal does not record the message it named" \
+  "core/outbox.py" \
+  "('            self._write(row[\"key\"], refused_ts=str(latest.get(\"ts\")))', '            pass')" \
+  "test_outbox_write"
+
+run_mutation "outbox: the acknowledgement jumps to the platform's newest, not to the named message" \
+  "core/outbox.py" \
+  "('                    \"WHERE key=? AND state=?\", (row[\"refused_ts\"], time.time(), key, STAGED))', '                    \"WHERE key=? AND state=?\", (seen_ts, time.time(), key, STAGED))')" \
+  "test_outbox_write"
+
+run_mutation "outbox: a send()-minted draft has no baseline (the host clock judges its click)" \
+  "core/outbox.py" \
+  "('            seen = self._seen_ts(target, thread_id) if policy == \"staged\" else None', '            seen = None')" \
+  "test_outbox_write"
+
+run_mutation "outbox: the caller's baseline is ignored (the platform's newest wins)" \
+  "core/outbox.py" \
+  "('        if seen_ts is None:\\n            seen_ts = self._seen_ts(target, thread_id)', '        seen_ts = self._seen_ts(target, thread_id)')" \
+  "test_outbox_write"
+
+run_mutation "outbox: recovery re-sends a row it already re-sent once" \
+  "core/outbox.py" \
+  "('                elif row[\"resent_at\"] is not None:', '                elif False:')" \
+  "test_outbox_write"
+
+run_mutation "outbox: the one re-send is never recorded (a later run posts a third copy)" \
+  "core/outbox.py" \
+  "('                    self._write(key, receipt=json.dumps(receipt), resent_at=time.time())', '                    self._write(key, receipt=json.dumps(receipt))')" \
+  "test_outbox_write"
+
+run_mutation "outbox: recovery ignores the adapter's send capability (a user token re-sends)" \
+  "core/outbox.py" \
+  "('                    if not _can_send(self.adapter):', '                    if False:')" \
+  "test_outbox_write"
+
+run_mutation "outbox: recovery retries a failing row forever" \
+  "core/outbox.py" \
+  "('                if attempt >= MAX_RECOVER_ATTEMPTS:', '                if False:')" \
+  "test_outbox_write"
+
+run_mutation "outbox: the restart search is bounded by the host clock again" \
+  "core/outbox.py" \
+  "('                since = row[\"seen_ts\"] if row[\"seen_ts\"] else row[\"created_at\"]', '                since = row[\"created_at\"]')" \
+  "test_outbox_write"
+
+run_mutation "outbox: a refused post strands the approved draft in INTENT" \
+  "core/outbox.py" \
+  "('        except (RateLimited, NotPosted):', '        except RateLimited:')" \
+  "test_slack_send"
+
+run_mutation "outbox: recovery's refused re-send strands the row" \
+  "core/outbox.py" \
+  "('                self._claim(key, INTENT, STAGED)\\n                counts[\"errors\"].append((key, f\"{type(ex).__name__}: {ex}\"))', '                counts[\"errors\"].append((key, f\"{type(ex).__name__}: {ex}\"))')" \
+  "test_slack_send"
+
+run_mutation "outbox: the 429 hand-back is unconditional (a 429 on the read-back re-stages a posted row)" \
+  "core/outbox.py" \
+  "('            self._claim(key, INTENT, STAGED)\\n            raise', '            self._write(key, state=STAGED)\\n            raise')" \
+  "test_outbox_write"
+
+run_mutation "outbox: recovery stops passing the approved text (a restart commits a mangled post)" \
+  "core/outbox.py" \
+  "('                if self._read_back(target, key, row[\"thread_id\"], row[\"text\"], since=since):', '                if self._read_back(target, key, row[\"thread_id\"], since=since):')" \
+  "test_slack_send"
+
+run_mutation "slack: a refused post is reported as a generic API error" \
+  "channels/slack/adapter.py" \
+  "('            raise NotPosted(f\"chat.postMessage refused by the platform: {ex.error}\") from ex', '            raise')" \
+  "test_slack_send"
+
+run_mutation "slack: health hides an active API base override" \
+  "channels/slack/adapter.py" \
+  "('            detail_suffix += f\"; API base override active: {self._api_base}\"', '            pass')" \
+  "test_slack_adapter"
+
+run_mutation "slack: newest() in a thread never asks for metadata (the engine's own reply refuses the next)" \
+  "channels/slack/adapter.py" \
+  "('            others = [m for m in self._replies_raw(channel_id, str(thread_id),\\n                                                   with_metadata=True)', '            others = [m for m in self._replies_raw(channel_id, str(thread_id))')" \
+  "test_slack_adapter"
+
+run_mutation "slack: newest() looks at the single newest message only (an unseen human message hides behind our post)" \
+  "channels/slack/adapter.py" \
+  "('            page = self._api(\"conversations.history\", channel=channel_id, limit=20,', '            page = self._api(\"conversations.history\", channel=channel_id, limit=1,')" \
+  "test_slack_adapter"
+
+run_mutation "slack: _canonical never unwraps an unlabelled mailto link" \
+  "channels/slack/adapter.py" \
+  "('    t = re.sub(r\"<mailto:([^|>]+)>\", r\"\\\\1\", t)\\n', '')" \
+  "test_slack_adapter"
+
+run_mutation "dashboard: a MISMATCH or UNPROVEN row is not triage" \
+  "core/dashboard.py" \
+  "('                \"WHERE state IN (\\'MISMATCH\\',\\'UNPROVEN\\') ORDER BY created_at\"):', '                \"WHERE state IN (\\'NEVER\\') ORDER BY created_at\"):')" \
+  "test_dashboard"
+
+run_mutation "dashboard: one reply closing several asks is not flagged" \
+  "core/dashboard.py" \
+  "('            c[\"also_closed\"] = shared.get(c[\"response_key\"], 1) - 1', '            c[\"also_closed\"] = 0')" \
+  "test_dashboard"
+
+run_mutation "dashboard_write: a Reply is baselined on the platform's newest, not on what the page showed" \
+  "scripts/dashboard_write.py" \
+  "('                           seen_ts=_seen_ts_for(cfg, ch.id, thread))', '                           seen_ts=None)')" \
+  "test_dashboard_write"
+
+run_mutation "dashboard_write: a refused post is flashed as a generic error" \
+  "scripts/dashboard_write.py" \
+  "('    except NotPosted as ex:', '    except () as ex:')" \
+  "test_dashboard_write"
+
+run_mutation "dashboard_write: an UNPROVEN row has no card" \
+  "scripts/dashboard_write.py" \
+  "('        mismatched = _rows(outbox_path, (MISMATCH, UNPROVEN))', '        mismatched = _rows(outbox_path, (MISMATCH,))')" \
+  "test_dashboard_write"
+
+run_mutation "config: a letters-only or underscored D name infers a DM again" \
+  "core/config.py" \
+  "('_SLACK_DM_ID = re.compile(r\"D(?=[A-Z0-9]*[0-9])[A-Z0-9]{8,}\")', '_SLACK_DM_ID = re.compile(r\"D[A-Z0-9_]{8,}\")')" \
+  "test_config"
 
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"

@@ -21,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.outbox import (COMMITTED, DISCARDED, INTENT, Outbox,  # noqa: E402
+from core.outbox import (COMMITTED, DISCARDED, INTENT, Outbox, SENT,  # noqa: E402
                          PolicyError, ReleaseError, SendBlocked, STAGED,
                          _Crash, idempotency_key)
 
@@ -695,6 +695,198 @@ class SendGuardsTest(unittest.TestCase):
         Outbox(self.db, GuardedFake(direct=False), {TARGET: "staged"}, send_interval=0.0)
         Outbox(self.db, GuardedFake(direct=True), {TARGET: "direct"}, send_interval=0.0)
         Outbox(self.db, FakeAdapter(), {TARGET: "direct"}, send_interval=0.0)   # absent = allowed
+
+    # ---- review round 2: the click and stage() default-deny too (R2-4) ----------------------
+    def test_the_click_and_stage_default_deny_any_policy_value_that_is_not_staged(self):
+        """Review R2-4: default deny existed only in send(); release() — the one production
+        send path — and stage() checked `== "never"` and sent on 'off', 'Staged' or a
+        post-construction 'direct'."""
+        box = self.box()
+        key = box.stage(TARGET, TS, self.MARKED)["key"]
+        for junk in ("off", "Staged", "direct", {"channel": None}):
+            box.policies[TARGET] = junk
+            with self.assertRaises(PolicyError, msg=repr(junk)):
+                box.release(key)
+            self.assertEqual((box.get(key)["state"], self.adapter.delivered), (STAGED, []))
+        box.policies[TARGET] = "staged"
+        self.assertEqual(box.release(key)["state"], COMMITTED)
+        for junk in ("off", "Staged", {"channel": None}):
+            with self.assertRaises(PolicyError, msg=repr(junk)):
+                self.box(policy=junk).stage(TARGET, "2.0", self.MARKED)
+
+    # ---- review round 2: the baseline is what the human SAW (R2-5) -------------------------
+    def test_a_refusal_records_the_message_it_named_and_the_acknowledgement_moves_only_there(self):
+        """Review R2-5 case B: the click refuses naming message A; message B arrives; the
+        operator re-stages as told. The baseline must advance to A — the message the
+        refusal showed — so the next click names B, and only the click after that posts."""
+        self.adapter.latest = {"ts": "100.0", "sender_id": "U_ASKER"}
+        box = self.box()
+        key = box.stage(TARGET, TS, self.MARKED)["key"]
+        self.adapter.latest = {"ts": "101.0", "sender_id": "U_A"}          # A
+        with self.assertRaises(ReleaseError):
+            box.release(key)
+        self.assertEqual(box.get(key)["refused_ts"], "101.0")
+        self.adapter.latest = {"ts": "102.0", "sender_id": "U_B"}          # B, never named
+        again = box.stage(TARGET, TS, self.MARKED)
+        self.assertEqual((again.get("re_read"), box.get(key)["seen_ts"]), (True, "101.0"),
+                         "the acknowledgement absorbed a message no refusal ever named")
+        self.assertIsNone(box.get(key)["refused_ts"])
+        with self.assertRaises(ReleaseError) as cm:
+            box.release(key)
+        self.assertIn("102.0", str(cm.exception))
+        self.assertEqual(box.stage(TARGET, TS, self.MARKED).get("re_read"), True)
+        self.assertEqual(box.get(key)["seen_ts"], "102.0")
+        self.assertEqual(box.release(key)["state"], COMMITTED)
+        # a plain re-stage with nothing refused is a dedupe, not an acknowledgement
+        self.adapter.latest = {"ts": "103.0", "sender_id": "U_C"}
+        key2 = box.stage(TARGET, "9.0", self.MARKED)["key"]
+        self.adapter.latest = {"ts": "104.0", "sender_id": "U_C"}
+        plain = box.stage(TARGET, "9.0", self.MARKED)
+        self.assertEqual((plain["deduped"], plain.get("re_read"), box.get(key2)["seen_ts"]),
+                         (True, None, "103.0"))
+
+    def test_the_callers_baseline_is_what_the_human_saw_not_the_platforms_newest(self):
+        """Review R2-5 case A: the page lags the platform by a poll. What the page showed
+        is the baseline; a message the platform holds but no page displayed refuses."""
+        self.adapter.latest = {"ts": "200.0", "sender_id": "U_ASKER"}      # unseen on the page
+        box = self.box()
+        key = box.stage(TARGET, TS, self.MARKED, seen_ts="100.0")["key"]
+        self.assertEqual(box.get(key)["seen_ts"], "100.0")
+        with self.assertRaises(ReleaseError) as cm:
+            box.release(key)
+        self.assertIn("200.0", str(cm.exception))
+        self.assertEqual(self.adapter.delivered, [])
+
+    def test_a_draft_minted_by_send_at_policy_staged_carries_the_baseline_too(self):
+        self.adapter.latest = {"ts": "100.0", "sender_id": "U_ASKER"}
+        box = self.box()
+        res = box.send(TARGET, TS, self.MARKED)
+        self.assertEqual(res["state"], STAGED)
+        self.assertEqual(box.get(res["key"])["seen_ts"], "100.0",
+                         "a send()-minted draft is judged on the host clock at its click")
+
+    # ---- review round 2: recovery is bounded, token-aware, platform-bounded (R2-6..R2-11) --
+    def test_recovery_re_sends_an_unprovable_row_once_then_parks_it(self):
+        from core.outbox import UNPROVEN
+
+        class NeverProven(GuardedFake):
+            def read_back(self, target, key, thread_id=None, text=None, since=None):
+                return False
+        adapter = NeverProven()
+        box = self.box(adapter=adapter)
+        key = box.stage(TARGET, TS, self.MARKED)["key"]
+        box.conn.execute("UPDATE outbox SET state='INTENT' WHERE key=?", (key,))
+        box.conn.commit()
+        counts = box.recover()
+        self.assertEqual((counts["resent"], counts["unproven"], len(adapter.delivered)), (1, 1, 1))
+        self.assertEqual(box.get(key)["state"], UNPROVEN)
+        self.assertIsNotNone(box.get(key)["resent_at"])
+        self.assertEqual(box.recover()["resumed"], 0, "an UNPROVEN row was touched again")
+        self.assertEqual(len(adapter.delivered), 1, "recovery posted a third copy")
+        res = box.send(TARGET, TS, self.MARKED)                   # a live retry of the same text
+        self.assertEqual((res["state"], res.get("unresolved"), len(adapter.delivered)),
+                         (UNPROVEN, True, 1))
+
+    def test_a_row_recovery_already_re_sent_is_never_posted_again_after_a_crash(self):
+        """The crash window of R2-6: a run re-sent the row, recorded it, and died before it
+        could park or commit. The next run finds the record and the platform still shows
+        no key — it must park the row, never post a third copy."""
+        import time as _time
+        from core.outbox import UNPROVEN
+
+        class NeverProven(GuardedFake):
+            def read_back(self, target, key, thread_id=None, text=None, since=None):
+                return False
+        adapter = NeverProven()
+        box = self.box(adapter=adapter)
+        key = box.stage(TARGET, TS, self.MARKED)["key"]
+        box.conn.execute("UPDATE outbox SET state='SENT', resent_at=? WHERE key=?",
+                         (_time.time(), key))
+        box.conn.commit()
+        counts = box.recover()
+        self.assertEqual((counts["resent"], counts["unproven"], adapter.delivered), (0, 1, []))
+        self.assertEqual(box.get(key)["state"], UNPROVEN)
+
+    def test_a_row_whose_read_back_keeps_failing_is_parked_after_three_runs(self):
+        """Review F7's missing half: a dead thread (replies -> thread_not_found) must not be
+        retried forever; after MAX_RECOVER_ATTEMPTS runs it is parked for a human."""
+        from core.outbox import MAX_RECOVER_ATTEMPTS, UNPROVEN
+
+        class DeadThreadFake(GuardedFake):
+            def read_back(self, target, key, thread_id=None, text=None, since=None):
+                raise RuntimeError("conversations.replies failed: thread_not_found")
+        adapter = DeadThreadFake()
+        box = self.box(adapter=adapter)
+        key = box.stage(TARGET, TS, self.MARKED, thread_id="dead")["key"]
+        box.conn.execute("UPDATE outbox SET state='INTENT' WHERE key=?", (key,))
+        box.conn.commit()
+        for n in range(1, MAX_RECOVER_ATTEMPTS):
+            counts = box.recover()
+            self.assertEqual((box.get(key)["state"], box.get(key)["attempts"]), (INTENT, n))
+            self.assertIn("thread_not_found", counts["errors"][0][1])
+        counts = box.recover()
+        self.assertEqual((box.get(key)["state"], counts["unproven"]), (UNPROVEN, 1))
+        self.assertEqual(adapter.delivered, [], "a dead thread was re-sent, top-level or not")
+        self.assertEqual(box.recover()["resumed"], 0)
+
+    def test_recovery_honours_the_adapters_send_capability(self):
+        """Review R2-11: a row approved under a bot token must not be re-sent under a token
+        the adapter declares cannot send (a user token posts in a person's name)."""
+        class NoSendNow(GuardedFake):
+            def capabilities(self):
+                return dict(super().capabilities(), send=False)
+        adapter = NoSendNow()
+        box = self.box(adapter=adapter)
+        key = box.stage(TARGET, TS, self.MARKED)["key"]
+        box.conn.execute("UPDATE outbox SET state='INTENT' WHERE key=?", (key,))
+        box.conn.commit()
+        counts = box.recover()
+        self.assertEqual((counts["resent"], adapter.delivered), (0, []))
+        self.assertIn("send capability", counts["errors"][0][1])
+        self.assertEqual(box.get(key)["state"], INTENT)
+
+    def test_recovery_bounds_the_restart_search_by_the_platform_ts_the_human_saw(self):
+        """Review R2-10: the bound was the host clock's created_at minus a margin; a host
+        clock minutes fast missed the post and re-sent it. seen_ts is a platform ts."""
+        class SinceFake(GuardedFake):
+            def read_back(self, target, key, thread_id=None, text=None, since=None):
+                self.read_back_kwargs.append(since)
+                return super(GuardedFake, self).read_back(target, key)
+        adapter = SinceFake()
+        adapter.latest = {"ts": "100.0", "sender_id": "U_ASKER"}
+        box = self.box(adapter=adapter)
+        key = box.stage(TARGET, TS, self.MARKED)["key"]
+        box.conn.execute("UPDATE outbox SET state='INTENT' WHERE key=?", (key,))
+        box.conn.commit()
+        box.recover()
+        self.assertEqual(adapter.read_back_kwargs[0], "100.0")
+
+    def test_a_429_on_the_read_back_leaves_the_posted_row_sent(self):
+        """Review R2-7 (Y8): the 429 hand-back is a compare-and-swap on INTENT. After the
+        post landed the row is SENT; a 429 on the READ-BACK must leave it there, or the
+        next click posts a duplicate."""
+        from core.ratelimit import RateLimited
+
+        class LimitedReadBack(GuardedFake):
+            def __init__(self):
+                super().__init__()
+                self.limit_once = True
+
+            def read_back(self, target, key, thread_id=None, text=None, since=None):
+                if self.limit_once:
+                    self.limit_once = False
+                    raise RateLimited("5", method="conversations.history")
+                return super().read_back(target, key)
+        adapter = LimitedReadBack()
+        box = self.box(adapter=adapter)
+        key = box.stage(TARGET, TS, self.MARKED)["key"]
+        with self.assertRaises(RateLimited):
+            box.release(key)
+        self.assertEqual((box.get(key)["state"], len(adapter.delivered)), (SENT, 1))
+        again = box.release(key)                                  # the human clicks again
+        self.assertEqual((again.get("in_flight"), len(adapter.delivered)), (True, 1))
+        self.assertEqual(box.recover()["already_delivered"], 1)
+        self.assertEqual(box.get(key)["state"], COMMITTED)
 
     # ---- guard 3's third answer: present, but not the approved text (review F3) ----------
     def test_a_mismatched_post_is_parked_never_re_sent_never_committed(self):

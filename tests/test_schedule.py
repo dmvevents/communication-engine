@@ -1182,6 +1182,21 @@ class DmAnsweredStateTest(SchedulerHarness):
                          "a thread reply was taken for a top-level DM answer")
         self.assertIsNone(self.journal.get(self.DM, "2.0")["responded_at"])
 
+    def test_a_non_orderable_dm_channel_is_refused_by_name_in_the_cycle_summary(self):
+        """Review R2-13: the DM rule declined a whole channel and the cycle said nothing —
+        an empty answered count read as 'nothing to do'."""
+        adapter, sched = self.dm()
+        mailbox = "INBOX"
+        sched2 = self.scheduler(adapter, channels=(self.DM,), dm_channels=(self.DM, mailbox))
+        self.journal.record(mailbox, "1@mail.example", sender_id="U_HUMAN",
+                            text="where is it?", kind="QUESTION")
+        self.store.upsert_messages([msg(mailbox, "1@mail.example", "where is it?",
+                                        sender_id="U_HUMAN")])
+        summary = sched2.cycle()
+        self.assertEqual([ch for ch, _ in summary["dm_refused"]], [mailbox])
+        self.assertIn("non-orderable", summary["dm_refused"][0][1])
+        self.assertEqual(sched.cycle()["dm_refused"], [])
+
     def test_a_configured_answerer_list_restricts_who_closes_an_ask(self):
         adapter, sched = self.dm(answerers=("U_BOT",))
         adapter.seed([msg(self.DM, "1.0", "where is the dashboard?", sender_id="U_HUMAN")])
@@ -1239,7 +1254,7 @@ class SchedulerScriptWiringTest(unittest.TestCase):
         raw = {"engine": {"state_dir": "state", "channels_dir": str(root / "channels")},
                "instances": [{"name": "team", "adapter": "fake",
                               "answerers": ["U_BOT", "U_OPERATOR"],
-                              "channels": [{"id": "C_CUST"}, {"id": "D_SOMEONE_DM"},
+                              "channels": [{"id": "C_CUST"}, {"id": "D_SOMEONE_DM", "kind": "dm"},
                                            {"id": "C_DECLARED", "kind": "dm"}]}]}
         (src,) = self.sources(raw)
         self.assertEqual(src.channels, ("C_CUST", "D_SOMEONE_DM", "C_DECLARED"))
@@ -1282,6 +1297,14 @@ class ReportLinesTest(unittest.TestCase):
         lines = self.lines()
         self.assertEqual(len(lines), 1, lines)
         self.assertTrue(lines[0].startswith("cycle: polled=3 fresh=1"))
+
+    def test_a_dm_rule_refusal_gets_its_own_line(self):
+        lines = self.lines(dm_refused=[("INBOX", "non-orderable id space — the DM rule "
+                                                 "cannot tell a later message from an earlier one")])
+        refused = [ln for ln in lines if ln.startswith("dm-rule: REFUSED")]
+        self.assertEqual(len(refused), 1, lines)
+        self.assertIn("channel=INBOX", refused[0])
+        self.assertIn("non-orderable", refused[0])
 
 
 if __name__ == "__main__":

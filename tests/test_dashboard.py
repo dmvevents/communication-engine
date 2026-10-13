@@ -151,6 +151,7 @@ class SnapshotTest(unittest.TestCase):
         constant must fail here, not re-derive the expectation."""
         sevs = [i["severity"] for i in self.snap()["attention"]]
         self.assertEqual(sevs, sorted(sevs, key=["engine_lost", "in_flight",
+                                                 "unresolved_send",
                                                  "edited_after_response",
                                                  "staged", "unanswered"].index))
         self.assertEqual(sevs[0], "in_flight",
@@ -158,6 +159,30 @@ class SnapshotTest(unittest.TestCase):
                          "mid-flight can double-message someone — nothing else "
                          "outranks it")
         self.assertEqual(sevs[-1], "unanswered")
+
+    def test_a_mismatch_or_unproven_row_is_triage_not_a_side_count(self):
+        """Review round 2 (R2-3): a MISMATCH or UNPROVEN row can double-message someone like
+        an in-flight row, yet the page read ALL CLEAR over one — it was only a count in the
+        outbox tab. It ranks right after in_flight and names its state."""
+        conn = sqlite3.connect(self.outbox)
+        done = conn.execute("SELECT key FROM outbox WHERE state='COMMITTED'").fetchone()[0]
+        draft = conn.execute("SELECT key FROM outbox WHERE state='STAGED'").fetchone()[0]
+        conn.execute("UPDATE outbox SET state='MISMATCH' WHERE key=?", (done,))
+        conn.execute("UPDATE outbox SET state='UNPROVEN' WHERE key=?", (draft,))
+        conn.commit()
+        conn.close()
+        s = self.snap()
+        items = self.by_severity(s, "unresolved_send")
+        self.assertEqual(sorted(i["state"] for i in items), ["MISMATCH", "UNPROVEN"])
+        for i in items:
+            self.assertEqual(i["instance"], "team")
+            self.assertIn("settle it there", i["why"])
+        sevs = [i["severity"] for i in s["attention"]]
+        self.assertLess(sevs.index("in_flight"), sevs.index("unresolved_send"))
+        for later in ("edited_after_response", "staged", "unanswered"):
+            if later in sevs:
+                self.assertLess(sevs.index("unresolved_send"), sevs.index(later), later)
+        self.assertEqual(s["outbox"]["team"]["MISMATCH"], 1)
 
     def test_in_flight_is_exactly_the_intent_and_sent_rows(self):
         """COMMITTED is done and STAGED is a different queue; surfacing either as a
@@ -252,6 +277,7 @@ class ParityViewTest(unittest.TestCase):
                          "it takes the top of the queue")
         self.assertIn("in_flight", sevs)
         self.assertEqual(sevs, sorted(sevs, key=["engine_lost", "in_flight",
+                                                 "unresolved_send",
                                                  "edited_after_response",
                                                  "staged", "unanswered"].index))
 
@@ -540,6 +566,20 @@ class ClosedByOthersTest(unittest.TestCase):
                           s["journal"]["answered"]), (1, 1, 3))
         self.assertEqual([a["ts"] for a in s["attention"] if a["severity"] == "unanswered"],
                          ["4.0"])
+
+    def test_one_reply_closing_several_asks_is_flagged(self):
+        """Review N9: the F1 signature — and the sweep's by-design behaviour under one root
+        — is one response_key on several asks; the list must say so, counted over the
+        whole journal."""
+        j = Journal(self.journal)
+        j.record("C_TEAM", "5.0", sender_id="U2", text="me too — where?", kind="QUESTION")
+        j.mark_responded("C_TEAM", "5.0", "thread-reply:1.5", at=40.0)
+        j.close()
+        s = snapshot(self.journal, {})
+        by_ts = {c["ts"]: c for c in s["closed_by_others"]}
+        self.assertEqual(by_ts["5.0"]["also_closed"], 1)
+        self.assertEqual(by_ts["1.0"]["also_closed"], 1)
+        self.assertEqual(by_ts["2.0"]["also_closed"], 0)
 
     def test_a_missing_journal_lists_nothing_and_stays_unknown(self):
         s = snapshot(Path(self.tmp.name) / "absent.db", {})
