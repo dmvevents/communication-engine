@@ -220,7 +220,10 @@ class Scheduler:
             # one-Scheduler-per-run keeps every guarantee. A 429 ends this source's
             # sweeping for the cycle; polling is already done.
             budget = threads.SWEEP_MAX
-            order = self._sweep_order_for(src)
+            # A declared DM has no threads in practice (535 DM messages, 0 in-thread) and
+            # its asks close by the DM rule below, so its asks must not spend the thread
+            # budget every cycle (review N2).
+            order = [c for c in self._sweep_order_for(src) if c not in src.dm_channels]
             swept_now, skipped_now, spent = [], [], {}
             stopped = None              # set once a 429 ends this source's sweeping
             for i, ch in enumerate(order):

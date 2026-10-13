@@ -47,6 +47,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from core.delivery import ENGINE_EVENT_TYPE, DeliveryMismatch
 from core.ratelimit import RateLimited
 
 API_BASE = "https://slack.com/api"
@@ -67,12 +68,14 @@ def api_base(env=None) -> str:
     if not value:
         return API_BASE
     u = urllib.parse.urlparse(value)
-    if (u.scheme != "http" or u.hostname not in ("127.0.0.1", "localhost")
+    # The literal loopback address only: "localhost" resolves through /etc/hosts, which
+    # can point anywhere (review N5).
+    if (u.scheme != "http" or u.hostname != "127.0.0.1"
             or not u.port or u.path not in ("", "/") or u.query or u.fragment
             or u.username is not None):
         raise ValueError(
-            f"{API_BASE_ENV} must be http://127.0.0.1:<port> or http://localhost:<port> — "
-            f"a loopback stub for tests, never a third host; refusing {value!r}")
+            f"{API_BASE_ENV} must be http://127.0.0.1:<port> — a loopback stub for tests, "
+            f"never a third host or a name; refusing {value!r}")
     return f"http://{u.hostname}:{u.port}"
 
 # Deny-by-default: everything this adapter is allowed to call, exhaustively. Extending
@@ -91,7 +94,7 @@ READ_METHODS = frozenset({
 # reply", nothing else.
 WRITE_METHODS = frozenset({"chat.postMessage"})
 MAX_TEXT_CHARS = 3500     # Slack silently splits >4,000 chars and returns one ts (2026-09-18)
-METADATA_EVENT = "comms_engine_reply"
+METADATA_EVENT = ENGINE_EVENT_TYPE   # one definition, in core/delivery.py
 
 # Platform id shapes (uppercase-only, so lowercase channel names can never collide —
 # Slack forbids uppercase in channel names). Written so the pattern SOURCE cannot
@@ -123,10 +126,16 @@ class ReadOnlyViolation(RuntimeError):
 
 
 def _canonical(text: str) -> str:
-    """Slack stores `&`, `<`, `>` escaped and may wrap a URL as `<url>` or `<url|label>`;
-    compare both sides through this so "exact text" means exact CONTENT (ENH-31 guard 3)."""
+    """Slack stores `&`, `<`, `>` escaped, wraps a typed URL as `<url>`, and auto-links a
+    bare domain or an email as `<scheme:target|label>` where the LABEL is what the human
+    typed (`<http://docs.example|docs.example>`, `<mailto:a@b|a@b>`). Compare both sides
+    through this so "exact text" means exact CONTENT: a labelled link is its label, an
+    unlabelled one its target without the mailto: scheme (review F8 — keeping the URL
+    instead of the label made a reply naming a bare domain fail its own read-back)."""
     t = (text or "").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-    t = re.sub(r"<(https?://[^|>]+)(?:\|[^>]*)?>", r"\1", t)
+    t = re.sub(r"<(?:https?://|mailto:)[^|>]+\|([^>]*)>", r"\1", t)
+    t = re.sub(r"<(https?://[^|>]+)>", r"\1", t)
+    t = re.sub(r"<mailto:([^|>]+)>", r"\1", t)
     return " ".join(t.split())
 
 
@@ -193,10 +202,14 @@ class Adapter:
     def capabilities(self):
         # send: through core/outbox only, at policy `staged` — `direct` is declared
         # OFF, so an outbox built for a direct policy on this adapter refuses at
-        # construction (the 2026-10-13 grant: human click only). threads: a reply is
-        # placed with thread_ts, and conversations.replies serves the thread back.
+        # construction (the 2026-10-13 grant: human click only) — and only for a BOT
+        # token (xoxb-): the grant is the harness's bot identity; a user token would
+        # post in a person's name, so its drafts stay Discard-only (review N1).
+        # threads: a reply is placed with thread_ts, and conversations.replies serves
+        # the thread back.
         return {"read": True, "history": True, "search": False,
-                "send": True, "direct": False, "react": False, "threads": True}
+                "send": self._token.startswith("xoxb-"), "direct": False,
+                "react": False, "threads": True}
 
     # ---- the send path (ENH-31; only core/outbox may call these) ------------------
     def send(self, channel_id, text, key=None, thread_id=None):
@@ -218,45 +231,69 @@ class Adapter:
                            "thread_id": thread_id}
         return {"ts": ts, "channel": payload.get("channel", channel_id), "key": key}
 
-    def read_back(self, target, key, thread_id=None):
-        """Proof of delivery BY KEY (channels/CONTRACT.md): the platform shows a message
-        carrying this outbox key in its metadata. For a message this process posted the
-        check is exact — fetched by its ts, key AND canonical text must match (guard 3:
-        a read-back that found "a message" could not tell a truncated or rewritten
-        post from the approved one). For a key this process never posted (recovery
-        after a crash), the newest page of the channel — or the thread, when the
-        caller passes `thread_id` — is searched for the key."""
+    def read_back(self, target, key, thread_id=None, text=None, since=None):
+        """Proof of delivery BY KEY (channels/CONTRACT.md): True when the platform shows a
+        message carrying this outbox key in its metadata with the approved text; False
+        when no message carries the key; core.delivery.DeliveryMismatch when a message
+        carries the key but its text is not the approved text (guard 3: a read-back
+        that found "a message" could not tell a truncated or rewritten post from the
+        approved one, and recovery then posted again — review F3). The approved text is
+        what this process posted, or `text` from the outbox row after a restart; with
+        neither, the key alone decides. `thread_id` searches the thread (history never
+        serves a reply); `since` (the row's created_at, from the outbox) bounds the
+        restart search to history newer than the draft minus a margin, all pages — a
+        newest-page search missed a post older than 200 messages and re-sent it
+        (review N8)."""
         mine = self._sent.get(key)
         if mine is not None:
             found = self._fetch_exact(mine["channel"], mine["ts"], mine["thread_id"])
-            return (found is not None and _metadata_key(found) == key
-                    and _canonical(found.get("text", "")) == _canonical(mine["text"]))
+            if found is None or _metadata_key(found) != key:
+                return False
+            return self._exact_or_mismatch(found, mine["text"], key)
         if thread_id is not None:
-            candidates = self._replies_raw(target, str(thread_id))
+            candidates = self._replies_raw(target, str(thread_id), with_metadata=True)
+        elif since is not None:
+            candidates = self._history_raw(target, oldest=f"{float(since) - 300.0:.6f}",
+                                           with_metadata=True)
         else:
             candidates = self._api("conversations.history", channel=target,
                                    limit=PAGE_LIMIT, include_all_metadata="true"
                                    ).get("messages", [])
-        return any(_metadata_key(m) == key for m in candidates)
+        for m in candidates:
+            if _metadata_key(m) == key:
+                return True if text is None else self._exact_or_mismatch(m, text, key)
+        return False
+
+    @staticmethod
+    def _exact_or_mismatch(found, approved, key):
+        if _canonical(found.get("text", "")) == _canonical(approved):
+            return True
+        raise DeliveryMismatch(
+            f"the platform shows a message carrying key {str(key)[:12]}… at ts "
+            f"{found.get('ts')} whose text is not the approved text")
 
     def newest(self, channel_id, thread_id=None):
-        """The newest message in the channel (top-level) or in one thread, normalized,
-        or None when there is none — the outbox's pre-send re-read (ENH-31 guard 2): a
-        message newer than the draft means the conversation moved on since the human
-        approved the text, and the click must refuse with "re-read first"."""
+        """The newest message in the channel (top-level) or in one thread that this
+        engine did NOT post, normalized, or None — the outbox's pre-send re-read (ENH-31
+        guard 2): a message the human has not seen means the conversation moved on, and
+        the click must refuse with "re-read first". The engine's own posts carry its
+        metadata and are skipped (review F4: our earlier approved reply refused the
+        next one), which is why both reads ask for metadata."""
         if thread_id is None:
-            page = self._api("conversations.history", channel=channel_id, limit=1)
-            msgs = page.get("messages", [])
-            return self._normalize(channel_id, msgs[0]) if msgs else None
-        replies = [m for m in self._replies_raw(channel_id, str(thread_id))
-                   if m.get("ts") != str(thread_id)]
-        if not replies:
+            page = self._api("conversations.history", channel=channel_id, limit=20,
+                             include_all_metadata="true")
+            others = [m for m in page.get("messages", []) if _metadata_key(m) is None]
+        else:
+            others = [m for m in self._replies_raw(channel_id, str(thread_id),
+                                                   with_metadata=True)
+                      if m.get("ts") != str(thread_id) and _metadata_key(m) is None]
+        if not others:
             return None
-        return self._normalize(channel_id, max(replies, key=lambda m: float(m["ts"])))
+        return self._normalize(channel_id, max(others, key=lambda m: float(m["ts"])))
 
     def _fetch_exact(self, channel, ts, thread_id):
         if thread_id is not None:
-            for m in self._replies_raw(channel, str(thread_id)):
+            for m in self._replies_raw(channel, str(thread_id), with_metadata=True):
                 if m.get("ts") == ts:
                     return m
             return None
@@ -359,7 +396,7 @@ class Adapter:
             return ex.code, dict(ex.headers), ex.read().decode("utf-8", "replace")
 
     # ---- polling internals ---------------------------------------------------
-    def _history_raw(self, channel, oldest=None, latest=None):
+    def _history_raw(self, channel, oldest=None, latest=None, with_metadata=False):
         """Raw platform messages in the window, ALL pages followed to the end."""
         out, page_cursor = [], None
         while True:
@@ -368,6 +405,8 @@ class Adapter:
                 params["oldest"] = oldest
             if latest is not None:
                 params["latest"] = latest
+            if with_metadata:
+                params["include_all_metadata"] = "true"
             if page_cursor:
                 params["cursor"] = page_cursor
             payload = self._api("conversations.history", **params)
@@ -404,12 +443,17 @@ class Adapter:
         out.sort(key=lambda m: float(m["ts"]))
         return out
 
-    def _replies_raw(self, channel, thread_ts, oldest=None):
+    def _replies_raw(self, channel, thread_ts, oldest=None, with_metadata=False):
         out, page_cursor = [], None
         while True:
             params = {"channel": channel, "ts": thread_ts, "limit": PAGE_LIMIT}
             if oldest is not None:
                 params["oldest"] = oldest
+            if with_metadata:
+                # Slack serves message metadata on replies only when asked, exactly as
+                # on history — without this every thread read-back is "unproven" and
+                # recovery posts the reply again (independent review of ENH-31, F2).
+                params["include_all_metadata"] = "true"
             if page_cursor:
                 params["cursor"] = page_cursor
             payload = self._api("conversations.replies", **params)

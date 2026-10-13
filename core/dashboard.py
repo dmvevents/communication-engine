@@ -152,7 +152,7 @@ def _journal_view(journal_path: Path):
         # Asks closed by SOMEONE ELSE's message — a thread reply or a DM reply — are
         # listed, not only counted (review S8 / ENH-31 B'): with no answerer list a
         # bystander's "+1" closes an ask too, and the operator must be able to see
-        # WHICH asks left the queue that way and confirm them.
+        # WHICH asks left the queue that way and review them.
         items["closed_by_others"] = [
             {"where": r["channel"], "ts": r["ts"], "text": r["text"], "kind": r["kind"],
              "response_key": r["response_key"], "responded_at": r["responded_at"]}
@@ -272,7 +272,7 @@ def snapshot(journal_path: str | Path, outboxes: dict[str, str | Path] | None = 
     Returns::
 
         attention   every item needing a human, in SEVERITY order
-        closed_by_others  asks closed by someone else's thread or DM reply (confirm them)
+        closed_by_others  asks closed by someone else's thread or DM reply (review them)
         missing     paths that do not exist yet — reported, never created
         journal     distinct/unanswered/answered/by_kind counts, or None if missing
         outbox      instance name -> per-state counts, or None if that file is missing
@@ -318,6 +318,6 @@ def snapshot(journal_path: str | Path, outboxes: dict[str, str | Path] | None = 
         "outbox": outbox_counts,
         "parity": panels,
         # ENH-31 B': asks a thread reply or a DM reply closed — listed for a human to
-        # confirm, newest first, never only counted.
+        # review, newest first, never only counted.
         "closed_by_others": closed_by_others,
     }

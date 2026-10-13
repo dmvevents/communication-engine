@@ -76,12 +76,12 @@ def api_base(env=None) -> str:
     if not value:
         return API_BASE
     u = urllib.parse.urlparse(value)
-    if (u.scheme != "http" or u.hostname not in ("127.0.0.1", "localhost")
+    if (u.scheme != "http" or u.hostname != "127.0.0.1"
             or not u.port or u.path not in ("", "/") or u.query or u.fragment
             or u.username is not None):
         raise ValueError(
-            f"{API_BASE_ENV} must be http://127.0.0.1:<port> or http://localhost:<port> — "
-            f"a loopback stub for tests, never a third host; refusing {value!r}")
+            f"{API_BASE_ENV} must be http://127.0.0.1:<port> — a loopback stub for tests, "
+            f"never a third host or a name; refusing {value!r}")
     return f"http://{u.hostname}:{u.port}"
 
 # Event-only wrappers that never appear as rows in conversations.history: ingesting

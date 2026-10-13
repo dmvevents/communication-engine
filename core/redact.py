@@ -16,13 +16,21 @@ import re
 
 # (class, pattern). Each pattern's literal prefix is split so the source cannot match.
 BLOCK_PATTERNS = (
-    ("slack-token", re.compile("xo" + "x[abprs]-[0-9A-Za-z-]{8,}")),
+    # every Slack token family (bot, user, app-config, refresh, client, ...): xox?-
+    ("slack-token", re.compile("xo" + "x[a-z]-[0-9A-Za-z-]{8,}")),
     ("slack-app-token", re.compile("xa" + "pp-[0-9]-[0-9A-Za-z-]{8,}")),
     ("telegram-bot-token", re.compile(r"\b[0-9]{8,10}:" + "AA[0-9A-Za-z_-]{30,}")),
     ("aws-access-key", re.compile(r"\b(AK" + r"IA|AS" + r"IA)[0-9A-Z]{16}\b")),
     ("private-key", re.compile("BEGIN [A-Z ]*PRIV" + "ATE KEY")),
+    # KEY=value, case-insensitive, spaces around the sign allowed (a pasted shell line)
     ("assigned-secret", re.compile(
-        r"(SECRET|TOKEN|PASSWD|PASSWORD|API_KEY)=[\"']?[A-Za-z0-9+/=_-]{16,}")),
+        r"(?i)(SECRET|TOKEN|PASSWD|PASSWORD|API_KEY)\s*=\s*[\"']?[A-Za-z0-9+/=_-]{16,}")),
+    # the gate's json-secret class: "token": "<16+ chars>" in a pasted config snippet
+    ("json-secret", re.compile(
+        r"(?i)\"(token|bot_token|secret|password|api_key|hmac_secret)\"\s*:\s*"
+        r"\"[A-Za-z0-9+/=_-]{16,}\"")),
+    # a pasted curl line: Authorization: Bearer <16+ chars>
+    ("bearer-token", re.compile(r"(?i)\bBearer\s+[A-Za-z0-9+/=_.-]{16,}")),
 )
 
 

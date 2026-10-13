@@ -1,0 +1,22 @@
+"""core/delivery — the one exception an adapter's read_back() may raise (ENH-31 guard 3).
+
+`read_back(target, key, ...)` answers True (the message carrying this key is on the
+platform, with the approved text), False (no message carries this key), or raises
+DeliveryMismatch: a message carrying this key IS on the platform, but its text is NOT
+the approved text — truncated, split, rewritten. The outbox must treat the three
+differently: False re-sends (recovery), True commits, a mismatch parks the row in a
+terminal MISMATCH state for a human. Before this existed, a mismatch read as False and
+recovery posted the reply again (independent review of ENH-31, F3). Lives apart from
+core/outbox so an adapter can raise it without importing the send layer.
+"""
+
+
+# The marker an adapter attaches to the engine's own posts (Slack: message metadata
+# event_type), so a read-back can find them by key and so the DM rule can recognise a
+# message the engine itself delivered — one that was tied to its ask at send time and
+# must never be handed to the next older open ask (review of ENH-31, F1 addendum).
+ENGINE_EVENT_TYPE = "comms_engine_reply"
+
+
+class DeliveryMismatch(RuntimeError):
+    """A message with this key is on the platform; its text is not the approved text."""

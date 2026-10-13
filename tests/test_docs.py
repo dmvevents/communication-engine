@@ -956,5 +956,70 @@ class ConfigSurfaceDocTest(unittest.TestCase):
                          f"says {stranded}")
 
 
+class SendPathDocsTest(unittest.TestCase):
+    """ENH-31 review F11: QUICKSTART step 7 told the adopter the Slack adapter "has no send
+    method" after it had one, the write-surface paragraph counted six pre-flip guards where
+    the code has five refusals and a post-send proof, `localhost` was documented as an
+    accepted stub host after N5 refused it, and the three new config keys were documented
+    nowhere an adopter edits. Each claim below is checked against the code it describes."""
+
+    def setUp(self):
+        self.text = QUICKSTART.read_text()
+
+    def _step(self, number):
+        m = re.search(rf"^## {number}\.[^\n]*$(.*?)(?=^## |\Z)", self.text,
+                      re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(m, f"QUICKSTART has no step {number}")
+        return m.group(0)
+
+    def test_step_7_no_longer_claims_the_slack_adapter_has_no_send_path(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "slack_adapter_for_docs", ROOT / "channels" / "slack" / "adapter.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertTrue(callable(getattr(mod.Adapter, "send", None)),
+                        "the premise moved: the Slack adapter has no send() again — "
+                        "rewrite step 7 the other way")
+        step7 = self._step(7)
+        for stale in ("no send method", "read-only at every layer",
+                      "refuses any non-read Web API method"):
+            self.assertNotIn(stale, step7,
+                             f"step 7 still says {stale!r} of an adapter that has send()")
+        self.assertIn("chat.postMessage", step7)
+        self.assertIn("`staged`", step7)
+        self.assertIn("xoxb-", step7, "the bot-token-only rule is not stated where the "
+                                      "adopter grants the token")
+
+    def test_the_guard_count_matches_the_code(self):
+        from core.outbox import MISMATCH
+        self.assertNotIn("six guards", self.text,
+                         "the read-back runs AFTER the post and placement is the surface's "
+                         "routing rule — there are five pre-flip refusals, not six guards")
+        self.assertIn("five refusals", self.text)
+        self.assertIn(f"`{MISMATCH}`", self.text, "the third read-back answer is undocumented")
+
+    def test_localhost_is_not_documented_as_an_accepted_stub_host(self):
+        for doc in (QUICKSTART, ROOT / "channels" / "slack" / "README.md"):
+            self.assertNotIn("http://localhost", doc.read_text(),
+                             f"{doc.name} still offers a NAME as the stub base; the adapter "
+                             "refuses anything but the literal loopback address (review N5)")
+
+    def test_the_three_send_keys_are_listed_where_the_adopter_edits_the_file(self):
+        step2 = self._step(2)
+        for key in ("instances[].channels[].kind", "instances[].answerers",
+                    "instances[].send_marker"):
+            self.assertIn(f"`{key}`", step2, f"{key} is missing from the step-2 field table")
+        example = json.loads((ROOT / "settings.example.json").read_text())
+        doc = example.get("_send_keys_doc", {})
+        self.assertEqual(sorted(doc), ["instances[].answerers", "instances[].channels[].kind",
+                                       "instances[].send_marker"])
+        dm = [ch for inst in example["instances"] for ch in inst["channels"]
+              if ch["id"].startswith("D")]
+        self.assertEqual([ch.get("kind") for ch in dm], ["dm"],
+                         "the example DM channel does not declare its kind")
+        self.assertIn("slack adapter declares them OFF", example["_reply_policies_doc"]["direct"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

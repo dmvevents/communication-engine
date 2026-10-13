@@ -1,13 +1,15 @@
-"""Slack read-only adapter tests (ENH-18; feeds gates G1/R8/R17).
+"""Slack adapter tests (ENH-18 read path, feeding gates G1/R8/R17; ENH-31 send path).
 
-The adapter under test is the first REAL platform adapter, and it lands with a property
-the incumbent never had: **no send path exists at any layer**. The operator authorized
-the workspace token READ-ONLY, so "read-only" must be a tested invariant, not a promise:
+The adapter under test is the first REAL platform adapter. It landed with no send path at
+any layer, because this host's token was authorized READ-ONLY (2026-08-26); ENH-31 added
+exactly one write, `chat.postMessage`, for the aws-do-agent harness's bot token, and the
+tested invariants became:
 
-* the adapter exposes no callable `send` (nothing for an outbox to even mis-drive);
+* `send()` and `read_back()` exist but are callable only by core/outbox at policy
+  `staged` (a human click); send capability is declared for a bot token (`xoxb-`) only;
 * the transport itself default-denies — any Web API method outside the read allowlist
-  is refused BEFORE a byte reaches the wire, so a future helper cannot smuggle a write
-  through the generic `_api` primitive;
+  plus that single write is refused BEFORE a byte reaches the wire, so a future helper
+  cannot smuggle another write through the generic `_api` primitive;
 * polling is gap-free (pagination followed to the end, or fail loudly — never a silent
   truncation) and cursored per channel;
 * a platform 429 surfaces as core.ratelimit.RateLimited carrying the platform's EXACT
@@ -84,7 +86,7 @@ class SlackAdapterTestCase(unittest.TestCase):
     def make(self, script=(), channels="C_ONE", clock=None):
         self.http = FakeHttp(script)
         kwargs = {"clock": clock} if clock else {}
-        return self.mod.Adapter(auth={"token": "tok", "channels": channels},
+        return self.mod.Adapter(auth={"token": "xoxb-tok", "channels": channels},
                                 http=self.http, **kwargs)
 
 
@@ -144,7 +146,7 @@ class ApiBaseTest(SlackAdapterTestCase):
 
     def make_env(self, env, script=()):
         self.http = FakeHttp(script)
-        return self.mod.Adapter(auth={"token": "tok", "channels": "C_ONE"},
+        return self.mod.Adapter(auth={"token": "xoxb-tok", "channels": "C_ONE"},
                                 http=self.http, env=env)
 
     def test_the_default_base_is_slack(self):
@@ -157,15 +159,16 @@ class ApiBaseTest(SlackAdapterTestCase):
                           [(200, {}, {"ok": True})])
         a._api("auth.test")
         self.assertEqual(self.http.requests[0][0], "http://127.0.0.1:18999/auth.test")
-        a = self.make_env({"COMMS_SLACK_API_BASE": "http://localhost:18999/"},
+        a = self.make_env({"COMMS_SLACK_API_BASE": "http://127.0.0.1:18999/"},
                           [(200, {}, {"ok": True})])
         a._api("auth.test")
-        self.assertEqual(self.http.requests[0][0], "http://localhost:18999/auth.test")
+        self.assertEqual(self.http.requests[0][0], "http://127.0.0.1:18999/auth.test")
 
     def test_a_non_loopback_base_is_refused_by_name_before_any_io(self):
         for bad in ("http://10.0.0.5:8080", "https://127.0.0.1:18999", "http://evil.example",
                     "http://127.0.0.1", "http://127.0.0.1:1/api", "http://u@127.0.0.1:1",
-                    "http://127.0.0.1:1/?x=1", "ftp://127.0.0.1:1"):
+                    "http://127.0.0.1:1/?x=1", "ftp://127.0.0.1:1",
+                    "http://localhost:18999"):   # a NAME resolves wherever /etc/hosts says (N5)
             with self.assertRaises(ValueError, msg=bad) as ctx:
                 self.make_env({"COMMS_SLACK_API_BASE": bad})
             self.assertIn("COMMS_SLACK_API_BASE", str(ctx.exception))
@@ -236,15 +239,18 @@ class SendTest(SlackAdapterTestCase):
         self.assertEqual((form["latest"], form["oldest"], form["inclusive"],
                           form["include_all_metadata"]), (ts, ts, "true", "true"))
 
-    def test_read_back_fails_when_the_platform_shows_different_text(self):
+    def test_read_back_raises_when_the_platform_shows_different_text(self):
+        """Not False (that would read as 'never sent' and recovery would post again,
+        review F3) but the third answer: present, with other text."""
+        from core.delivery import DeliveryMismatch
         ts = "1700000100.000100"
         meta = {"event_type": "comms_engine_reply", "event_payload": {"key": "k1"}}
         shown = {"type": "message", "ts": ts, "user": "U_BOT", "metadata": meta,
                  "text": "[AGENT] a TRUNCATED or rewritten"}
         a = self.make([posted(ts), history([shown])])
         a.send("C_ONE", "[AGENT] the approved text, in full", key="k1")
-        self.assertFalse(a.read_back("C_ONE", "k1"),
-                         "a read-back that accepts different text proves nothing")
+        with self.assertRaises(DeliveryMismatch):
+            a.read_back("C_ONE", "k1")
 
     def test_read_back_fails_when_the_shown_message_carries_another_key(self):
         ts = "1700000100.000100"
@@ -273,11 +279,64 @@ class SendTest(SlackAdapterTestCase):
         self.assertTrue(a.read_back("C_ONE", "k9", thread_id="1.0"))
         self.assertTrue(self.http.requests[0][0].endswith("/conversations.replies"))
 
+    def test_a_thread_read_back_asks_for_message_metadata(self):
+        """Review F2: conversations.replies serves metadata only when asked, exactly like
+        history. Without the flag every thread read-back is 'unproven' and recovery
+        posts the reply again."""
+        ts = "1700000100.000100"
+        meta = {"event_type": "comms_engine_reply", "event_payload": {"key": "k1"}}
+        thread = {"ok": True, "has_more": False, "messages": [
+            slack_msg("1.0", text="ask?"),
+            {"type": "message", "ts": ts, "user": "U_BOT", "thread_ts": "1.0",
+             "metadata": meta, "text": "[AGENT] x"}]}
+        a = self.make([posted(ts), (200, {}, thread)])
+        a.send("C_ONE", "[AGENT] x", key="k1", thread_id="1.0")
+        self.assertTrue(a.read_back("C_ONE", "k1"))
+        form = self.http.requests[1][1]
+        self.assertTrue(self.http.requests[1][0].endswith("/conversations.replies"))
+        self.assertEqual(form["include_all_metadata"], "true")
+        a = self.make([(200, {}, thread)])
+        self.assertTrue(a.read_back("C_ONE", "k1", thread_id="1.0"))
+        self.assertEqual(self.http.requests[0][1]["include_all_metadata"], "true")
+
+    def test_a_message_with_the_key_but_other_text_is_a_mismatch_not_absence(self):
+        """Review F3: False means 'no message carries the key' and makes recovery
+        re-send. A present message with different text is a third answer — raised, so
+        the outbox parks the row instead of posting again or committing the wrong text."""
+        from core.delivery import DeliveryMismatch
+        ts = "1700000100.000100"
+        meta = {"event_type": "comms_engine_reply", "event_payload": {"key": "k1"}}
+        shown = {"type": "message", "ts": ts, "user": "U_BOT", "metadata": meta,
+                 "text": "[AGENT] a TRUNCATED"}
+        a = self.make([posted(ts), history([shown])])
+        a.send("C_ONE", "[AGENT] the approved text, in full", key="k1")
+        with self.assertRaises(DeliveryMismatch):
+            a.read_back("C_ONE", "k1")
+        # after a restart, the outbox passes the approved text: same verdict
+        a = self.make([history([shown])])
+        with self.assertRaises(DeliveryMismatch):
+            a.read_back("C_ONE", "k1", text="[AGENT] the approved text, in full")
+        # with no text to compare, the key alone proves presence (the old contract)
+        a = self.make([history([shown])])
+        self.assertTrue(a.read_back("C_ONE", "k1"))
+
+    def test_canonical_compares_content_not_slacks_link_storage(self):
+        """Review F8: Slack auto-links a bare domain or an email as <target|label> with
+        the typed text as the LABEL, and wraps a typed URL as <url>. The canonical form is
+        the content the human typed, or a reply naming a bare domain fails its own
+        read-back."""
+        c = self.mod._canonical
+        self.assertEqual(c("[AGENT] here: <http://127.0.0.1:8502>"), c("[AGENT] here: http://127.0.0.1:8502"))
+        self.assertEqual(c("[AGENT] see <http://docs.example|docs.example>"), c("[AGENT] see docs.example"))
+        self.assertEqual(c("[AGENT] mail <mailto:ops@example.com|ops@example.com>"), c("[AGENT] mail ops@example.com"))
+        self.assertEqual(c("[AGENT] <http://127.0.0.1:8502/?a=1&amp;b=2>"), c("[AGENT] http://127.0.0.1:8502/?a=1&b=2"))
+        self.assertNotEqual(c("[AGENT] see docs.example"), c("[AGENT] see docs.other"))
+
     def test_newest_reads_the_channel_top_level_or_one_thread(self):
         a = self.make([history([slack_msg("9.0", user="U_H", text="newer")])])
         m = a.newest("C_ONE")
         self.assertEqual((m["ts"], m["sender_id"]), ("9.0", "U_H"))
-        self.assertEqual(str(self.http.requests[0][1]["limit"]), "1")
+        self.assertEqual(self.http.requests[0][1]["include_all_metadata"], "true")
         thread = {"ok": True, "has_more": False, "messages": [
             slack_msg("1.0", text="ask?"),
             slack_msg("2.0", user="U_B", text="r1", thread_ts="1.0"),
@@ -286,6 +345,42 @@ class SendTest(SlackAdapterTestCase):
         self.assertEqual(a.newest("C_ONE", thread_id="1.0")["ts"], "3.0")
         a = self.make([history([])])
         self.assertIsNone(a.newest("C_ONE"))
+
+    def test_newest_skips_this_engines_own_posts(self):
+        """Review F4: the engine's own earlier reply is a message too; without this the
+        first approved Send refused the second ("re-read first: U_BOT posted...")."""
+        meta = {"event_type": "comms_engine_reply", "event_payload": {"key": "k1"}}
+        a = self.make([history([{"type": "message", "ts": "9.0", "user": "U_BOT",
+                                 "metadata": meta, "text": "[AGENT] our reply"},
+                                slack_msg("8.0", user="U_H", text="the human's last word")])])
+        self.assertEqual(a.newest("C_ONE")["ts"], "8.0")
+        a = self.make([history([{"type": "message", "ts": "9.0", "user": "U_BOT",
+                                 "metadata": meta, "text": "[AGENT] our reply"}])])
+        self.assertIsNone(a.newest("C_ONE"))
+
+    def test_send_is_declared_only_for_a_bot_token(self):
+        """Review N1: the grant is the harness's BOT identity. A user token would post in
+        a person's name — its drafts stay Discard-only because send is not declared."""
+        self.http = FakeHttp()
+        user = self.mod.Adapter(auth={"token": "xoxp-user", "channels": "C_ONE"}, http=self.http)
+        self.assertFalse(user.capabilities()["send"])
+        self.assertTrue(self.make().capabilities()["send"])
+
+    def test_a_restart_read_back_searches_from_the_drafts_age_all_pages(self):
+        """Review N8: the newest 200 messages missed an older post and re-sent it; with
+        `since` from the outbox row the search starts at the draft's age minus a margin
+        and follows every page."""
+        meta = {"event_type": "comms_engine_reply", "event_payload": {"key": "k9"}}
+        page1 = {"ok": True, "has_more": True, "response_metadata": {"next_cursor": "c2"},
+                 "messages": [slack_msg("5000.0", text="newer noise")]}
+        page2 = {"ok": True, "has_more": False, "messages": [
+            {"type": "message", "ts": "4000.0", "user": "U_BOT", "metadata": meta,
+             "text": "[AGENT] x"}]}
+        a = self.make([(200, {}, page1), (200, {}, page2)])
+        self.assertTrue(a.read_back("C_ONE", "k9", since=3900.0))
+        first = self.http.requests[0][1]
+        self.assertEqual((first["oldest"], first["include_all_metadata"]), ("3600.000000", "true"))
+        self.assertEqual(self.http.requests[1][1]["cursor"], "c2")
 
     def test_the_size_limit_is_declared_for_the_outbox(self):
         self.assertEqual(self.mod.MAX_TEXT_CHARS, 3500)

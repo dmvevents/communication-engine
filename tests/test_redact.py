@@ -22,10 +22,19 @@ class ScanTest(unittest.TestCase):
             "aws-access-key": "AK" + "IA" + "ABCDEFGHIJKLMNOP",
             "private-key": "-----BEGIN RSA PRIV" + "ATE KEY-----",
             "assigned-secret": "API_KEY=" + "Zz" * 10,
+            "json-secret": '"bot_' + 'token": "' + "Ab" * 10 + '"',
+            "bearer-token": "Authorization: Bea" + "rer " + "Qq" * 10,
         }
         for cls, secret in planted.items():
             hits = scan(f"here you go: {secret} — do not share")
             self.assertEqual(hits, [cls], f"{cls} not caught as itself: {hits}")
+
+    def test_the_other_slack_token_families_and_sloppy_assignments_are_caught(self):
+        """Review F6: refresh (xoxe-), client (xoxc-) and config tokens are tokens too;
+        a pasted shell line may write `token = "..."` in any case."""
+        for text in ("xo" + "xe-1-" + "A" * 24, "xo" + "xc-" + "B" * 24,
+                     "slack_to" + "ken = '" + "Cc" * 10 + "'", "pass" + "word= " + "Dd" * 10):
+            self.assertTrue(scan(text), f"not caught: {text[:12]}…")
 
     def test_the_hit_is_named_never_echoed(self):
         secret = "xo" + "xb-" + "1234567890-abcdefghij"

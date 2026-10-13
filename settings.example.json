@@ -50,6 +50,7 @@
         },
         {
           "id": "D_EXAMPLE_DM",
+          "kind": "dm",
           "label": "colleague-dm",
           "poll_interval_s": 60,
           "reply_policy": "never",
@@ -69,6 +70,11 @@
   "_reply_policies_doc": {
     "never": "read-only; core/outbox refuses send() for this target",
     "staged": "drafts written to state/outbox/, explicit operator gate required before send",
-    "direct": "adapter may send after outbox audit logging (only for precedented targets)"
+    "direct": "adapter may send with no click, after outbox audit logging — only through an adapter that declares direct sends on; the slack adapter declares them OFF, so a direct policy on it is refused at outbox construction and again at the send seam"
+  },
+  "_send_keys_doc": {
+    "instances[].send_marker": "optional prefix (e.g. \"[AGENT]\") every send from the connection must carry: prepended when a draft is staged on the write surface, required again at the click",
+    "instances[].answerers": "optional list of sender ids whose replies may close OTHER people's asks (the agent's bot user, the operators); an ask posed by a listed answerer is closed by the other party; omitted, any non-asker's answer closes an ask",
+    "instances[].channels[].kind": "optional 'dm' or 'channel': a 1:1 direct message is answered top-level and closed by the DM rule; omitted, a Slack-shaped D... id infers dm and any other id is a channel"
   }
 }

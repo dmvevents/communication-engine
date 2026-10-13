@@ -33,7 +33,7 @@ class StubSend(unittest.TestCase):
 
     def adapter(self):
         cls = load_adapter_class(ROOT / "channels", "slack")
-        return cls(auth={"token": "stub-tok", "channels": f"{CH},{DM}"},
+        return cls(auth={"token": "xoxb-stub", "channels": f"{CH},{DM}"},
                    env={"COMMS_SLACK_API_BASE": self.stub.base})
 
     def box(self, adapter=None, policies=None, marker="[AGENT]"):
@@ -57,10 +57,11 @@ class StubSend(unittest.TestCase):
                          (CH, TEXT, ASK_TS))
         shown = self.stub.posted(CH)[0]
         self.assertEqual(shown["metadata"]["event_payload"]["key"], key)
-        self.assertEqual(shown["text"], TEXT.replace("&", "&amp;").replace("<", "&lt;")
-                         .replace(">", "&gt;"), "the stub stores Slack-escaped text")
+        self.assertIn("<http://127.0.0.1:8502>", shown["text"],
+                      "the stub stores the URL wrapped the way Slack does")
+        self.assertNotEqual(shown["text"], TEXT, "read-back must have compared canonically")
         for method, form, auth in self.stub.requests:
-            self.assertEqual(auth, "Bearer stub-tok")
+            self.assertEqual(auth, "Bearer xoxb-stub")
             self.assertNotIn("token", form)
 
     def test_a_second_click_dedupes_instead_of_posting_twice(self):
@@ -72,15 +73,52 @@ class StubSend(unittest.TestCase):
         self.assertEqual(len(self.posts()), 1)
 
     # ---- guard 3: read-back must prove the SAME text ------------------------------------
-    def test_a_truncated_post_is_not_committed_and_not_re_sent(self):
+    def test_a_truncated_post_is_parked_as_a_mismatch_and_recovery_never_re_sends_it(self):
+        """Review F3: the message IS on the platform, with text that is not the approved
+        text. Before, a failed exact read-back read as 'never sent': an in-process
+        recover() posted a duplicate and a new process committed the mangled text."""
+        from core.outbox import MISMATCH
         self.stub.truncate_posts_to = 20
         box = self.box()
         key = box.stage(CH, ASK_TS, TEXT, thread_id=ASK_TS)["key"]
         with self.assertRaises(SendBlocked) as cm:
             box.release(key)
-        self.assertIn("read-back", str(cm.exception))
-        self.assertEqual(box.get(key)["state"], SENT, "SENT is durable; COMMITTED is not earned")
-        self.assertEqual(len(self.posts()), 1, "an unproven send must never be re-sent blindly")
+        self.assertIn("DIFFERENT text", str(cm.exception))
+        self.assertEqual(box.get(key)["state"], MISMATCH)
+        self.assertEqual(len(self.posts()), 1)
+        box.recover()                                           # same process
+        self.assertEqual((box.get(key)["state"], len(self.posts())), (MISMATCH, 1))
+        counts = self.box().recover()                           # a new process
+        self.assertEqual((counts["resumed"], box.get(key)["state"], len(self.posts())),
+                         (0, MISMATCH, 1), "recovery re-posted or committed a mangled post")
+
+    def test_a_dead_thread_does_not_wedge_the_other_approved_sends(self):
+        """Review F7: the asker deleted the parent of one approved thread reply; its
+        read-back raises thread_not_found forever. The DM reply approved next to it
+        must still be delivered, and the dead row reported, not retried as a wedge."""
+        box = self.box()
+        from core.outbox import _Crash, INTENT
+        dead = box.stage(CH, ASK_TS, TEXT, thread_id=ASK_TS)["key"]
+        dm = box.stage(DM, "1699999999.000200", "[AGENT] yes, it is up")["key"]
+        for k in (dead, dm):
+            with self.assertRaises(_Crash):
+                box.release(k, _crash_at="after_intent")
+        self.stub.fail_always["conversations.replies"] = "thread_not_found"
+        counts = self.box().recover()
+        self.assertEqual(self.box().get(dm)["state"], COMMITTED, "the DM reply was wedged")
+        self.assertEqual(self.box().get(dead)["state"], INTENT)
+        self.assertEqual([k for k, _ in counts["errors"]], [dead])
+        self.assertIn("thread_not_found", counts["errors"][0][1])
+        self.assertEqual(len(self.stub.posted(DM)), 1)
+        self.assertEqual(len(self.stub.posted(CH)), 0, "a dead thread must never be posted to top-level")
+
+    def test_a_reply_naming_a_bare_domain_or_an_email_reads_back_exactly(self):
+        """Review F8: Slack auto-links `docs.example` as <http://docs.example|docs.example>
+        and an email as <mailto:x|x>; the canonical comparison must see the typed text."""
+        box = self.box()
+        key = box.stage(CH, ASK_TS, "[AGENT] docs are at docs.example, or mail ops@example.com",
+                        thread_id=ASK_TS)["key"]
+        self.assertEqual(box.release(key)["state"], COMMITTED)
 
     # ---- guards 1, 4, 5 on the real adapter -----------------------------------------------
     def test_the_text_guards_refuse_before_any_post(self):
@@ -111,19 +149,23 @@ class StubSend(unittest.TestCase):
             self.box(policies={CH: "direct"})
         self.assertIn("direct", str(cm.exception))
 
-    # ---- exactly once under a 429, through recovery -------------------------------------------
-    def test_a_429_on_the_post_leaves_intent_and_recovery_posts_exactly_once(self):
+    # ---- exactly once under a 429: the draft goes back to the gate, the next click posts ----
+    def test_a_429_on_the_post_hands_the_draft_back_to_the_gate_and_the_next_click_posts_once(self):
+        """Review N4: a 429 is answered before the platform posts, so nothing is on the
+        platform and the approval is not lost — the draft returns to STAGED for another
+        click. Before, it stranded in INTENT with no Send and no Discard on the surface,
+        and only a Python `Outbox.recover()` from the RUNBOOK could finish it."""
         box = self.box()
         key = box.stage(CH, ASK_TS, TEXT, thread_id=ASK_TS)["key"]
         self.stub.rate_limit["chat.postMessage"] = "3"
-        with self.assertRaises(RateLimited):
+        with self.assertRaises(RateLimited) as cm:
             box.release(key)
-        self.assertEqual(box.get(key)["state"], INTENT)
+        self.assertNotIn("None", str(cm.exception))
+        self.assertEqual(box.get(key)["state"], STAGED)
         self.assertEqual(self.stub.posted(CH), [], "the 429'd call posted nothing")
-        counts = self.box().recover()                        # a new process, same db
-        self.assertEqual(counts["resent"], 1)
+        self.assertEqual(self.box().recover()["resumed"], 0, "nothing is in flight")
+        self.assertEqual(self.box().release(key)["state"], COMMITTED)      # the next click
         self.assertEqual(len(self.stub.posted(CH)), 1)
-        self.assertEqual(self.box().get(key)["state"], COMMITTED)
 
     def test_recovery_after_a_crash_between_post_and_sent_finds_the_message_by_key(self):
         """The nastiest seam: the message IS on the platform, the row still says INTENT.

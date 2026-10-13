@@ -108,6 +108,22 @@ class GatePlacementTest(unittest.TestCase):
                 "is the one sanctioned write surface")
 
 
+def slack_stub_base(tmp):
+    """An adopter tree on the REAL Slack adapter, pointed at the loopback stub: a DM at
+    `staged` (replies post top-level) and a channel answerable in-thread, with a marker."""
+    base = Path(tmp)
+    shutil.copytree(ROOT / "channels" / "slack", base / "channels" / "slack",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    (base / "settings.json").write_text(
+        '{"engine": {"state_dir": "state"},\n'
+        ' "instances": [{"name": "team", "adapter": "slack", "send_marker": "[AGENT]",\n'
+        '   "auth": {"token": "env:UI_TEST_SLACK_TOKEN", '
+        '"channels": "env:UI_TEST_SLACK_CHANNELS"},\n'
+        '   "channels": [{"id": "C_CUST", "thread_reply_policy": "staged"},\n'
+        '                {"id": "D_SOMEONE", "reply_policy": "staged"}]}]}\n')
+    return base
+
+
 def write_base(tmp, cust_policy='"reply_policy": "staged"'):
     """An adopter tree with one composable channel and one read-only one."""
     base = Path(tmp)
@@ -536,6 +552,138 @@ def two_channel_base(tmp):
 
 @unittest.skipUnless(HAVE_STREAMLIT, "streamlit not installed — the static checks "
                      "above and tests/test_outbox_write.py still guard the gate")
+@unittest.skipUnless(HAVE_STREAMLIT, "streamlit not installed")
+class SlackStubWriteSurfaceTest(_WriteSurfaceBase):
+    """The one production send path — a human's click on the surface — driven through the
+    REAL Slack adapter against the loopback stub, so guard 2 (re-read), guard 3's third
+    answer (a mangled post) and the exact Slack calls a Send makes are measured on the path
+    that ships. Review F4: every UI flow ran on the fake, whose newest() has no history and
+    which is rebuilt empty on every click, so no UI test could reach the "re-read first"
+    flash or the re-stage that follows it. Nothing here can reach slack.com:
+    COMMS_SLACK_API_BASE admits the loopback stub only."""
+
+    DM, ASK_TS = "D_SOMEONE", "1700000002.000100"
+    REPLY = "it is at http://127.0.0.1:8502"
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / "tests"))
+        from slack_stub import SlackStub
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.stub = SlackStub(slack_escapes=True).start()
+        self.addCleanup(self.stub.stop)
+        self.base = slack_stub_base(self.tmp.name)
+        keys = ("COMMS_SETTINGS", "COMMS_UI_WRITE_ENABLED", "COMMS_SLACK_API_BASE",
+                "UI_TEST_SLACK_TOKEN", "UI_TEST_SLACK_CHANNELS")
+        self._saved = {k: os.environ.get(k) for k in keys}
+        self.addCleanup(self._restore_env)
+        os.environ.update(COMMS_SETTINGS=str(self.base / "settings.json"),
+                          COMMS_UI_WRITE_ENABLED="true",
+                          COMMS_SLACK_API_BASE=self.stub.base,
+                          UI_TEST_SLACK_TOKEN="xoxb-ui",       # bot-shaped, not a token
+                          UI_TEST_SLACK_CHANNELS="C_CUST,D_SOMEONE")
+        self.stub.seed(self.DM, "where is the dashboard?", user="U_ASKER", ts=self.ASK_TS)
+        (self.base / "state").mkdir(exist_ok=True)
+        j = Journal(self.base / "state" / "journal.db")
+        j.record(self.DM, self.ASK_TS, sender_id="U_ASKER", text="where is the dashboard?",
+                 kind="QUESTION")
+        j.close()
+
+    def methods(self):
+        return [m for m, _, _ in self.stub.requests]
+
+    def rows(self):
+        db = self.base / "state" / "outbox-team.db"
+        if not db.is_file():
+            return []
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            return [dict(zip(("key", "state", "text", "seen_ts"), r)) for r in conn.execute(
+                "SELECT key, state, text, seen_ts FROM outbox ORDER BY created_at")]
+        finally:
+            conn.close()
+
+    def responded(self):
+        j = Journal(self.base / "state" / "journal.db")
+        try:
+            r = j.get(self.DM, self.ASK_TS)
+            return (r["responded_at"], r["response_key"])
+        finally:
+            j.close()
+
+    def reply_and_stage(self, at, text):
+        at = self.buttons(at, "reply|")[0].click().run()
+        at.text_area[0].input(text)
+        return self.buttons(at, "FormSubmitter:compose")[0].click().run()
+
+    def test_a_message_after_staging_refuses_the_click_and_re_staging_is_the_acknowledgement(self):
+        """Guard 2 on the shipped path. The baseline is what the human saw on the
+        PLATFORM's clock (the ask, recorded at stage); a message after it refuses the
+        click, naming who and when and never the text; staging the SAME text again is the
+        acknowledgement ("I re-read; keep this text"), and the next click posts exactly
+        once — re-read, post, read-back, and nothing else."""
+        at = self.reply_and_stage(self.run_app(), self.REPLY)
+        self.assertFalse(at.exception)
+        (row,) = self.rows()
+        self.assertEqual((row["state"], row["text"], row["seen_ts"]),
+                         ("STAGED", f"[AGENT] {self.REPLY}", self.ASK_TS))
+        self.stub.seed(self.DM, "never mind, found it", user="U_ASKER")   # before the click
+        n0 = len(self.stub.requests)
+        at = self.buttons(at, "send-")[0].click().run()
+        self.assertFalse(at.exception)
+        flashes = "\n".join(str(x.value) for x in list(at.error) + list(at.warning))
+        self.assertIn("re-read first", flashes)
+        self.assertIn("U_ASKER", flashes)
+        self.assertNotIn("never mind", flashes, "a flash renders markdown — never the text")
+        self.assertEqual(self.rows()[0]["state"], "STAGED")
+        self.assertEqual(self.methods()[n0:], ["conversations.history"],
+                         "a refused click made a Slack call beyond the re-read")
+        self.assertEqual(self.stub.posted(self.DM), [])
+        at = self.reply_and_stage(at, self.REPLY)                 # the human re-read
+        self.assertFalse(at.exception)
+        successes = "\n".join(str(x.value) for x in at.success)
+        self.assertIn("re-read acknowledged", successes)
+        self.assertEqual(len(self.rows()), 1, "re-staging the same text minted a second draft")
+        self.assertGreater(float(self.rows()[0]["seen_ts"]), float(self.ASK_TS))
+        n1 = len(self.stub.requests)
+        at = self.buttons(at, "send-")[0].click().run()
+        self.assertFalse(at.exception)
+        self.assertEqual(self.rows()[0]["state"], "COMMITTED")
+        self.assertEqual(self.methods()[n1:],
+                         ["conversations.history", "chat.postMessage", "conversations.history"],
+                         "a Send is exactly: re-read, one post, read-back")
+        (post,) = self.stub.posted(self.DM)
+        self.assertEqual(post["text"], "[AGENT] it is at <http://127.0.0.1:8502>",
+                         "the stub stores the URL the way Slack does; read-back compared canonically")
+        self.assertEqual(post["metadata"]["event_payload"]["key"], self.rows()[0]["key"])
+        self.assertNotIn("thread_ts", post, "a DM reply is top-level")
+        self.assertIsNotNone(self.responded()[0], "the proven reply did not tie the ask")
+
+    def test_a_mangled_post_is_parked_as_mismatch_on_the_surface_and_nothing_more_is_sent(self):
+        """Guard 3's third answer on the shipped path (review F3): the platform holds a
+        message with this draft's key and other text. The flash says so (not "unproven,
+        run recover()", which re-sent), the row is MISMATCH with no Send and no Discard,
+        nothing is recorded as answered, and a later render posts nothing."""
+        self.stub.truncate_posts_to = 20
+        at = self.reply_and_stage(self.run_app(), self.REPLY)
+        at = self.buttons(at, "send-")[0].click().run()
+        self.assertFalse(at.exception)
+        errors = "\n".join(str(x.value) for x in at.error)
+        self.assertIn("DIFFERENT text", errors)
+        self.assertIn("MISMATCH", errors)
+        self.assertNotIn("recover()", errors, "a mismatch was flashed as 'unproven, run recover()'")
+        self.assertEqual(self.rows()[0]["state"], "MISMATCH")
+        self.assertEqual(len(self.stub.posted(self.DM)), 1)
+        cards = "\n".join(str(m.value) for m in at.markdown)
+        self.assertIn("MISMATCH", cards)
+        self.assertIn("Needs a human", cards)
+        self.assertEqual((self.buttons(at, "send-"), self.buttons(at, "discard-")), ([], []))
+        self.assertEqual(self.responded(), (None, None), "a mangled post was recorded as the answer")
+        at = self.run_app()
+        self.assertFalse(at.exception)
+        self.assertEqual((self.rows()[0]["state"], len(self.stub.posted(self.DM))), ("MISMATCH", 1))
+
+
 class WriteSurfaceReviewTest(_WriteSurfaceBase):
     """Properties the independent merge review (2026-10-13) found missing or broken:
     the click must act on the CURRENT config (B2), Send must never be offered where the
@@ -800,6 +948,45 @@ class WriteSurfaceReviewTest(_WriteSurfaceBase):
         self.assertFalse(at.exception)
         self.assertEqual(self.rows()[0]["state"], "COMMITTED")
         self.assertIsNotNone(self.journal_row("D_SOMEONE", "7.0")[0])
+
+    def test_a_draft_staged_before_the_marker_was_configured_is_refused_at_the_click(self):
+        """Review X7: the marker is verified again at the click BY THE OUTBOX THE SURFACE
+        BUILDS — the one production send path has to carry the guard, not only the compose
+        form. A draft from before the connection had a marker must not go out bare."""
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        at = self.compose(self.run_app(), "a bare draft, staged before the marker existed")
+        self.assertEqual([r["state"] for r in self.rows()], ["STAGED"])
+        settings = self.base / "settings.json"
+        settings.write_text(settings.read_text().replace(
+            '"adapter": "fake",', '"adapter": "fake", "send_marker": "[AGENT]",'))
+        self.assertEqual(load(settings).instance("team").send_marker, "[AGENT]")
+        at = self.buttons(at, "send-")[0].click().run()
+        self.assertFalse(at.exception)
+        flashes = "\n".join(str(x.value) for x in list(at.error) + list(at.warning))
+        self.assertIn("marker", flashes)
+        self.assertNotIn("a bare draft", flashes, "a flash renders markdown — never the text")
+        self.assertEqual(self.rows()[0]["state"], "STAGED",
+                         "a bare draft went out — the surface's outbox ran without the marker")
+
+    def test_a_mismatched_row_is_shown_as_needing_a_human_with_no_buttons(self):
+        """ENH-31 guard 3 (review F3): the platform holds a message with this draft's key
+        and other text. The card says so and offers neither Send (it is there) nor
+        Discard (it was delivered); nothing else on the page changes."""
+        os.environ["COMMS_UI_WRITE_ENABLED"] = "true"
+        at = self.compose(self.run_app(), "approved text, as staged")
+        key = self.rows()[0]["key"]
+        conn = sqlite3.connect(self.base / "state" / "outbox-team.db")
+        conn.execute("UPDATE outbox SET state='MISMATCH' WHERE key=?", (key,))
+        conn.commit()
+        conn.close()
+        at = self.run_app()
+        self.assertFalse(at.exception)
+        self.assertEqual((self.buttons(at, "send-"), self.buttons(at, "discard-")), ([], []))
+        cards = "\n".join(str(m.value) for m in at.markdown)
+        self.assertIn("MISMATCH", cards)
+        self.assertIn("DIFFERENT text", cards)
+        self.assertIn("Needs a human", cards)
+        self.assertIn("approved text, as staged", cards)
 
     def test_send_is_not_offered_on_a_thread_draft_the_adapter_cannot_place(self):
         """A thread draft staged while the connection could thread, before its adapter

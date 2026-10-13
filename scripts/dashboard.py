@@ -188,7 +188,7 @@ with journal_tab:
                     f"**{j['unanswered']}** unanswered · **{j['answered']}** answered "
                     f"({j['answered_by_thread']} closed by someone else's in-thread "
                     f"reply and {j['answered_by_dm']} by a direct-message reply, not by "
-                    "an answer sent from here — confirm them below)")
+                    "an answer sent from here — review them below)")
         dom_table(("kind", "count"),
                   [(html.escape(str(k)), n)
                    for k, n in sorted(j["by_kind"].items(), key=lambda kv: str(kv[0]))])
@@ -196,7 +196,10 @@ with journal_tab:
         if closed:
             # ENH-31 B' (review S8): listed, not only counted — with no answerer list a
             # bystander's "+1" closes an ask too, and the operator must see WHICH.
-            st.markdown("##### Closed by someone else — confirm")
+            st.markdown("##### Closed by someone else — review")
+            st.caption("asks that left the queue on someone else's reply, listed so the "
+                       "operator sees which; there is no reopen action here — the journal "
+                       "row is the record to inspect")
             dom_table(("channel", "ts", "kind", "closed by", "text"),
                       [(html.escape(c["where"]), html.escape(str(c["ts"])),
                         html.escape(str(c["kind"] or "—")),

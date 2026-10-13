@@ -16,7 +16,9 @@ to slack.com: the adapter reaches the stub through COMMS_SLACK_API_BASE.
 from __future__ import annotations
 
 import json
+import re
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -25,16 +27,29 @@ def _escape(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _slackify(text):
+    """What Slack stores for a posted plain text: entities escaped, a typed URL wrapped as
+    `<url>`, an email auto-linked as `<mailto:x|x>` (the label is what was typed)."""
+    out = _escape(text)
+    out = re.sub(r"\b([\w.+-]+@[\w-]+\.[\w.-]+)\b", r"<mailto:\1|\1>", out)
+    out = re.sub(r"(?<![<|])(https?://[^\s<>]+)", r"<\1>", out)
+    return out
+
+
 class SlackStub:
     def __init__(self, bot_user="U_BOT", slack_escapes=False):
         self.channels: dict = {}          # channel id -> [raw message dicts, ts ascending]
         self.requests: list = []          # (method, form dict, authorization header)
         self.rate_limit: dict = {}        # method -> Retry-After string, consumed once
         self.fail_next: dict = {}         # method -> error code, consumed once
+        self.fail_always: dict = {}       # method -> error code, every call (a dead thread)
         self.bot_user = bot_user
         self.slack_escapes = slack_escapes
         self.truncate_posts_to = None     # store only the first N chars of a post (a planted mismatch)
-        self._ts = 1700000000.0
+        # Real-time ts by default (review F4: a stub minting ts from 2023 made every
+        # stub message older than any draft, so no guard-2 path was ever exercised);
+        # seed(ts=...) still pins a message where a test wants it.
+        self._ts = time.time()
         self._lock = threading.Lock()
         stub = self
 
@@ -77,7 +92,7 @@ class SlackStub:
     # ---- fixture helpers ----------------------------------------------------------
     def next_ts(self) -> str:
         with self._lock:
-            self._ts += 1.0
+            self._ts = max(time.time(), self._ts + 0.001)
             return f"{self._ts:.6f}"
 
     def seed(self, channel, text, user="U_A", thread_ts=None, ts=None, **extra):
@@ -104,6 +119,8 @@ class SlackStub:
             return 429, {"Retry-After": str(wait)}, {"ok": False, "error": "ratelimited"}
         if method in self.fail_next:
             return 200, {}, {"ok": False, "error": self.fail_next.pop(method)}
+        if method in self.fail_always:
+            return 200, {}, {"ok": False, "error": self.fail_always[method]}
         fn = getattr(self, "_m_" + method.replace(".", "_"), None)
         if fn is None:
             return 200, {}, {"ok": False, "error": "unknown_method"}
@@ -139,12 +156,15 @@ class SlackStub:
     def _m_conversations_replies(self, form):
         ch, root = form.get("channel", ""), form.get("ts", "")
         oldest = form.get("oldest")
+        # Metadata only on request — the same rule as history (review F2: a stub that
+        # served it unasked hid a read-back that never asked).
+        with_meta = form.get("include_all_metadata") in ("1", "true", "True")
         out = []
         for m in self.channels.get(ch, []):
             if m["ts"] == root or m.get("thread_ts") == root:
                 if oldest is not None and m["ts"] != root and float(m["ts"]) <= float(oldest):
                     continue
-                out.append(self._public(m, True))
+                out.append(self._public(m, with_meta))
         out.sort(key=lambda m: float(m["ts"]))
         return {"ok": True, "messages": out, "has_more": False}
 
@@ -155,7 +175,7 @@ class SlackStub:
         stored = text if self.truncate_posts_to is None else text[:self.truncate_posts_to]
         m = {"type": "message", "ts": self.next_ts(), "user": self.bot_user,
              "bot_id": "B_STUB", "bot_posted": True,
-             "text": _escape(stored) if self.slack_escapes else stored}
+             "text": _slackify(stored) if self.slack_escapes else stored}
         if form.get("thread_ts"):
             m["thread_ts"] = form["thread_ts"]
         if form.get("metadata"):

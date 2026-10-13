@@ -566,7 +566,8 @@ class SendGuardsTest(unittest.TestCase):
         self.assertIn("U_HUMAN", msg)
         self.assertNotIn("never mind", msg, "a flash renders markdown — never the text")
         self.assertEqual((box.get(key)["state"], self.adapter.delivered), (STAGED, []))
-        self.assertEqual(self.adapter.newest_calls, [(TARGET, None)])
+        self.assertEqual(self.adapter.newest_calls, [(TARGET, None), (TARGET, None)],
+                         "newest() is asked at stage (what the human saw) and at the click")
 
     def test_an_older_newest_message_lets_the_click_through(self):
         box = self.box()
@@ -578,7 +579,112 @@ class SendGuardsTest(unittest.TestCase):
         box = self.box()
         key = box.stage(TARGET, TS, self.MARKED, thread_id=TS)["key"]
         box.release(key)
-        self.assertEqual(self.adapter.newest_calls, [(TARGET, TS)])
+        self.assertEqual(self.adapter.newest_calls, [(TARGET, TS), (TARGET, TS)])
+
+    def test_the_click_compares_platform_time_with_what_the_human_saw(self):
+        """Review F4: the baseline is the platform ts recorded when the draft was staged
+        (seen_ts), not the host clock. A message posted after staging on the PLATFORM's
+        clock refuses the click even though, to the host clock, it is ancient."""
+        self.adapter.latest = {"ts": "100.0", "sender_id": "U_ASKER"}      # what the human saw
+        box = self.box()
+        key = box.stage(TARGET, TS, self.MARKED)["key"]
+        self.assertEqual(box.get(key)["seen_ts"], "100.0")
+        self.adapter.latest = {"ts": "101.0", "sender_id": "U_HUMAN"}      # newer on the platform
+        with self.assertRaises(ReleaseError) as cm:
+            box.release(key)
+        self.assertIn("re-read first", str(cm.exception))
+        self.assertEqual((box.get(key)["state"], self.adapter.delivered), (STAGED, []))
+
+    def test_an_empty_thread_is_baselined_on_its_root_so_the_first_reply_refuses_the_click(self):
+        """Review F4 (clock basis): a thread with no replies yet has no newest message,
+        but the human saw the ROOT — so the root's ts is the baseline and the first reply
+        to arrive before the click is compared on the platform's clock, never the host's."""
+        self.adapter.latest = None                                    # no replies yet
+        box = self.box()
+        key = box.stage(TARGET, TS, self.MARKED, thread_id=TS)["key"]
+        self.assertEqual(box.get(key)["seen_ts"], TS)
+        self.adapter.latest = {"ts": str(float(TS) + 1), "sender_id": "U_ASKER"}
+        with self.assertRaises(ReleaseError) as cm:
+            box.release(key)
+        self.assertIn("re-read first", str(cm.exception))
+        # a top-level draft on an empty channel has nothing to baseline on
+        self.adapter.latest = None
+        key2 = box.stage(TARGET, "9.0", self.MARKED)["key"]
+        self.assertIsNone(box.get(key2)["seen_ts"])
+
+    def test_re_staging_the_same_text_is_the_acknowledgement_and_the_next_click_passes(self):
+        """Review F4: a refused Reply had no exit — re-staging deduped onto the stale row.
+        Staging the same text again means "I re-read; keep this text": the baseline moves."""
+        self.adapter.latest = {"ts": "100.0", "sender_id": "U_ASKER"}
+        box = self.box()
+        key = box.stage(TARGET, TS, self.MARKED)["key"]
+        self.adapter.latest = {"ts": "101.0", "sender_id": "U_HUMAN"}
+        with self.assertRaises(ReleaseError):
+            box.release(key)
+        again = box.stage(TARGET, TS, self.MARKED)
+        self.assertEqual((again["key"], again.get("re_read")), (key, True))
+        self.assertEqual(box.get(key)["seen_ts"], "101.0")
+        self.assertEqual(box.release(key)["state"], COMMITTED)
+
+    def test_a_policy_changed_or_junk_after_construction_cannot_send_without_a_human(self):
+        """Review F5: 'direct is off' was a one-time scan at construction, and send()
+        treated every non-never, non-staged value as direct. The seam decides, default
+        deny: a typo is never, 'direct' sends only where the adapter allows it."""
+        box = self.box(policy="staged")
+        box.policies[TARGET] = "direct"                      # mutated after construction
+        with self.assertRaises(PolicyError):
+            box.send(TARGET, TS, self.MARKED)
+        box.policies[TARGET] = "Staged"                      # not one of the three values
+        with self.assertRaises(PolicyError):
+            box.send(TARGET, TS, self.MARKED)
+        box.policies[TARGET] = {"channel": "staged", "thread": None}
+        with self.assertRaises(PolicyError):
+            box.send(TARGET, TS, self.MARKED, thread_id=TS)
+        self.assertEqual((box.get(idempotency_key(TARGET, TS, self.MARKED, None)),
+                          self.adapter.delivered), (None, []))
+
+    def test_a_429_on_the_click_hands_the_draft_back_to_the_gate(self):
+        """Review N4: a 429 is answered before the platform posts, so the approval is not
+        lost and nothing is on the platform — the draft returns to STAGED for another
+        click instead of stranding in INTENT with no Send and no Discard."""
+        from core.ratelimit import RateLimited
+
+        class Limited(GuardedFake):
+            def send(self, target, text, key=None, thread_id=None):
+                raise RateLimited("3", method="chat.postMessage")
+        adapter = Limited()
+        box = self.box(adapter=adapter)
+        key = box.stage(TARGET, TS, self.MARKED)["key"]
+        with self.assertRaises(RateLimited) as cm:
+            box.release(key)
+        self.assertNotIn("None", str(cm.exception))
+        self.assertEqual(box.get(key)["state"], STAGED)
+        self.assertEqual(box.discard(key)["state"], DISCARDED)
+
+    def test_the_marker_is_a_word_not_a_raw_prefix(self):
+        """Review N7: "[AGENT]glued" passed, and a marker "[AG" accepted another sender's
+        "[AGENT-OTHER]"; the marker must be followed by whitespace or the end."""
+        box = self.box()
+        with self.assertRaises(SendBlocked):
+            box.stage(TARGET, TS, "[AGENT]glued to the text")
+        with self.assertRaises(SendBlocked):
+            self.box(marker="[AG").stage(TARGET, TS, "[AGENT-OTHER] another sender's")
+        self.assertEqual(box.stage(TARGET, TS, "[AGENT]")["state"], STAGED)
+
+    def test_recovery_bounds_the_restart_search_with_the_drafts_age(self):
+        """Review N8: a newest-page search missed a post older than 200 messages and
+        re-sent it; the row's created_at travels to read_back as `since`."""
+        class SinceFake(GuardedFake):
+            def read_back(self, target, key, thread_id=None, text=None, since=None):
+                self.read_back_kwargs.append(since)
+                return super(GuardedFake, self).read_back(target, key)
+        adapter = SinceFake()
+        box = self.box(adapter=adapter)
+        key = box.stage(TARGET, TS, self.MARKED)["key"]
+        box.conn.execute("UPDATE outbox SET state='INTENT' WHERE key=?", (key,))
+        box.conn.commit()
+        box.recover()
+        self.assertEqual(adapter.read_back_kwargs[0], box.get(key)["created_at"])
 
     # ---- the adapter's declaration: direct sends off ----------------------------------
     def test_a_direct_policy_on_an_adapter_declaring_direct_off_is_refused_at_construction(self):
@@ -589,6 +695,67 @@ class SendGuardsTest(unittest.TestCase):
         Outbox(self.db, GuardedFake(direct=False), {TARGET: "staged"}, send_interval=0.0)
         Outbox(self.db, GuardedFake(direct=True), {TARGET: "direct"}, send_interval=0.0)
         Outbox(self.db, FakeAdapter(), {TARGET: "direct"}, send_interval=0.0)   # absent = allowed
+
+    # ---- guard 3's third answer: present, but not the approved text (review F3) ----------
+    def test_a_mismatched_post_is_parked_never_re_sent_never_committed(self):
+        from core.delivery import DeliveryMismatch
+        from core.outbox import MISMATCH
+
+        class MangledFake(GuardedFake):
+            def read_back(self, target, key, thread_id=None, text=None):
+                self.read_back_kwargs.append((thread_id, text))
+                if any(k == key for _, _, k, _ in self.delivered):
+                    raise DeliveryMismatch("the platform shows other text under this key")
+                return False
+        adapter = MangledFake()
+        box = self.box(adapter=adapter)
+        key = box.stage(TARGET, TS, self.MARKED)["key"]
+        with self.assertRaises(SendBlocked) as cm:
+            box.release(key)
+        self.assertIn("DIFFERENT text", str(cm.exception))
+        self.assertEqual(box.get(key)["state"], MISMATCH)
+        self.assertEqual(len(adapter.delivered), 1)
+        self.assertEqual(adapter.read_back_kwargs[-1][1], self.MARKED,
+                         "the approved text travels to read_back for the exact comparison")
+        counts = self.box(adapter=adapter).recover()                 # a new process
+        self.assertEqual((counts["resumed"], counts["resent"]), (0, 0),
+                         "a MISMATCH row is terminal: recovery must not touch it")
+        self.assertEqual((box.get(key)["state"], len(adapter.delivered)), (MISMATCH, 1))
+
+    def test_recovery_isolates_rows_and_records_the_failing_one(self):
+        """Review F7: one row whose read-back raises (a thread whose parent is gone) must
+        not wedge every other approved send behind it. A 429 still stops the run."""
+        from core.ratelimit import RateLimited
+
+        class DeadThreadFake(GuardedFake):
+            def read_back(self, target, key, thread_id=None, text=None):
+                if thread_id == "dead":
+                    raise RuntimeError("conversations.replies failed: thread_not_found")
+                return super().read_back(target, key)
+        adapter = DeadThreadFake()
+        box = self.box(adapter=adapter)
+        bad = box.stage(TARGET, "1.0", self.MARKED, thread_id="dead")["key"]
+        good = box.stage(TARGET, "2.0", self.MARKED)["key"]
+        for k in (bad, good):
+            box.conn.execute("UPDATE outbox SET state='INTENT' WHERE key=?", (k,))
+        box.conn.commit()
+        counts = box.recover()
+        self.assertEqual(box.get(good)["state"], COMMITTED, "the healthy row was wedged")
+        self.assertEqual(box.get(bad)["state"], INTENT)
+        self.assertEqual([k for k, _ in counts["errors"]], [bad])
+        self.assertIn("thread_not_found", counts["errors"][0][1])
+
+        class LimitedFake(GuardedFake):
+            def read_back(self, target, key, thread_id=None, text=None):
+                raise RateLimited("5", method="conversations.history")
+        limited = LimitedFake()
+        box2 = Outbox(Path(self.tmp.name) / "o3.db", limited, {TARGET: "staged"},
+                      send_interval=0.0)
+        k = box2.stage(TARGET, TS, TEXT)["key"]
+        box2.conn.execute("UPDATE outbox SET state='INTENT' WHERE key=?", (k,))
+        box2.conn.commit()
+        with self.assertRaises(RateLimited):
+            box2.recover()
 
     # ---- guard 3's plumbing: the thread travels to read_back ----------------------------
     def test_read_back_is_given_the_thread_when_it_takes_one(self):

@@ -67,7 +67,7 @@ from core.config import ConfigError, ensure_dirs, load, load_adapter_class  # no
 from core.dashboard import html_text, open_ro, snapshot  # noqa: E402
 from core.journal import Journal  # noqa: E402
 from core.outbox import (COMMITTED, DISCARDED, Outbox, PolicyError,  # noqa: E402
-                         ReleaseError, SENT, SendBlocked, STAGED, VERIFIED,
+                         MISMATCH, ReleaseError, SENT, SendBlocked, STAGED, VERIFIED,
                          thread_block_reason)
 
 
@@ -400,6 +400,10 @@ def _stage_clicked():
             _tie_or_warn(cfg, proven.get(res["key"]), res["key"])
         finally:
             proven.close()
+    if res.get("re_read"):
+        _push_flash("success", f"re-read acknowledged: draft `{res['key'][:12]}…` is "
+                               "current again — the same text waits for your click below")
+        return
     if res.get("deduped"):
         _push_flash("warning", f"already known: `{res['key'][:12]}…` is {res['state']}")
         return
@@ -449,7 +453,12 @@ def _release_clicked(inst_name, key):
         # After SENT is durable a failed read-back is NOT a refusal: the message may
         # well be on the platform, and "refused" would invite a second one.
         state = outbox.get(key)["state"] if outbox is not None else "?"
-        if state in (SENT, VERIFIED):
+        if state == MISMATCH:
+            # ENH-31 guard 3: the message is on the platform with text that is not the
+            # approved text. Nothing more will be sent; a human must look.
+            _push_flash("error", f"delivered with DIFFERENT text (state {state}): {ex} — "
+                                 "nothing more will be sent; the card below needs a human")
+        elif state in (SENT, VERIFIED):
             _push_flash("warning", f"SENT but delivery unproven (state {state}): {ex} — "
                                    "do NOT re-send; run Outbox.recover()")
         else:
@@ -600,7 +609,8 @@ def render(cfg):
     for inst in cfg.instances:
         outbox_path = cfg.outbox_path_for(inst.name)
         drafts = _rows(outbox_path, (STAGED,))
-        if not drafts:
+        mismatched = _rows(outbox_path, (MISMATCH,))
+        if not drafts and not mismatched:
             continue
         # Send is offered only where the adapter can deliver: a click on a draft whose
         # adapter has no send() used to flip the row to INTENT and crash — a wedge no
@@ -648,6 +658,23 @@ def render(cfg):
                                on_click=_release_clicked, args=(inst.name, row["key"]))
             reject.button("Discard", key=f"discard-{row['key']}",
                           on_click=_discard_clicked, args=(inst.name, row["key"]))
+        # ENH-31 guard 3: rows the platform holds with text that is not the approved
+        # text. Terminal until a human acts — no Send (it is there), no Discard (it was
+        # delivered); the card says what to do.
+        for row in mismatched:
+            any_staged = True
+            st.markdown(
+                "<div style='border:1px solid rgba(128,128,128,.3);border-left:"
+                "3px solid #8f1d1d;border-radius:8px;padding:10px 14px;margin:2px 0'>"
+                f"<b>{MISMATCH}</b> · {html.escape(row['target'])} · instance "
+                f"{html.escape(inst.name)} · key <code>{html.escape(row['key'][:12])}…</code>"
+                "<div style='font-size:.9rem;margin-top:4px'>approved text: "
+                f"{html_text(row['text'])}</div>"
+                "<div style='color:#8f1d1d;font-size:.85rem;margin-top:4px'>delivered with "
+                "DIFFERENT text — the platform shows a message carrying this draft's key "
+                "whose text is not the text above. Nothing more will be sent and nothing is "
+                "recorded as answered; compare the two on the platform, then edit or delete "
+                "there. Needs a human.</div></div>", unsafe_allow_html=True)
     if not any_staged:
         st.markdown("_no drafts at the gate_")
 

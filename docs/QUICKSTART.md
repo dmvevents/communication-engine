@@ -38,6 +38,9 @@ Edit it. The only things you must change:
 | `instances[].channels[].id` | the channel/chat IDs you want watched |
 | `instances[].channels[].reply_policy` | `never` (default), `staged`, or `direct` |
 | `instances[].channels[].thread_reply_policy` | optional; same three values, applied only to replies **inside a thread**. Omit it and a thread is governed by `reply_policy` like anything else |
+| `instances[].channels[].kind` | optional; `dm` or `channel`. A 1:1 direct message is answered top-level and closed by the DM rule (step 9). Omitted, a Slack-shaped `D…` id infers `dm` and any other id is a channel |
+| `instances[].answerers` | optional; the sender ids whose replies may close OTHER people's asks (the agent's bot user, the operators). Omitted, any non-asker's answer closes an ask |
+| `instances[].send_marker` | optional; a prefix (e.g. `"[AGENT]"`) every send from this connection must carry — prepended when a draft is staged, required again at the click |
 | `instances[].principals` | the user IDs whose messages matter |
 
 Paths in `engine` are resolved **relative to the config file**, so the same file works on any
@@ -171,10 +174,14 @@ rules you just tuned — no LLM sits in the hot path.
 
 ## 7. First real poll — your workspace, read-only
 
-The shipped real adapter is `slack`, and it is read-only at every layer: the class has
-no send method, and its transport refuses any non-read Web API method before a byte
-leaves the process (`tests/test_slack_adapter.py` fails if either property is lost).
-Switch your instance to it — still editing only `settings.json`:
+The shipped real adapter is `slack`. This step uses its read path only: with every channel
+at `reply_policy: never` (the default you copy below) nothing can post. Its send path
+(ENH-31) exists, but is reachable only through `core/outbox.py` at a channel policy of
+`staged` — a human click on the write surface — and only for a bot token (`xoxb-`); the
+transport refuses any Web API method outside its read allowlist plus that single write,
+`chat.postMessage`, before a byte leaves the process (`tests/test_slack_adapter.py` and
+`tests/test_outbox_write.py` fail if the allowlist, the token rule or the policy gate is
+lost). Switch your instance to it — still editing only `settings.json`:
 
 ```json
 "instances": [{
@@ -320,32 +327,52 @@ off, so an outbox built for a direct policy refuses at construction) — and fli
 gate gives a live channel a send path only where its policy already says `staged`. A token
 granted read-only never writes: its channels stay at `never`.
 
-Every Slack send passes six guards, each refusing **before** the durable INTENT flip, so
-a refused draft stays STAGED and discardable and nothing reaches the platform: (1) the
-connection's `send_marker` (an instance key, e.g. `"[AGENT]"`) is prepended when the draft
-is staged, shown on the card, and required again at the click — several senders share the
-bot identity in the harness, and the marker is how a reader and the other senders' dedupe
-tell the engine's messages apart; (2) the click **re-reads** the channel or thread, and a
-message newer than the draft refuses with who and when ("re-read first") — the human
-approved the text against the conversation as it stood; (3) the read-back after the post
-must find the SAME message: the outbox key rides the message metadata, and the canonical
-text must match exactly, or the row stays SENT, unproven and never re-sent blindly; (4) a
-text over 3,500 characters is refused (Slack silently splits at 4,000 and returns one ts);
-(5) a BLOCK-tier credential shape in the text (`core/redact.py`) is refused by class name,
-never echoed; (6) placement follows the human — in the ask's thread in a channel, top-level
-in a 1:1 direct message (a channel declared `kind: dm`, or inferred from a D-prefixed id).
-Tests exercise all of it against a loopback Slack stub through `COMMS_SLACK_API_BASE`,
-which admits `http://127.0.0.1:<port>` or `http://localhost:<port>` and refuses anything
-else by name at construction — nothing in the suite reaches slack.com.
+Every Slack send passes five refusals **before** the durable INTENT flip and one proof
+after the post, so a refused draft stays STAGED and discardable and nothing reaches the
+platform: (1) the connection's `send_marker` (an instance key, e.g. `"[AGENT]"`) is
+prepended when the draft is staged, shown on the card, and required again at the click by
+the outbox the surface builds — several senders share the bot identity in the harness, and
+the marker is how a reader and the other senders' dedupe tell the engine's messages apart
+(it must be followed by a space or the end of the text, so `[AGENT]glued` and another
+sender's `[AGENT-OTHER]` do not pass); (2) the click **re-reads** the channel or thread and
+refuses, with who and when ("re-read first"), when anything the human has NOT seen has
+arrived — the baseline is the platform's newest message recorded when the draft was staged
+(platform clock against platform clock; the engine's own earlier posts never count), and
+staging the same text again is the acknowledgement that re-arms the click; (3) a text over
+3,500 characters is refused — Slack silently splits at 4,000 and returns one ts; the guard
+counts the approved text as typed, and whether Slack's split counts the stored,
+entity-escaped form is unverified against the platform, which is what the 500-character
+margin is for; (4) a BLOCK-tier credential shape in the text (`core/redact.py`) is refused
+by class name, never echoed; (5) the channel's reply policy, re-read at the click, must be
+exactly `staged` — anything else is deny, and `direct` sends only through an adapter that
+declares them on, which Slack does not. After the post the **read-back** must find the SAME
+message: the outbox key rides the message metadata and the canonical text must match. A
+message carrying the key with other text parks the row as `MISMATCH` — never re-sent,
+never committed, and the card says a human must look; no message carrying the key leaves
+the row SENT for `Outbox.recover()`, which re-sends only what the platform does not hold,
+isolates each row (one dead thread cannot wedge the others) and stops on a 429. A 429 on
+the post itself hands the draft back to the gate as STAGED, because nothing was posted.
+Placement is the surface's routing rule, not a refusal: in the ask's thread in a channel,
+top-level in a 1:1 direct message (a channel declared `kind: dm`, or inferred from a
+Slack-shaped `D…` id). The outbox ladder and the surface are tested against a loopback
+Slack stub through `COMMS_SLACK_API_BASE` — which admits `http://127.0.0.1:<port>` only
+and refuses a name, a third host or a path before any I/O — and against the fake adapter;
+nothing in the suite reaches slack.com.
 
 Who may **close** an ask is the instance's `answerers` list (sender ids — the agent's bot
-user, the operators): with one, only their replies close asks, in threads and in DMs
-alike, so a bystander's "+1" closes nothing; without one, today's rule stands (any
-non-asker whose reply is not itself an ask; the other party of a DM). A reply that
-classifies as a question is never credited, from anyone: a clarifying question is a
-question. The Journal tab lists every ask closed by someone else's thread or DM reply
-under "closed by someone else — confirm", newest first, so the operator can see which
-asks left the queue that way.
+user, the operators): with one, only their replies close OTHER people's asks, in threads
+and in DMs alike, so a bystander's "+1" closes nothing; an ask posed by a listed answerer
+(the agent's own clarifying question) is closed by the other party's answer, or the engine
+would owe its agent an answer forever. Without a list, today's rule stands (any non-asker
+whose reply is not itself an ask; the other party of a DM) — note that a multi-party
+channel declared `kind: dm` with no answerer list closes an ask on anyone's next
+statement. In the thread sweep and the DM rule a reply that classifies as a question is
+never credited, from anyone: a clarifying question is a question (the write surface's
+Reply ties the text the human chose to send, whatever its shape). A message closes at most
+one ask, ever, and the engine's own deliveries are never re-credited to an older ask. The
+Journal tab lists every ask closed by someone else's thread or DM reply under "closed by
+someone else — review", newest first, so the operator can see which asks left the queue
+that way; there is no reopen action there — the journal row is the record to inspect.
 
 The same gate covers **configuration** (`scripts/dashboard_config.py`, over
 `core/reconfig.py`): with it on, the dashboard can also add, edit and remove
@@ -386,7 +413,10 @@ surface says so instead of implying one.
   top-level as the channel's thread policy allows), by an in-thread reply from someone
   other than the asker — from a listed answerer, when the source names them — swept each
   scheduler cycle, or, in a 1:1 direct message (declared or inferred), by the next
-  top-level message from an answerer, which closes the most recent open ask before it. "Responded" means exactly that, not
+  top-level message that is an answer, which closes the most recent open ask before it,
+  once — a message closes at most one ask, ever, and the engine's own deliveries are never
+  re-credited; a reply inside a DM's thread is not credited (0 of 535 DM messages measured
+  in-thread), and DM asks spend no thread-sweep budget. "Responded" means exactly that, not
   "resolved": a third party's "+1" closes an ask too, and the dashboard counts
   thread-closed asks apart from answers sent from here. A reply posted top-level in the
   channel by anyone else is stored and listed but cannot be tied to the ask, and the
@@ -409,7 +439,7 @@ surface says so instead of implying one.
   than for an internal app, so a distributed app should expect asks to close more slowly,
   never faster — and at about one call per cycle it needs that window fix first.
 - Five adapters ship: **`fake`** (in-memory dry-run), **`slack`** (poll / replies / resolve /
-  health, and one send — `chat.postMessage`, reachable only through `core/outbox` at policy
+  health, and one send — `chat.postMessage`, reachable only through `core/outbox.py` at policy
   `staged`, authorized for the aws-do-agent harness's bot token only; `tests/test_slack_adapter.py`
   fails if any other write surface appears) — **`slack_socket`** (Socket Mode push ingestion,
   read-only; push is for latency only: Socket Mode can MISS events, so the socket adapter is

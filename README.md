@@ -20,8 +20,9 @@ directions). Adapters live one directory per platform, all implementing
 | `email` | read-only IMAP polling (Outlook or any RFC-3501 server) — identity is the Message-ID (a non-orderable string, which store and parity handle end to end), ordering is mailbox UID order, threading from References/In-Reply-To; every select is EXAMINE and every fetch BODY.PEEK, so polling never marks mail seen |
 
 What does NOT ship is listed where an adopter acts: the quickstart's honest-limits section.
-Notably there is no live send path (the outbox ladder is complete, but only the `fake`
-adapter exposes `send()`) and `watchers/` is a stub. A reference scheduler ships
+The one live send path is the Slack adapter's `chat.postMessage`, behind `core/outbox.py` at
+policy `staged` — a human click on the write surface (ENH-31) — for a bot token only; every
+other adapter is read-only, and `watchers/` is a stub. A reference scheduler ships
 (`scripts/scheduler.py`): a guarded, read-only probe → classify → journal → route → owed
 loop you run under your own supervisor. An operator dashboard ships too
 (`scripts/dashboard.py` over `core/dashboard.py`): a read-only, loopback-only Streamlit

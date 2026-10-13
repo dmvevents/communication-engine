@@ -27,10 +27,24 @@ def cfg(instance_extra=None, channel_extra=None, channels=None):
 
 class KindTest(unittest.TestCase):
     def test_kind_is_inferred_from_a_slack_shaped_id_when_absent(self):
-        c = cfg(channels=[{"id": "D_SOMEONE_DM"}, {"id": "C_CUST"}, {"id": "G_PRIV"}])
+        real_shape = "D" + "7" * 10          # built at runtime: the gate refuses literal ids
+        c = cfg(channels=[{"id": "D_SOMEONE_DM"}, {"id": "C_CUST"}, {"id": "G_PRIV"},
+                          {"id": real_shape}])
         inst = c.instances[0]
-        self.assertEqual([ch.is_dm for ch in inst.channels], [True, False, False])
-        self.assertEqual(inst.dm_channels(), ("D_SOMEONE_DM",))
+        self.assertEqual([ch.is_dm for ch in inst.channels], [True, False, False, True])
+        self.assertEqual(inst.dm_channels(), ("D_SOMEONE_DM", real_shape))
+
+    def test_the_inference_is_bound_to_slacks_id_shape_not_to_a_bare_d(self):
+        """Review N3: the email adapter's channel ids are mailbox names, and the DM rule
+        would run on a mailbox called Drafts or Done. Only a Slack-shaped id (D plus 8+
+        uppercase letters, digits or underscores) infers a DM; anything else is declared."""
+        c = cfg(channels=[{"id": "Drafts"}, {"id": "Deleted Items"}, {"id": "Done"},
+                          {"id": "D1234567"}, {"id": "Drafts", "kind": "dm"}][:4])
+        self.assertEqual([ch.is_dm for ch in c.instances[0].channels],
+                         [False, False, False, False])
+        self.assertEqual(c.instances[0].dm_channels(), ())
+        declared = cfg(channels=[{"id": "Drafts", "kind": "dm"}])
+        self.assertTrue(declared.instances[0].channels[0].is_dm)
 
     def test_an_explicit_kind_overrides_the_inference_both_ways(self):
         c = cfg(channels=[{"id": "D_LOOKS_LIKE_DM", "kind": "channel"},

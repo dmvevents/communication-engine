@@ -35,17 +35,24 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import re
 import sqlite3
 import time
 from pathlib import Path
 
 from core import redact
+from core.delivery import DeliveryMismatch
+from core.ratelimit import RateLimited
 
 INTENT, SENT, VERIFIED, COMMITTED, STAGED = (
     "INTENT", "SENT", "VERIFIED", "COMMITTED", "STAGED")
 # ENH-28: a draft a human looked at and rejected. Terminal, and KEPT — deleting the
 # row would erase the record that this exact text reached the gate and was refused.
 DISCARDED = "DISCARDED"
+# ENH-31 guard 3: the platform shows a message carrying this row's key whose text is
+# NOT the approved text. Terminal until a human acts: never re-sent (the message is
+# there), never COMMITTED (it is not what was approved). recover() skips it.
+MISMATCH = "MISMATCH"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS outbox (
@@ -59,7 +66,8 @@ CREATE TABLE IF NOT EXISTS outbox (
     scope       TEXT NOT NULL DEFAULT 'channel',
     thread_id   TEXT,
     created_at  REAL NOT NULL,
-    updated_at  REAL NOT NULL
+    updated_at  REAL NOT NULL,
+    seen_ts     TEXT
 );
 """
 
@@ -70,6 +78,8 @@ CREATE TABLE IF NOT EXISTS outbox (
 _MIGRATIONS = (
     ("scope", "ALTER TABLE outbox ADD COLUMN scope TEXT NOT NULL DEFAULT 'channel'"),
     ("thread_id", "ALTER TABLE outbox ADD COLUMN thread_id TEXT"),
+    # ENH-31 guard 2: the platform ts the human had seen when the draft was staged.
+    ("seen_ts", "ALTER TABLE outbox ADD COLUMN seen_ts TEXT"),
 )
 
 
@@ -311,7 +321,7 @@ class Outbox:
         send) and again before the flip (release): the configured marker prefix, the
         adapter's size limit, and the BLOCK-tier credential scan. Each names its reason
         and never echoes a secret."""
-        if self.marker and not text.startswith(self.marker):
+        if self.marker and not re.match(re.escape(self.marker) + r"(\s|$)", text):
             raise exc(
                 f"the message does not start with the configured marker {self.marker!r} "
                 "— every send from this engine carries it so a reader, and the other "
@@ -328,35 +338,64 @@ class Outbox:
                 f"the message matches the BLOCK-tier credential pattern(s) {hits} — "
                 "refused before it could leave the host; nothing sent")
 
+    def _seen_ts(self, target, thread_id):
+        """The platform ts of the newest message a human staging now has seen: the newest
+        message of the channel or the thread, or — for a thread with no replies yet — the
+        thread's root, which IS what the human saw (review F4: without a platform baseline
+        the click fell back to the host clock, and the first reply to arrive was compared
+        against the wrong clock). None when the adapter has no newest(), or a channel is
+        empty."""
+        newest = getattr(self.adapter, "newest", None)
+        if not callable(newest):
+            return None
+        latest = newest(target, thread_id)
+        if latest is None:
+            return None if thread_id is None else str(thread_id)
+        return str(latest.get("ts"))
+
     def _check_newest(self, row):
         """ENH-31 guard 2 — at the CLICK: re-read the channel (or the thread) and refuse
-        when anything newer than the draft has arrived. The human approved this text
-        against the conversation as it was when the draft was staged; a newer message
-        means it moved on, and only a human who has re-read can say the text still
-        fits. Names who and when, never the text (a flash renders markdown)."""
+        when anything the human has not seen has arrived. The baseline is the platform ts
+        recorded when the draft was staged (`seen_ts`; re-staging refreshes it), so the
+        comparison is platform clock against platform clock — the host clock never
+        enters it (review F4). An adapter's newest() excludes this engine's own posts, so
+        an earlier approved send does not refuse the next one. Rows without a baseline
+        (staged before this column) fall back to the draft's created_at. Names who and
+        when, never the text (a flash renders markdown)."""
         newest = getattr(self.adapter, "newest", None)
         if not callable(newest):
             return
         latest = newest(row["target"], row["thread_id"])
         if latest is None:
             return
+        baseline = row["seen_ts"] if "seen_ts" in row.keys() else None
         try:
             latest_ts = float(latest.get("ts"))
+            base = float(baseline) if baseline is not None else float(row["created_at"])
         except (TypeError, ValueError):
             return                     # a non-numeric id space cannot be compared
-        if latest_ts > float(row["created_at"]):
+        if latest_ts > base:
             raise ReleaseError(
                 f"re-read first: {latest.get('sender_id') or 'someone'} posted at ts "
                 f"{latest.get('ts')} after this draft was staged, so the conversation "
-                "moved on — the draft stays STAGED; re-read, then re-stage or discard")
+                "moved on — the draft stays STAGED; re-read it, then stage the same text "
+                "again to confirm, or discard")
 
-    def _read_back(self, target, key, thread_id):
-        """read_back(target, key), plus thread_id for an adapter whose read_back takes
-        it (Slack: a thread reply is served by conversations.replies, never history)."""
+    def _read_back(self, target, key, thread_id, text=None, since=None):
+        """read_back(target, key), plus thread_id and the approved text for an adapter
+        whose read_back takes them (Slack: a thread reply is served by
+        conversations.replies, never history; the text lets a NEW process compare
+        exactly, so a mangled post is a mismatch after a restart too — review F3).
+        May raise core.delivery.DeliveryMismatch; callers park the row."""
         rb = self.adapter.read_back
+        kwargs = {}
         if thread_id is not None and _accepts_kw(rb, "thread_id"):
-            return rb(target, key, thread_id=thread_id)
-        return rb(target, key)
+            kwargs["thread_id"] = thread_id
+        if text is not None and _accepts_kw(rb, "text"):
+            kwargs["text"] = text
+        if since is not None and _accepts_kw(rb, "since"):
+            kwargs["since"] = since                  # bounds a restart search (review N8)
+        return rb(target, key, **kwargs)
 
     def _deliver(self, target, text, key, thread_id):
         """The one place adapter.send() is called, from both the live path and recovery.
@@ -391,7 +430,7 @@ class Outbox:
         """
         policy = self.policies.get(target, "never")
         if isinstance(policy, dict):
-            return policy.get(scope, "never")
+            return policy.get(scope) or "never"      # a None value is deny, not direct
         return policy
 
     # ---- the send ladder --------------------------------------------------
@@ -412,6 +451,19 @@ class Outbox:
             raise PolicyError(
                 f"reply policy for {target} ({scope} scope) is 'never' — refusing to "
                 "send. Sending requires an explicit policy of 'staged' or 'direct'.")
+        # Default DENY at the seam, not only at construction (review F5): anything that
+        # is not exactly 'staged' or 'direct' is never — a typo is not a direct send —
+        # and 'direct' sends only through an adapter that allows it. The policy map may
+        # have changed since construction; the send is what must not happen.
+        if policy not in ("staged", "direct"):
+            raise PolicyError(
+                f"reply policy for {target} ({scope} scope) is {policy!r}, not one of "
+                "'never', 'staged', 'direct' — default deny, nothing sent")
+        if policy == "direct" and not _allows_direct(self.adapter):
+            raise PolicyError(
+                f"reply policy for {target} ({scope} scope) is 'direct', but adapter "
+                f"{_adapter_label(self.adapter)} declares direct sends off — only a human "
+                "click ('staged') may send through it; nothing sent")
 
         key = idempotency_key(target, trigger_ts, text, thread_id)
         row = self.get(key)
@@ -481,7 +533,17 @@ class Outbox:
         if _crash_at == "before_readback":
             raise _Crash("crash after SENT, before read-back")
 
-        if not self._read_back(target, key, thread_id):
+        try:
+            proven = self._read_back(target, key, thread_id, text)
+        except DeliveryMismatch as ex:
+            # The message IS on the platform, with text that is not the approved text.
+            # Never re-send (it is there), never commit (it is not what was approved):
+            # park it for a human (review F3).
+            self._write(key, state=MISMATCH)
+            raise SendBlocked(
+                f"delivered with DIFFERENT text — {ex}; the row is parked as {MISMATCH}, "
+                "nothing more will be sent, a human must resolve it") from ex
+        if not proven:
             raise SendBlocked(f"read-back could not prove delivery of {key} to {target}")
         self._write(key, state=VERIFIED)
 
@@ -500,28 +562,42 @@ class Outbox:
           * yes -> mark VERIFIED then COMMITTED. **No re-send.**
           * no  -> the send never happened; do it now.
         """
-        counts = {"resumed": 0, "resent": 0, "already_delivered": 0}
+        counts = {"resumed": 0, "resent": 0, "already_delivered": 0, "mismatched": 0,
+                  "errors": []}
         rows = self.conn.execute(
             "SELECT * FROM outbox WHERE state IN (?,?)", (INTENT, SENT)).fetchall()
         for row in rows:
             counts["resumed"] += 1
             key, target = row["key"], row["target"]
-            if self._read_back(target, key, row["thread_id"]):
-                counts["already_delivered"] += 1
-            else:
-                # recovery is a burst source too: N undelivered rows for one channel
-                # re-sent back-to-back would 429 exactly like the live path
-                self._pace(target)
-                # Placement comes from the ROW, never from a caller: resuming a thread
-                # reply as a top-level post would break the thread-only policy after
-                # the fact, in public, with no second chance.
-                receipt = self._deliver(target, row["text"], key, row["thread_id"])
-                self._write(key, receipt=json.dumps(receipt))
-                counts["resent"] += 1
-                if not self._read_back(target, key, row["thread_id"]):
-                    raise SendBlocked(f"re-send of {key} still not provable")
-            self._write(key, state=VERIFIED)
-            self._write(key, state=COMMITTED)
+            # Per ROW (review F7): one row whose thread is gone, or whose post was
+            # mangled, must not wedge every other approved send behind it. A 429 is the
+            # platform saying stop, so it still ends the run.
+            try:
+                if self._read_back(target, key, row["thread_id"], row["text"],
+                                   since=row["created_at"]):
+                    counts["already_delivered"] += 1
+                else:
+                    # recovery is a burst source too: N undelivered rows for one channel
+                    # re-sent back-to-back would 429 exactly like the live path
+                    self._pace(target)
+                    # Placement comes from the ROW, never from a caller: resuming a
+                    # thread reply as a top-level post would break the thread-only
+                    # policy after the fact, in public, with no second chance.
+                    receipt = self._deliver(target, row["text"], key, row["thread_id"])
+                    self._write(key, receipt=json.dumps(receipt))
+                    counts["resent"] += 1
+                    if not self._read_back(target, key, row["thread_id"], row["text"]):
+                        raise SendBlocked(f"re-send of {key} still not provable")
+                self._write(key, state=VERIFIED)
+                self._write(key, state=COMMITTED)
+            except RateLimited:
+                raise
+            except DeliveryMismatch as ex:
+                self._write(key, state=MISMATCH)
+                counts["mismatched"] += 1
+                counts["errors"].append((key, f"{type(ex).__name__}: {ex}"))
+            except Exception as ex:  # noqa: BLE001 — recorded by row, never a wedge
+                counts["errors"].append((key, f"{type(ex).__name__}: {ex}"))
         return counts
 
     def pending(self) -> list:
@@ -573,19 +649,33 @@ class Outbox:
         if self.get(key) is None:               # a new draft, not a replay (review F9)
             self._check_placement(thread_id)        # before the draft exists at all
             self._check_payload(text)               # marker, size, redaction (ENH-31)
+        # ENH-31 guard 2: what the human had SEEN when staging — the platform's newest
+        # message, on the platform's clock — so the click compares platform ts with
+        # platform ts (review F4: comparing with the host's created_at missed every
+        # message inside the clock skew, and the engine's own earlier post tripped it).
+        seen_ts = self._seen_ts(target, thread_id)
         # Same INSERT-is-the-claim shape as send(): concurrent stagers of the same
         # draft collapse to one row, and re-staging an already-delivered reply must
         # report the delivery, not mint a second visible message.
         cur = self.conn.execute(
             "INSERT OR IGNORE INTO outbox (key, target, trigger_ts, text, state, "
-            "policy, scope, thread_id, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "policy, scope, thread_id, created_at, updated_at, seen_ts) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (key, target, str(trigger_ts), text, STAGED,
              self.policy_for(target, scope), scope, thread_id,
-             time.time(), time.time()))
+             time.time(), time.time(), seen_ts))
         self.conn.commit()
         if cur.rowcount == 0:
             row = self.get(key)
+            if row["state"] == STAGED:
+                # Re-staging the SAME draft is the human saying "I re-read; keep this
+                # text": the draft becomes current again (review F4: without this a
+                # refused Reply had no exit — re-staging deduped onto the stale row).
+                self.conn.execute("UPDATE outbox SET seen_ts=?, updated_at=? WHERE key=? "
+                                  "AND state=?", (seen_ts, time.time(), key, STAGED))
+                self.conn.commit()
+                return {"key": key, "receipt": None, "state": STAGED, "deduped": True,
+                        "re_read": True}
             return {"key": key, "receipt": row["receipt"], "state": row["state"],
                     "deduped": True}
         return {"key": key, "receipt": None, "state": STAGED, "staged": True,
@@ -640,8 +730,16 @@ class Outbox:
             if settled is None:
                 raise ReleaseError(f"draft {key!r} changed under this click; retry")
             return settled
-        return self._finish(key, row["target"], row["text"], row["thread_id"],
-                            _crash_at)
+        try:
+            return self._finish(key, row["target"], row["text"], row["thread_id"],
+                                _crash_at)
+        except RateLimited:
+            # A 429 is answered BEFORE the platform posts, so nothing is on the platform
+            # and the approval is not lost: hand the draft back to the gate (compare-and-
+            # swap, INTENT -> STAGED) for the human to click again — a routine 429 used
+            # to leave an approved reply with no Send and no Discard (review N4).
+            self._claim(key, INTENT, STAGED)
+            raise
 
     def discard(self, key: str) -> dict:
         """Reject a draft. Terminal, and only FROM staged: an in-flight or delivered

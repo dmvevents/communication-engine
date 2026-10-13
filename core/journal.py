@@ -255,6 +255,16 @@ class Journal:
             args = (channel,)
         return self.conn.execute(q + " ORDER BY ts", args).fetchall()
 
+    def used_response_keys(self, channel: str, prefix: str) -> set:
+        """Every response_key in this channel starting with `prefix`. The DM rule asks
+        which messages already closed an ask, so one message closes at most one ask,
+        EVER — without this, the answer that closed ask 2.0 in one cycle closed ask 1.0
+        in the next, and its owed work with it (independent review of ENH-31, F1)."""
+        rows = self.conn.execute(
+            "SELECT response_key FROM journal WHERE channel=? AND response_key LIKE ?",
+            (channel, prefix + "%")).fetchall()
+        return {r[0] for r in rows}
+
     def answered(self, channel: str | None = None) -> list:
         """The closable complement of unanswered(): rows already tied to a response.
         The reference scheduler closes message-routed owed work from this set — by
