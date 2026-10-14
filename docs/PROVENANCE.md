@@ -1,22 +1,23 @@
 # PROVENANCE — where each module's design comes from
 
 Every part of this engine generalizes something that already runs in production on the origin
-host. This file maps planned modules to their battle-tested ancestors — **paths only, no content,
-no identifiers**. The originals stay where they are; this repo re-implements the *patterns*.
+host. This file maps planned modules to their battle-tested ancestors — **descriptions only: no paths,
+no tool names, no content, no identifiers**. The originals stay where they are; this repo re-implements
+the *patterns*.
 
 | Planned module | Origin (on the origin host) | What it proved |
 |---|---|---|
-| `core/engine.py` | `jarvis-slack/monitor.py` | 15s gap-free cursored polling, idempotent ingest (INSERT OR REPLACE), heartbeat file contract; container up for weeks |
-| `core/store.py` | `slack/db.py` | working schema: messages / users / channels / reactions / files / sync_state / workspaces |
-| `core/triggers.py` | `jarvis-slack/monitor.py` (classify_tier) | mention/keyword triggers + tier-1(info)/tier-2(work) classification |
-| `core/outbox.py` | the staged-send discipline in the colleague-supervisor loop | draft → staged file → operator gate → send; read-back verification after send |
-| `core/watchdog.py` | `jarvis-slack/watchdog.sh` + `telegram-bridge/watchdog.sh` (near-identical mirrors) | check registry, consecutive-fail threshold, alert cooldown, maintenance flag, quiet-channel vs dead-monitor disambiguation |
-| `core/supervisor.py` | the colleague-supervisor command loop (cron, 15-min cadence) | flock single-instance, idempotent cursor, idle backoff, byte-identical-outcome alarm, cursor auto-reconcile with proof-of-reply, detached bounded responder sessions |
+| `core/engine.py` | a Slack monitor daemon's polling loop | 15s gap-free cursored polling, idempotent ingest (INSERT OR REPLACE), heartbeat file contract; container up for weeks |
+| `core/store.py` | the Slack mirror's SQLite layer | working schema: messages / users / channels / reactions / files / sync_state / workspaces |
+| `core/triggers.py` | the same monitor daemon's tier classifier | mention/keyword triggers + tier-1(info)/tier-2(work) classification |
+| `core/outbox.py` | the staged-send discipline of a supervised reply loop | draft → staged file → operator gate → send; read-back verification after send |
+| `core/watchdog.py` | two near-identical watchdog scripts (the Slack monitor's and a Telegram bridge's) | check registry, consecutive-fail threshold, alert cooldown, maintenance flag, quiet-channel vs dead-monitor disambiguation |
+| `core/supervisor.py` | a cron-driven supervisor command loop (15-min cadence) | flock single-instance, idempotent cursor, idle backoff, byte-identical-outcome alarm, cursor auto-reconcile with proof-of-reply, detached bounded responder sessions |
 | `core/probe.py` | that loop's per-minute connection probe | cheap-probe/expensive-responder split; edge-only alerting ("who monitors the monitor"); per-minute probe doubling as new-message trigger (~1-min detection at zero LLM cost) |
-| `core/dashboard.py` | the comms-spoke monitors catalog + dashboard | monitors.json schema → issues-style rendered dashboard |
-| `channels/slack/` | `slack/mcp_server.py` + `jarvis-slack/monitor.py` | 12-tool surface over db-mirror + live API; loopback HMAC post bridge |
-| `channels/telegram/` | `telegram-dispatcher/` + `session-router/` | inbound envelope routing to consumers; marker-line reply scraping; loopback HMAC bridge |
-| `watchers/stack-watchdog.sh` | the two watchdog mirrors above | same 7-check skeleton parameterized per adapter |
+| `core/dashboard.py` | a monitors catalog and its rendered dashboard | monitors.json schema → issues-style rendered dashboard |
+| `channels/slack/` | the Slack mirror's tool server and the monitor daemon | 12-tool surface over db-mirror + live API; loopback HMAC post bridge |
+| `channels/telegram/` | a Telegram dispatcher and a session router | inbound envelope routing to consumers; marker-line reply scraping; loopback HMAC bridge |
+| `watchers/stack-watchdog.sh` | the two watchdog scripts above | same 7-check skeleton parameterized per adapter |
 
 ## Defects the origin system taught us (encode as regression tests, phase 1)
 
