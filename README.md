@@ -40,7 +40,7 @@ non-author adoption run).
 
 ```sh
 cp settings.example.json settings.json   # then edit; settings.json is gitignored
-scripts/install-hooks.sh                 # pre-commit + pre-push gates
+scripts/install-hooks.sh                 # pre-commit + commit-msg + pre-push gates
 scripts/sanitize-gate.sh --self-test     # prove the secret gate on this machine
 python3 -m unittest discover -s tests -q # the suite is the spec
 ```
@@ -68,7 +68,7 @@ incident it exists to prevent.
 ## Security model (non-negotiable)
 
 1. **No secrets in this repo, ever** — not in code, not in docs, not as scan patterns.
-   `scripts/sanitize-gate.sh` enforces this in the local pre-commit and pre-push hooks
+   `scripts/sanitize-gate.sh` enforces this in the local pre-commit, commit-msg and pre-push hooks
    (`scripts/install-hooks.sh`) and proves itself with `--self-test`. Do not trust a green
    GitHub Actions run: Actions is billing-blocked for this repo and reports "completed"
    while executing zero steps (finding F-3) — the local gates are the real ones.
@@ -90,6 +90,9 @@ README once gated its quickstart on a phase that had already shipped, and `core/
 listed six modules that never existed. Every load-bearing property has a test that fails if
 the property is removed, and `tests/mutation_check.sh` proves those tests have teeth.
 
+[SECURITY.md](SECURITY.md) records the gates, the privacy reviews of this repository and
+their planted controls, and how to report a vulnerability.
+
 ## License
 
-Private repository; licensing intentionally deferred until/unless visibility ever changes.
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).

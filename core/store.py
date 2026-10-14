@@ -1,6 +1,6 @@
 """core/store.py — the channel-agnostic message store.
 
-Generalises the live schema (origin: slack/db.py) so any adapter's messages land in one
+Generalises the live schema (origin: a Slack mirror's SQLite schema) so any adapter's messages land in one
 place. Deliberately boring: sqlite, explicit schema, no ORM.
 
 Two properties are load-bearing and each is pinned by a test that fails if the property
