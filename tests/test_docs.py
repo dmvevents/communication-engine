@@ -784,7 +784,7 @@ class GatesCheckDocTest(unittest.TestCase):
         if not (ROOT / ".git").is_dir():
             self.skipTest("not a git clone (mutation sandbox); the content "
                           "assertions above carry the property there")
-        for hook in ("pre-commit", "pre-push"):
+        for hook in ("pre-commit", "pre-push", "commit-msg"):
             self.assertTrue(
                 (ROOT / ".git" / "hooks" / hook).is_file(),
                 f"the runbook promises `ls .git/hooks/{hook}` prints on a healthy "

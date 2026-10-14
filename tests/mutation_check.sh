@@ -2795,6 +2795,29 @@ run_mutation "dashboard: html_text keeps a bare carriage return (CR CR is a blan
   "('    return html.escape(text or \"\").replace(\"\\\\r\", \"\").replace(\"\\\\n\", \"<br>\")', '    return html.escape(text or \"\").replace(\"\\\\n\", \"<br>\")')" \
   "test_dashboard"
 
+# The text gate (independent privacy review of the public repository, 2026-10-14): the four
+# findings sat in commit messages and pull-request bodies, which the tree gate never sees.
+# Each entry removes one property of scripts/sanitize-text.sh or its commit-msg hook.
+run_mutation "sanitize-text: a finding never fails the check" \
+  "scripts/sanitize-text.sh" \
+  "('bash \"\$GATE\" \"\$T\" || rc=\$?', 'bash \"\$GATE\" \"\$T\" || rc=0')" \
+  "test_sanitize_text"
+
+run_mutation "sanitize-text: empty text passes as clean" \
+  "scripts/sanitize-text.sh" \
+  "('empty text — nothing to scan\" >&2; exit 2; }', 'empty text — nothing to scan\" >&2; exit 0; }')" \
+  "test_sanitize_text"
+
+run_mutation "sanitize-text: a commit range scans only its newest message" \
+  "scripts/sanitize-text.sh" \
+  "('for sha in \$(git rev-list \"\$2\"); do', 'for sha in \$(git rev-list -1 \"\$2\"); do')" \
+  "test_sanitize_text"
+
+run_mutation "install-hooks: the commit-msg hook accepts every message" \
+  "scripts/install-hooks.sh" \
+  "('exec bash \"\$R/scripts/sanitize-text.sh\" \"\$1\"', 'exec true')" \
+  "test_sanitize_text"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }
