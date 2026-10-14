@@ -1710,7 +1710,7 @@ run_mutation "docs: the parity differ loses its name in honest limits" \
 # ENH-22 — the check that prints nothing on a healthy clone, reintroduced verbatim.
 run_mutation "docs: the hook check reverts to the silent-on-healthy form" \
   "docs/RUNBOOK.md" \
-  "('ls .git/hooks/pre-commit .git/hooks/pre-push  # healthy: both paths print', 'git config core.hooksPath; ls .git/hooks/pre-push')" \
+  "('ls .git/hooks/pre-commit .git/hooks/pre-push .git/hooks/commit-msg  # healthy: all three paths print', 'git config core.hooksPath; ls .git/hooks/pre-push')" \
   "test_docs"
 
 # ENH-9 — the hedge signal, per boundary. "Ambiguity silently becomes STATEMENT: safe
