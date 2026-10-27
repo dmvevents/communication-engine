@@ -87,6 +87,13 @@ def report_lines(summary) -> list:
                  "channel" if why == "rate-limited" else
                  "this adapter's thread budget was spent before it reached this channel")
         lines.append(f"sweep: SKIPPED channel={ch} — {cause}; it is swept first next cycle")
+    # Issue #8: the follow-up sweep's own refusals (it reports thread errors with the rest).
+    for ch, method in summary.get("followup_rate_limited", ()):
+        lines.append(f"followup-sweep: RATE-LIMITED channel={ch} method={method} — "
+                     "follow-ups under answered asks not looked for this cycle")
+    for ch in summary.get("followup_truncated", ()):
+        lines.append(f"followup-sweep: TRUNCATED channel={ch} — more recently answered "
+                     "threads than this cycle's leftover budget; the rest wait for a later cycle")
     return lines
 
 

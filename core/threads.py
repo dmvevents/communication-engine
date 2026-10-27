@@ -35,6 +35,13 @@ re-sighting). The first version used the newest STORED reply as the floor — bu
 is written inside the sweep and the journal only afterwards by the caller, so a crash between
 the two left a stored reply that was never fetched again and never journaled: the inverted
 dual-write the scheduler forbids for poll(), found by the independent review of 89fd0fa.
+
+Follow-ups (issue #8): an answered ask is no longer the open-ask sweep's, so a reply posted
+under the answer later (typically the asker's next question) was never ingested, listed or
+owed. `sweep_followups()` sweeps the threads of asks answered within FOLLOWUP_WINDOW_S, at
+the lowest priority (the scheduler gives it what the open asks left of the budget), and ties
+nothing. Not covered: a follow-up in a thread rooted at the answerer's own TOP-LEVEL message;
+recognising that root needs the source's answerer list or the engine's own delivery metadata.
 """
 from __future__ import annotations
 
@@ -57,6 +64,11 @@ SWEEP_MAX = 25
 # bots) to this placeholder — the store requires a sender. It is truthy, so it must be
 # excluded by name: a tombstone is not an answer.
 UNATTRIBUTED_SENDERS = frozenset({"unknown"})
+
+# Issue #8: how long after its answer an ask's thread is still swept for follow-ups. Bounded
+# on purpose: sweeping every answered thread forever would grow without limit, and a day
+# covers the asker who follows up the next morning.
+FOLLOWUP_WINDOW_S = 24 * 3600
 
 
 def answered_by(asker: str | None, replies, is_answer=None) -> dict | None:
@@ -175,4 +187,84 @@ def sweep(adapter, store, journal, channel: str, *,
                                        at=arrivals.get(str(hit["ts"])))
                 result["answered"].append((str(row["ts"]), str(hit["ts"])))
     result["next_start"] = (start + reached) % len(open_asks)
+    return result
+
+
+def followup_window_key(instance: str) -> str:
+    """The store key the follow-up window is kept under, beside the instance's open-ask
+    windows. A '#' never appears in an instance name (core/config refuses it), so the key
+    cannot collide with a real instance."""
+    return f"{instance}#followups"
+
+
+def recently_answered_for(journal, channel: str, since: float) -> list:
+    """This channel's ASKS answered at or after `since` (on the engine clock responded_at
+    is stamped with), most recently answered first: the follow-up sweep's list."""
+    rows = [r for r in journal.answered(channel, since=since) if r["kind"] in ACTIONABLE_KINDS]
+    rows.sort(key=lambda r: r["responded_at"], reverse=True)
+    return rows
+
+
+def sweep_followups(adapter, store, journal, channel: str, *, max_threads: int = SWEEP_MAX,
+                    start: int = 0, now: float | None = None,
+                    window_s: float = FOLLOWUP_WINDOW_S) -> dict | None:
+    """Fetch new replies under the threads of asks answered within the last `window_s`
+    seconds (issue #8). Once an ask is answered this is the only route by which a reply
+    posted under it later reaches the engine.
+
+    It never ties: an answered ask stays answered by what answered it, and a follow-up is
+    never its answer (review F7). The caller journals the replies, so a follow-up QUESTION
+    becomes an owed ask of its own and the open-ask sweep looks for ITS answer from the next
+    cycle on. A root that has an open ask belongs to that sweep and is skipped here (one call
+    per root per cycle). The fetch floor is the oldest answered ask under the root, as in
+    sweep() (R9: the store and the journal absorb every re-sighting). `now` defaults to the
+    store's clock, the one that stamps the arrivals a thread tie is dated by.
+
+    Same result shape as sweep(); `answered` is always empty, and `next_start` rotates
+    through the roots, most recently answered first. None when the adapter has no
+    `replies()`: declared absent, never "nothing new".
+    """
+    if not hasattr(adapter, "replies"):
+        return None
+    now = store.clock() if now is None else now
+    result = {"swept": 0, "calls": 0, "replies": [], "answered": [], "truncated": False,
+              "rate_limited": None, "errors": [], "next_start": 0}
+    open_roots = {store.thread_root(channel, r["ts"]) for r in open_asks_for(journal, channel)}
+    by_root: dict = {}
+    for row in recently_answered_for(journal, channel, now - window_s):
+        if ts_order(row["ts"])[0] != 0:
+            result["errors"].append((str(row["ts"]), "non-orderable message id — the "
+                                     "thread sweep needs numeric platform timestamps"))
+            continue
+        root = store.thread_root(channel, row["ts"])
+        if root in open_roots:
+            continue
+        by_root.setdefault(root, []).append(row)
+    roots = list(by_root)
+    if not roots:
+        return result
+    start = start % len(roots)
+    turn = roots[start:] + roots[:start]
+    window = turn[:max_threads]
+    result["truncated"] = len(roots) > len(window)
+    reached = len(window)
+    for i, root in enumerate(window):
+        rows = by_root[root]
+        oldest = min((str(r["ts"]) for r in rows), key=ts_order)
+        result["calls"] += 1            # an attempt is a call, whatever it answers
+        try:
+            fetched = list(adapter.replies(channel, root, oldest=oldest))
+        except RateLimited as ex:
+            result["rate_limited"] = ex.method or "replies"
+            reached = i                 # this root was not fetched: resume at it
+            break
+        except Exception as ex:  # noqa: BLE001 — recorded by ask, never swallowed
+            result["errors"].extend((str(r["ts"]), f"{type(ex).__name__}: {ex}")
+                                    for r in rows)
+            continue
+        result["swept"] += 1
+        if fetched:
+            store.upsert_messages(fetched)
+            result["replies"].extend(fetched)
+    result["next_start"] = (start + reached) % len(roots)
     return result

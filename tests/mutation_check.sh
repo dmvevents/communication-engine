@@ -2795,6 +2795,49 @@ run_mutation "dashboard: html_text keeps a bare carriage return (CR CR is a blan
   "('    return html.escape(text or \"\").replace(\"\\\\r\", \"\").replace(\"\\\\n\", \"<br>\")', '    return html.escape(text or \"\").replace(\"\\\\n\", \"<br>\")')" \
   "test_dashboard"
 
+# Issue #8 — follow-ups under answered asks: swept inside the window only, asks only, never a
+# root the open-ask sweep owns, bounded, resumed at the root a 429 refused, run by the cycle
+# at the lowest priority from the same budget, and reported.
+run_mutation "threads: the follow-up sweep ignores its window" \
+  "core/threads.py" \
+  "('journal.answered(channel, since=since)', 'journal.answered(channel)')" \
+  "test_threads"
+
+run_mutation "threads: the follow-up sweep takes statements too" \
+  "core/threads.py" \
+  "('since=since) if r[\"kind\"] in ACTIONABLE_KINDS]', 'since=since) if True]')" \
+  "test_threads"
+
+run_mutation "threads: the follow-up sweep fetches a root the open-ask sweep owns" \
+  "core/threads.py" \
+  "('        if root in open_roots:\n            continue', '        if False:\n            continue')" \
+  "test_threads"
+
+run_mutation "threads: the follow-up sweep is unbounded" \
+  "core/threads.py" \
+  "('    window = turn[:max_threads]', '    window = turn')" \
+  "test_threads"
+
+run_mutation "threads: the follow-up window skips the root a 429 refused" \
+  "core/threads.py" \
+  "('            reached = i                 # this root was not fetched: resume at it', '            reached = i + 1')" \
+  "test_threads"
+
+run_mutation "schedule: the cycle never sweeps follow-ups" \
+  "core/schedule.py" \
+  "('fu = threads.sweep_followups(', 'fu = None and threads.sweep_followups(')" \
+  "test_schedule"
+
+run_mutation "schedule: follow-up calls are not charged against the budget" \
+  "core/schedule.py" \
+  "('                budget -= fu[\"calls\"]', '                pass')" \
+  "test_schedule"
+
+run_mutation "scheduler: a truncated follow-up sweep prints no line" \
+  "scripts/scheduler.py" \
+  "('    for ch in summary.get(\"followup_truncated\", ()):', '    for ch in ():')" \
+  "test_schedule"
+
 echo
 echo "mutation_check: caught=$PASS survived/error=$FAIL"
 [ "$FAIL" -eq 0 ] && { echo "PASS — every removed property turned the suite red"; exit 0; }
