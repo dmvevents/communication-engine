@@ -34,7 +34,8 @@ from core.journal import Journal  # noqa: E402
 from core.ratelimit import RateLimited  # noqa: E402
 from core.schedule import ROUTES  # noqa: E402
 from core.store import Store  # noqa: E402
-from core.threads import SWEEP_MAX, answered_by, sweep  # noqa: E402
+from core.threads import (  # noqa: E402
+    FOLLOWUP_WINDOW_S, SWEEP_MAX, answered_by, sweep, sweep_followups)
 
 FakeAdapter = load_adapter_class(ROOT / "channels", "fake")
 
@@ -380,6 +381,83 @@ class SweepTest(SweepHarness):
         self.assertEqual([m["ts"] for m in a.replies("C1", "1.0")], ["2.0", "3.0"])
         self.assertEqual([m["ts"] for m in a.replies("C1", "1.0", oldest="2.0")],
                          ["3.0"], "oldest is exclusive, like poll()'s cursor")
+
+class FollowupSweepTest(SweepHarness):
+    """Issue #8: the threads of asks answered within FOLLOWUP_WINDOW_S are swept for
+    follow-ups: fetched, stored and returned for journaling, never tied."""
+
+    NOW = 1_800_000_000.0
+
+    def answered(self, ts, at, kind="QUESTION"):
+        self.ask(ts=ts, text=f"question {ts}?", kind=kind)
+        self.journal.mark_responded("C1", ts, f"outbox-{ts}", at=at)
+
+    def test_a_follow_up_under_an_answered_ask_is_fetched_and_never_tied(self):
+        self.ask()
+        self.reply("2.0", "B_AGENT")
+        sweep(self.adapter, self.store, self.journal, "C1")          # ties 1.0 to 2.0
+        self.reply("3.0", "U_ASKER", text="and where are the logs?")
+        self.adapter.calls.clear()
+        self.assertEqual(sweep(self.adapter, self.store, self.journal, "C1")["calls"], 0,
+                         "the open-ask sweep does not look at an answered ask")
+        res = sweep_followups(self.adapter, self.store, self.journal, "C1")
+        self.assertEqual(self.adapter.calls, [("C1", "1.0", "1.0")])
+        self.assertIn("3.0", [m["ts"] for m in res["replies"]],
+                      "the follow-up must be returned for journaling")
+        self.assertEqual(res["answered"], [])
+        self.assertEqual(self.responded("1.0")[1], "thread-reply:2.0",
+                         "the answered ask was re-tied")
+
+    def test_only_asks_answered_inside_the_window_are_swept(self):
+        self.answered("1.0", at=self.NOW - FOLLOWUP_WINDOW_S - 1)
+        self.answered("2.0", at=self.NOW - FOLLOWUP_WINDOW_S + 60)
+        res = sweep_followups(self.adapter, self.store, self.journal, "C1", now=self.NOW)
+        self.assertEqual([c[1] for c in self.adapter.calls], ["2.0"],
+                         "a thread answered before the window was fetched, or one "
+                         "inside it was not")
+        self.assertEqual(res["swept"], 1)
+
+    def test_a_statement_is_never_follow_up_swept(self):
+        self.answered("1.0", at=self.NOW - 60, kind="STATEMENT")
+        sweep_followups(self.adapter, self.store, self.journal, "C1", now=self.NOW)
+        self.assertEqual(self.adapter.calls, [])
+
+    def test_a_root_with_an_open_ask_is_left_to_the_open_ask_sweep(self):
+        self.answered("1.0", at=self.NOW - 60)
+        self.ask(ts="3.0", text="and the logs?", thread="1.0")       # open, same root
+        res = sweep_followups(self.adapter, self.store, self.journal, "C1", now=self.NOW)
+        self.assertEqual(self.adapter.calls, [],
+                         "a root the open-ask sweep owns was fetched a second time")
+        self.assertEqual(res["swept"], 0)
+
+    def test_the_follow_up_sweep_is_bounded_rotates_and_says_so(self):
+        for i in range(1, 6):
+            self.answered(f"{i}.0", at=self.NOW - 600 + i)          # 5.0 answered last
+        res = sweep_followups(self.adapter, self.store, self.journal, "C1",
+                              now=self.NOW, max_threads=2)
+        self.assertTrue(res["truncated"], "a bounded sweep must say it left work")
+        self.assertEqual(res["calls"], 2)
+        for _ in range(2):
+            res = sweep_followups(self.adapter, self.store, self.journal, "C1",
+                                  now=self.NOW, max_threads=2, start=res["next_start"])
+        self.assertEqual([c[1] for c in self.adapter.calls],
+                         ["5.0", "4.0", "3.0", "2.0", "1.0", "5.0"],
+                         "most recently answered first, then the window rotates")
+
+    def test_a_rate_limit_stops_the_follow_up_sweep_and_is_reported(self):
+        for i in range(1, 4):
+            self.answered(f"{i}.0", at=self.NOW - 600 + i)
+        self.adapter.fail_after = 1
+        res = sweep_followups(self.adapter, self.store, self.journal, "C1", now=self.NOW)
+        self.assertEqual(res["rate_limited"], "conversations.replies")
+        self.assertEqual((res["swept"], res["calls"]), (1, 2))
+        self.assertEqual(res["next_start"], 1,
+                         "the window must resume at the root the 429 refused")
+
+    def test_an_adapter_without_replies_is_declared_absent(self):
+        self.answered("1.0", at=self.NOW - 60)
+        self.assertIsNone(sweep_followups(NoRepliesAdapter(), self.store, self.journal,
+                                          "C1", now=self.NOW))
 
 
 if __name__ == "__main__":

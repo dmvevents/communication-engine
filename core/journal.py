@@ -255,15 +255,19 @@ class Journal:
             args = (channel,)
         return self.conn.execute(q + " ORDER BY ts", args).fetchall()
 
-    def answered(self, channel: str | None = None) -> list:
+    def answered(self, channel: str | None = None, since: float | None = None) -> list:
         """The closable complement of unanswered(): rows already tied to a response.
         The reference scheduler closes message-routed owed work from this set — by
-        re-deriving each row's owed id, never by parsing ids back apart."""
+        re-deriving each row's owed id, never by parsing ids back apart. `since` keeps
+        the rows answered at or after it (the follow-up sweep's window, issue #8)."""
         q = "SELECT * FROM journal WHERE responded_at IS NOT NULL"
         args: tuple = ()
         if channel:
             q += " AND channel=?"
             args = (channel,)
+        if since is not None:
+            q += " AND responded_at >= ?"
+            args += (float(since),)
         return self.conn.execute(q + " ORDER BY ts", args).fetchall()
 
     def ambiguity_stats(self) -> dict:

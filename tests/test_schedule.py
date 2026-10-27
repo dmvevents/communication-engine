@@ -783,6 +783,76 @@ class ThreadSweepCycleTest(SchedulerHarness):
                          {"msg@C1@1.0", "msg@C1@2.0"},
                          "both questions are owed; the follow-up is an ask of its own")
 
+    def _answered_thread(self, adapter):
+        """Cycle 1 polls the ask; cycle 2 sweeps the in-thread answer that closes it."""
+        adapter.seed([msg("C1", "1.0", "where is the dashboard?")])
+        sched = self.scheduler(adapter)
+        sched.cycle()
+        adapter.seed([msg("C1", "2.0", "http://127.0.0.1:8502", sender_id="B_AGENT",
+                          thread_id="1.0")])
+        self.assertEqual(sched.cycle()["answered"], 1)
+        self.assertEqual({r["id"] for r in self.owed.open_items()}, set())
+        return sched
+
+    def test_a_follow_up_question_under_an_answered_ask_is_listed_and_owed(self):
+        """Issue #8: once its ask was answered a thread was never swept again, so the
+        asker's follow-up under the answer (often a new question) was never ingested,
+        listed or owed. Within FOLLOWUP_WINDOW_S of the answer it is, and the answered
+        ask keeps the reply that answered it."""
+        adapter = HistoryOnlyFake()
+        sched = self._answered_thread(adapter)
+        adapter.seed([msg("C1", "3.0", "and where are the logs?", thread_id="1.0")])
+        sched.cycle()
+        self.assertIsNotNone(self.journal.get("C1", "3.0"),
+                             "a follow-up under an answered ask was never listed")
+        self.assertEqual({r["id"] for r in self.owed.open_items()}, {"msg@C1@3.0"},
+                         "the follow-up question is an ask of its own and must be owed")
+        self.assertEqual(self.journal.get("C1", "1.0")["response_key"], "thread-reply:2.0",
+                         "the answered ask was re-tied")
+
+    def test_a_follow_up_statement_under_an_answered_ask_is_listed_and_owes_nothing(self):
+        adapter = HistoryOnlyFake()
+        sched = self._answered_thread(adapter)
+        adapter.seed([msg("C1", "3.0", "still waiting on this one", thread_id="1.0")])
+        sched.cycle()
+        self.assertIsNotNone(self.journal.get("C1", "3.0"), "the follow-up was not listed")
+        self.assertEqual({r["id"] for r in self.owed.open_items()}, set(),
+                         "a follow-up statement owes nobody an answer")
+        self.assertEqual(self.journal.get("C1", "1.0")["response_key"], "thread-reply:2.0")
+
+    def test_open_asks_are_swept_before_any_follow_up(self):
+        """Lowest priority: a follow-up sweep never takes a call the open asks needed."""
+        from core.threads import SWEEP_MAX
+        adapter = HistoryOnlyFake()
+        sched = self._answered_thread(adapter)
+        adapter.seed([msg("C1", f"{i}.0", f"question {i}?")
+                      for i in range(10, 10 + SWEEP_MAX)])
+        adapter.sweep_log.clear()
+        sched.cycle()
+        self.assertEqual(len(adapter.sweep_log), SWEEP_MAX)
+        self.assertNotIn(("C1", "1.0"), adapter.sweep_log,
+                         "a follow-up sweep spent a call while open asks waited")
+
+    def test_follow_up_sweeps_share_the_one_budget(self):
+        """The follow-up sweep spends the same per-adapter budget, charged by attempt: a
+        cycle with more recently answered threads than SWEEP_MAX issues SWEEP_MAX calls."""
+        from core.threads import SWEEP_MAX
+        adapter = HistoryOnlyFake()
+        n = SWEEP_MAX + 3
+        adapter.seed([msg(ch, f"{i}.0", f"question {i}?")
+                      for ch in ("C1", "C2") for i in range(1, n + 1)])
+        sched = self.scheduler(adapter, channels=("C1", "C2"))
+        sched.cycle()
+        for ch in ("C1", "C2"):
+            for i in range(1, n + 1):
+                self.journal.mark_responded(ch, f"{i}.0", f"outbox-{ch}-{i}")
+        adapter.calls = 0
+        summary = sched.cycle()
+        self.assertEqual(adapter.calls, SWEEP_MAX,
+                         f"one cycle issued {adapter.calls} replies() calls for one adapter")
+        self.assertIn("C1", summary["followup_truncated"],
+                      "a bounded follow-up sweep must say it left work")
+
     def test_an_adapter_without_replies_leaves_the_cycle_whole(self):
         adapter = QueueAdapter([([msg("C1", "1.0", "where is it?")], "1.0")])
         summary = self.scheduler(adapter).cycle()
@@ -1029,6 +1099,14 @@ class ReportLinesTest(unittest.TestCase):
         self.assertNotIn("budget", skipped[0], "a 429 skip was blamed on the budget")
         self.assertIn("channel=C3", skipped[1])
         self.assertIn("budget was spent", skipped[1])
+
+    def test_follow_up_refusals_get_their_own_lines(self):
+        lines = self.lines(followup_rate_limited=[("C1", "conversations.replies")],
+                           followup_truncated=["C2"])
+        self.assertTrue(any(ln.startswith("followup-sweep: RATE-LIMITED channel=C1")
+                            for ln in lines), lines)
+        self.assertTrue(any(ln.startswith("followup-sweep: TRUNCATED channel=C2")
+                            for ln in lines), lines)
 
     def test_a_healthy_cycle_prints_the_cycle_line_only(self):
         lines = self.lines()
