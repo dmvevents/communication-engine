@@ -467,6 +467,18 @@ run_mutation "config: tolerate a missing environment variable" \
   "('    if name not in env:', '    if False:')" \
   "test_portability"
 
+# Issue #1 — a default derived from the already-resolved state_dir is resolved ONCE; a
+# second resolution doubled a relative base. Explicit keys still resolve against base.
+run_mutation "config: resolve a state_dir-derived default against the base twice" \
+  "core/config.py" \
+  "('else state_dir / \"journal.db\")', 'else _resolve(base, state_dir / \"journal.db\"))')" \
+  "test_portability"
+
+run_mutation "config: resolve an explicit outbox path against the working directory" \
+  "core/config.py" \
+  "('_resolve(base, eng[\"outbox\"]) if', 'Path(eng[\"outbox\"]) if')" \
+  "test_portability"
+
 # R17 — a literal credential in config must be refused.
 run_mutation "config: accept a literal credential" \
   "core/config.py" \

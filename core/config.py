@@ -259,12 +259,17 @@ def from_dict(raw: dict, base_dir: str | Path, env: dict | None = None) -> Engin
     # Relative paths resolve against base_dir, so the same config works on any machine.
     state_dir = _resolve(base, eng.get("state_dir", "state"))
     channels_dir = _resolve(base, eng.get("channels_dir", "channels"))
+    # A default derived from state_dir is already resolved: resolving it against base a
+    # second time doubled a RELATIVE base (rehearsal/rehearsal/state/journal.db, #1).
     cfg = EngineConfig(
         base_dir=base,
         state_dir=state_dir,
-        store_path=_resolve(base, eng.get("store", state_dir / "messages.db")),
-        journal_path=_resolve(base, eng.get("journal", state_dir / "journal.db")),
-        outbox_path=_resolve(base, eng.get("outbox", state_dir / "outbox.db")),
+        store_path=(_resolve(base, eng["store"]) if "store" in eng
+                    else state_dir / "messages.db"),
+        journal_path=(_resolve(base, eng["journal"]) if "journal" in eng
+                      else state_dir / "journal.db"),
+        outbox_path=(_resolve(base, eng["outbox"]) if "outbox" in eng
+                     else state_dir / "outbox.db"),
         channels_dir=channels_dir,
     )
 

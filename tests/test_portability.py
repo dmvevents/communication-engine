@@ -10,6 +10,7 @@ that failure mode impossible to reintroduce:
   write nothing outside it
 * a fresh adopter's default must be DENY, so they cannot accidentally post as anyone
 """
+import json
 import os
 import re
 import subprocess
@@ -141,6 +142,33 @@ class ConfigTest(unittest.TestCase):
         c = from_dict(self.cfg_dict(), base_dir=self.base, env={"ADOPTER_TOKEN": "x"})
         self.assertTrue(str(c.store_path).startswith(str(self.base)))
         self.assertTrue(str(c.journal_path).startswith(str(self.base)))
+
+    def test_a_relative_config_path_resolves_every_path_once(self):
+        """Issue #1: through a RELATIVE config path the defaults derived from state_dir
+        were resolved against the base a second time, so journal.db landed in
+        rehearsal/rehearsal/state/, outside the operator's state_dir. An absolute base
+        masks it (_resolve is a no-op on an absolute path), so the test above cannot see
+        it; this one loads through load() with a path relative to the working directory,
+        the issue's reproduction."""
+        d = self.cfg_dict()
+        d["engine"]["channels_dir"] = str(self.base / "channels")
+        settings = self.base / "rehearsal" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_text(json.dumps(d))
+        rel = Path(os.path.relpath(settings))
+        self.assertFalse(rel.is_absolute(), "the reproduction needs a relative path")
+        c = load(rel, env={"ADOPTER_TOKEN": "x"})
+        self.assertEqual(c.state_dir, rel.parent / "state")
+        for key, p in (("store", c.store_path), ("journal", c.journal_path),
+                       ("outbox", c.outbox_path)):
+            self.assertEqual(p.parent, c.state_dir,
+                             f"{key}: the default {p} is outside state_dir {c.state_dir}")
+        # The explicit keys keep resolving against the config's directory, once.
+        d["engine"].update(store="db/m.db", journal="db/j.db", outbox="db/o.db")
+        settings.write_text(json.dumps(d))
+        c = load(rel, env={"ADOPTER_TOKEN": "x"})
+        self.assertEqual((c.store_path, c.journal_path, c.outbox_path),
+                         tuple(rel.parent / "db" / f for f in ("m.db", "j.db", "o.db")))
 
     def test_a_channel_without_a_policy_defaults_to_deny(self):
         """R19: a fresh adopter cannot accidentally post as anyone."""
