@@ -17,6 +17,8 @@ invariant (`tests/test_slack_adapter.py`), not a promise:
 | `resolve(ref)` | id → name via `conversations.info` / `users.info`; name → id by paging `conversations.list` / `users.list`. Unresolvable refs raise. |
 | `health()` | `auth.test`. Can FAIL (bad token → `auth_ok: false`; network down → `reachable: false`) and reports any active 429 hold in `detail`. |
 | `capabilities()` | `{read: true, history: true, search: false, send: false, react: false, threads: false}` — honest, not aspirational. |
+| `replies(channel_id, thread_ts, oldest?)` | `conversations.replies`, all pages or fail loudly, never the parent — the optional capability `core/threads.py` sweeps the open asks' threads through (ENH-30). |
+| `thread_summary(message)` | no call: the `reply_count` / `reply_users` / `latest_reply` a history PARENT carries, read back from the normalized row's `raw` — the optional capability that lets the engine tie a visibly answered ask at ingest (`threaded_is_answered`). None for a row without replies and for a reply row. |
 
 Rate limits follow contract rule 3: a 429 raises `core.ratelimit.RateLimited` with the
 platform's exact `Retry-After` and the method it hit; the engine's `(instance, method)`

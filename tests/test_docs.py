@@ -920,10 +920,11 @@ class ConfigSurfaceDocTest(unittest.TestCase):
 
     def test_what_unanswered_means_and_how_it_closes_is_stated(self):
         """ENH-30: the dashboard's UNANSWERED is the open ASK backlog, and an ask closes
-        in exactly two ways — a reply sent from the surface, or an in-thread reply from
-        someone else. The one limit an operator will trip over is that a TOP-LEVEL reply
-        cannot be attributed and leaves the ask open; the doc must keep saying so, or
-        "I answered and it still shows unanswered" is the next meeting note."""
+        in exactly three ways — a reply sent from the surface, an in-thread reply from
+        someone else, or (threaded_is_answered, 2026-10-31) the polled parent's own thread
+        summary naming such a replier. The one limit an operator will trip over is that a
+        TOP-LEVEL reply cannot be attributed and leaves the ask open; the doc must keep
+        saying so, or "I answered and it still shows unanswered" is the next meeting note."""
         self.assertIn("ACTIONABLE_KINDS", self.quickstart,
                       "the doc no longer names the one definition of an ask")
         self.assertIn("staging\nalone never ties", self.quickstart,
@@ -934,8 +935,10 @@ class ConfigSurfaceDocTest(unittest.TestCase):
                       self.quickstart,
                       "the doc dropped the top-level-reply limit — the one answered-state "
                       "surprise an operator meets on day one")
-        self.assertIn("Answered state has exactly two routes.", self.quickstart,
+        self.assertIn("Answered state has exactly three routes.", self.quickstart,
                       "the honest-limits entry for answered state is gone")
+        self.assertIn("threaded_is_answered", self.quickstart,
+                      "the doc no longer names the setting that decides what a thread means")
 
     def test_the_adapters_with_no_route_to_answered_are_named_from_the_code(self):
         """The limits entry names the adapters whose asks can never close: no replies()
@@ -948,9 +951,10 @@ class ConfigSurfaceDocTest(unittest.TestCase):
             if not hasattr(load_adapter_class(ROOT / "channels", name), "replies")
             and not hasattr(load_adapter_class(ROOT / "channels", name), "send"))
         self.assertTrue(stranded, "the derivation found nothing — it is broken, not the docs")
-        section = self.quickstart.split("Answered state has exactly two routes.", 1)[1]
+        section = self.quickstart.split("Answered state has exactly three routes.", 1)[1]
         section = section.split("\n- **", 1)[0]
-        named = sorted(set(re.findall(r"`([a-z_]+)`", section)) - {"replies", "SWEEP_MAX"})
+        named = sorted(set(re.findall(r"`([a-z_]+)`", section))
+                       - {"replies", "SWEEP_MAX", "thread_summary", "threaded_is_answered"})
         self.assertEqual(named, stranded,
                          f"the doc names {named} as having no route to answered; the code "
                          f"says {stranded}")

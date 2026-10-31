@@ -1452,7 +1452,7 @@ run_mutation "schedule: run() no longer acquires the single-instance guard" \
 # cursor first means a crash silently loses the tail of the batch, with no reconciler.
 run_mutation "schedule: cursor committed before the journal" \
   "core/schedule.py" \
-  "('                fresh += self._journal_and_route(ch, mine, src)\n                self._commit_cursor(src.name, ch, cursor, new_cursor)', '                self._commit_cursor(src.name, ch, cursor, new_cursor)\n                fresh += self._journal_and_route(ch, mine, src)')" \
+  "('                fresh += self._journal_and_route(ch, mine, src)\n                if src.threaded_is_answered:', '                self._commit_cursor(src.name, ch, cursor, new_cursor)\n                fresh += self._journal_and_route(ch, mine, src)\n                if src.threaded_is_answered:')" \
   "test_schedule"
 
 # ENH-6/R3 — the 8h17m bug verbatim: backoff self-gates exactly when owed work stalls.
@@ -1763,7 +1763,7 @@ run_mutation "config: a quoted escalate_ambiguous loads clean and counts as true
 # (the ENH-7 adapter-wiring lesson).
 run_mutation "scheduler.py: the wiring drops the escalate flag" \
   "scripts/scheduler.py" \
-  "('                      escalate_ambiguous=inst.escalate_ambiguous)', '                      escalate_ambiguous=False)')" \
+  "('                      escalate_ambiguous=inst.escalate_ambiguous,', '                      escalate_ambiguous=False,')" \
   "test_schedule"
 
 # first-poll journals rows that read as never-classified — the hedge count starts
@@ -2610,10 +2610,68 @@ run_mutation "threads: the unattributed placeholder sender answers an ask" \
   "('        if not sender or sender == asker or sender in UNATTRIBUTED_SENDERS:', '        if not sender or sender == asker:')" \
   "test_threads"
 
-run_mutation "schedule: the cycle sweeps without the classifier's verdict" \
+run_mutation "schedule: the cycle sweeps without the classifier's verdict (threaded_is_answered off)" \
   "core/schedule.py" \
-  "('                    is_answer=lambda m, _src=src: classify(\n                        m.get(\"text\") or \"\", _src.taxonomy,\n                        attachments=m.get(\"attachments\")).kind not in ACTIONABLE_KINDS)', '                    is_answer=None)')" \
+  "('                if not src.threaded_is_answered:\n                    is_answer = lambda m, _src=src: classify(  # noqa: E731', '                if False:\n                    is_answer = lambda m, _src=src: classify(  # noqa: E731')" \
   "test_schedule"
+
+# threaded_is_answered (2026-10-31) — a message that has a thread is answered: the tie at ingest
+# from the polled parent's thread summary, the setting that turns it on, the sweep's verdict it
+# turns off, the adapter capability it reads, and the config key that carries it.
+run_mutation "schedule: the cycle never ties from the thread summary" \
+  "core/schedule.py" \
+  "('                    ties = threads.answered_from_summary(src.adapter, self.journal, ch, mine)\n                    answered += len(ties or ())', '                    pass')" \
+  "test_schedule"
+
+run_mutation "schedule: the ingest tie ignores the source's setting" \
+  "core/schedule.py" \
+  "('                if src.threaded_is_answered:\n                    # An ask that visibly has a thread', '                if True:\n                    # An ask that visibly has a thread')" \
+  "test_schedule"
+
+run_mutation "schedule: the sweep keeps the classifier's verdict with the route on" \
+  "core/schedule.py" \
+  "('                is_answer = None\n                if not src.threaded_is_answered:', '                is_answer = None\n                if True:')" \
+  "test_schedule"
+
+run_mutation "threads: the asker alone in the thread summary counts as the answer" \
+  "core/threads.py" \
+  "('                    if r and r != asker and r not in UNATTRIBUTED_SENDERS]', '                    if r and r not in UNATTRIBUTED_SENDERS]')" \
+  "test_threads"
+
+run_mutation "threads: the unattributed placeholder in the summary answers an ask" \
+  "core/threads.py" \
+  "('                    if r and r != asker and r not in UNATTRIBUTED_SENDERS]', '                    if r and r != asker]')" \
+  "test_threads"
+
+run_mutation "threads: an adapter without thread_summary() reads as 'no thread'" \
+  "core/threads.py" \
+  "('    if not hasattr(adapter, \"thread_summary\"):\n        return None', '    if not hasattr(adapter, \"thread_summary\"):\n        return []')" \
+  "test_threads"
+
+run_mutation "threads: the summary route ties STATEMENTs and answered asks again" \
+  "core/threads.py" \
+  "('        if row is None or row[\"responded_at\"] is not None or row[\"kind\"] not in ACTIONABLE_KINDS:', '        if row is None:')" \
+  "test_threads"
+
+run_mutation "threads: the summary tie never marks the ask responded" \
+  "core/threads.py" \
+  "('        journal.mark_responded(channel, str(m[\"ts\"]), f\"thread-reply:summary:{repliers[0]}\")', '        pass')" \
+  "test_threads"
+
+run_mutation "slack: thread_summary drops the repliers" \
+  "channels/slack/adapter.py" \
+  "('                \"repliers\": [u for u in (raw.get(\"reply_users\") or ()) if u],', '                \"repliers\": [],')" \
+  "test_slack_adapter"
+
+run_mutation "config: threaded_is_answered is read as always on" \
+  "core/config.py" \
+  "('        threaded = spec.get(\"threaded_is_answered\", True)', '        threaded = True')" \
+  "test_portability"
+
+run_mutation "config: a quoted threaded_is_answered is accepted" \
+  "core/config.py" \
+  "('        if not isinstance(threaded, bool):', '        if False:')" \
+  "test_portability"
 
 # review F8 — one platform call per thread root, one budget per adapter, 429 stops the source.
 run_mutation "threads: every ask under one root issues its own platform call" \

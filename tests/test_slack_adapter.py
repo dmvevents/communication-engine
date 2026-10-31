@@ -466,6 +466,38 @@ class ThreadRepliesTest(SlackAdapterTestCase):
             a.replies("C_ONE", "1.0")
         self.assertEqual(ctx.exception.retry_after, 7)
 
+    def test_thread_summary_reads_the_parents_reply_users_from_the_raw_row(self):
+        """threaded_is_answered: a history PARENT carries reply_count, reply_users and
+        latest_reply; _normalize keeps the row in raw, and the summary reads it back so
+        the engine can tie a visibly answered ask without a conversations.replies call."""
+        parent = slack_msg("1.0", user="U_ASKER", text="where is the dashboard?",
+                           thread_ts="1.0", reply_count=2, reply_users_count=2,
+                           reply_users=["U_ASKER", "B_AGENT"], latest_reply="3.0")
+        a = self.make([history([parent, slack_msg("0.5", text="hello")])])
+        msgs, _ = a.poll(None)
+        by_ts = {m["ts"]: m for m in msgs}
+        self.assertEqual(a.thread_summary(by_ts["1.0"]),
+                         {"reply_count": 2, "repliers": ["U_ASKER", "B_AGENT"],
+                          "latest_reply": "3.0"})
+        self.assertIsNone(a.thread_summary(by_ts["0.5"]),
+                          "a row with no replies on it has no thread summary")
+        self.assertEqual(len(self.http.requests), 1, "the summary made a platform call")
+
+    def test_thread_summary_is_none_for_a_reply_and_for_a_foreign_row(self):
+        a = self.make([history([
+            slack_msg("1.0", thread_ts="1.0", reply_count=1, reply_users=["U_B"]),
+            slack_msg("3.0", user="U_B", text="bump (also sent to channel)",
+                      thread_ts="1.0", subtype="thread_broadcast", reply_count=1)])])
+        msgs, _ = a.poll(None)
+        by_ts = {m["ts"]: m for m in msgs}
+        self.assertIsNone(a.thread_summary(by_ts["3.0"]),
+                          "a broadcast reply's row was read as a thread parent")
+        self.assertIsNone(a.thread_summary({"channel_type": "fake", "channel_id": "C_ONE",
+                                            "sender_id": "U", "ts": "9.0", "text": "x",
+                                            "thread_id": None, "raw": "not json"}),
+                          "a row this adapter did not shape must answer None, not raise")
+        Store.validate(by_ts["1.0"])
+
     def test_a_broadcast_reply_served_by_history_is_stored_as_a_thread_reply(self):
         """History DOES serve one kind of reply: one posted "also send to channel"
         (subtype thread_broadcast) arrives with thread_ts set. It must land with

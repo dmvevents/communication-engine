@@ -107,12 +107,13 @@ class SchedulerHarness(unittest.TestCase):
         self.tmp.cleanup()
 
     def scheduler(self, adapter, channels=("C1",), journal=None, lock_path=None,
-                  escalate_ambiguous=False):
+                  escalate_ambiguous=False, threaded_is_answered=True):
         return Scheduler(
             store=self.store, journal=journal or self.journal, owed=self.owed,
             escalator=self.escalator,
             sources=[Source(name="inst", adapter=adapter, channels=tuple(channels),
-                            escalate_ambiguous=escalate_ambiguous)],
+                            escalate_ambiguous=escalate_ambiguous,
+                            threaded_is_answered=threaded_is_answered)],
             base_interval=self.BASE, max_interval=self.MAX, lock_path=lock_path,
             clock=lambda: self.now,
             sleep=self._sleep)
@@ -653,6 +654,10 @@ class HistoryOnlyFake:
         msgs, new_cursor = self.inner.poll(cursor)
         return [m for m in msgs if not m.get("thread_id")], new_cursor
 
+    def thread_summary(self, message):
+        """Slack's shape too: a history parent carries the summary of its thread."""
+        return self.inner.thread_summary(message)
+
     def replies(self, channel_id, thread_ts, oldest=None):
         self.calls += 1
         self.roots_swept.add(thread_ts)
@@ -770,10 +775,12 @@ class ThreadSweepCycleTest(SchedulerHarness):
         self.assertEqual(adapter.roots_swept, {f"{i}.0" for i in range(1, 2 * SWEEP_MAX + 1)},
                          "asks beyond the newest window were never swept — starvation")
 
-    def test_a_follow_up_question_in_the_thread_does_not_close_the_ask(self):
+    def test_a_follow_up_question_in_the_thread_does_not_close_the_ask_when_the_source_says_so(self):
+        """Review F7, kept behind threaded_is_answered=false: a follow-up question is a
+        new ask, never the answer."""
         adapter = HistoryOnlyFake()
         adapter.seed([msg("C1", "1.0", "where is the dashboard?")])
-        sched = self.scheduler(adapter)
+        sched = self.scheduler(adapter, threaded_is_answered=False)
         sched.cycle()
         adapter.seed([msg("C1", "2.0", "and where are the logs?", sender_id="U_B",
                           thread_id="1.0")])
@@ -782,6 +789,70 @@ class ThreadSweepCycleTest(SchedulerHarness):
         self.assertEqual({r["id"] for r in self.owed.open_items()},
                          {"msg@C1@1.0", "msg@C1@2.0"},
                          "both questions are owed; the follow-up is an ask of its own")
+
+    def test_by_default_a_message_that_has_a_thread_is_answered_whatever_the_reply_says(self):
+        """threaded_is_answered (the default): the operator reads an ask with a reply
+        under it as answered, question or not (measured on the aws-do-agent
+        integration, 2026-10-31); the follow-up question is still owed, on its own row."""
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg("C1", "1.0", "where is the dashboard?")])
+        sched = self.scheduler(adapter)
+        sched.cycle()
+        adapter.seed([msg("C1", "2.0", "and where are the logs?", sender_id="U_B",
+                          thread_id="1.0")])
+        self.assertEqual(sched.cycle()["answered"], 1,
+                         "a reply under the ask left it UNANSWERED because it was a question")
+        self.assertEqual(self.journal.get("C1", "1.0")["response_key"], "thread-reply:2.0")
+        self.assertEqual({r["id"] for r in self.owed.open_items()}, {"msg@C1@2.0"},
+                         "the follow-up question must stay owed on its own row")
+
+    def test_an_ask_polled_with_its_thread_already_answered_is_tied_at_ingest(self):
+        """The first poll of a channel serves every thread parent with the platform's
+        summary of its thread: a backfilled channel's answered asks close in that cycle,
+        with no replies() call each — not after the bounded sweep reaches them."""
+        from core.threads import SWEEP_MAX
+        adapter = HistoryOnlyFake()
+        asks = [msg("C1", f"{i}.0", f"question {i}?") for i in range(1, 2 * SWEEP_MAX + 1)]
+        answers = [msg("C1", f"{i}.5", f"answer {i}", sender_id="B_AGENT", thread_id=f"{i}.0")
+                   for i in range(1, 2 * SWEEP_MAX + 1)]
+        adapter.seed(asks + answers)
+        summary = self.scheduler(adapter).cycle()
+        self.assertEqual(summary["answered"], 2 * SWEEP_MAX,
+                         "asks whose polled row showed a foreign reply stayed open")
+        self.assertEqual(adapter.calls, 0,
+                         "a visibly answered ask cost a replies() call — the sweep window "
+                         "and a 429 would hold such asks open again")
+        self.assertEqual(self.journal.get("C1", "1.0")["response_key"],
+                         "thread-reply:summary:B_AGENT")
+        self.assertEqual({r["id"] for r in self.owed.open_items()}, set(),
+                         "the owed work stayed open after its ask was answered at ingest")
+        self.assertEqual(summary["sweep_truncated"], [], "the sweep still had asks to reach")
+
+    def test_the_ingest_tie_is_off_with_the_source(self):
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg("C1", "1.0", "where is the dashboard?"),
+                      msg("C1", "2.0", "here", sender_id="B_AGENT", thread_id="1.0")])
+        summary = self.scheduler(adapter, threaded_is_answered=False).cycle()
+        self.assertEqual(adapter.calls, 1, "with the route off the sweep is the one route")
+        self.assertEqual(summary["answered"], 1)
+        self.assertEqual(self.journal.get("C1", "1.0")["response_key"], "thread-reply:2.0",
+                         "the sweep's tie, not the summary's, with the route off")
+
+    def test_an_ingest_tie_closes_the_owed_work_and_shows_as_a_thread_answer(self):
+        """The dashboard counts thread answers by the key prefix; the owed registry closes
+        on the journal row — both must see an ingest tie as they see a swept one."""
+        from core.dashboard import snapshot
+        adapter = HistoryOnlyFake()
+        adapter.seed([msg("C1", "1.0", "can you check the dashboard?"),
+                      msg("C1", "2.0", "checked, all green", sender_id="B_AGENT",
+                          thread_id="1.0")])
+        self.scheduler(adapter).cycle()
+        self.assertEqual({r["id"] for r in self.owed.open_items()}, set())
+        snap = snapshot(Path(self.tmp.name) / "journal.db", {})
+        self.assertEqual([a["ts"] for a in snap["attention"] if a["severity"] == "unanswered"],
+                         [], "the dashboard still lists the ingest-tied ask as unanswered")
+        self.assertEqual(snap["journal"]["answered_by_thread"], 1,
+                         "an ingest tie is a thread answer and must be counted as one")
 
     def test_an_adapter_without_replies_leaves_the_cycle_whole(self):
         adapter = QueueAdapter([([msg("C1", "1.0", "where is it?")], "1.0")])

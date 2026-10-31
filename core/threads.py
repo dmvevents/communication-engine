@@ -35,6 +35,20 @@ re-sighting). The first version used the newest STORED reply as the floor — bu
 is written inside the sweep and the journal only afterwards by the caller, so a crash between
 the two left a stored reply that was never fetched again and never journaled: the inverted
 dual-write the scheduler forbids for poll(), found by the independent review of 89fd0fa.
+
+A second route to answered, at INGEST (threaded_is_answered, 2026-10-31): a history row of
+a thread parent carries the platform's own summary of the thread under it, and the first
+poll of a channel serves every parent that way. `answered_from_summary()` reads it through
+the adapter's optional `thread_summary(message)` and ties an open ask whose summary names a
+replier other than the asker — no platform call, so the sweep's window and a 429 no longer
+hold a visibly answered ask open. Measured on the aws-do-agent integration (operator,
+2026-10-31): asks whose thread anyone could see on the platform read UNANSWERED for as long
+as the bounded sweep took to reach them, and the dashboard kept "qualifying them as
+unanswered". The sweep stays the route for a thread that grows AFTER its parent was polled
+while that ask is still open: a cursored history poll never serves a parent twice, and the
+sweep works from open asks — once an ask is tied, by either route, its thread is not fetched
+again at this pin, so a later reply there (a follow-up question) reaches the engine only with
+the follow-up sweep of answered asks' threads (PR #12).
 """
 from __future__ import annotations
 
@@ -77,6 +91,53 @@ def answered_by(asker: str | None, replies, is_answer=None) -> dict | None:
             continue
         return r
     return None
+
+
+def answered_from_summary(adapter, journal, channel: str, messages) -> list | None:
+    """Tie the open asks among `messages` that visibly have a thread — without a call.
+
+    For each polled TOP-LEVEL message whose journal row is an open ask (ACTIONABLE_KINDS),
+    the adapter's `thread_summary(message)` is asked what the row says about its thread:
+    `{reply_count, repliers, latest_reply}`, or None. The rule is the sweep's, as far as
+    a summary lets it be applied: the FIRST replier other than the asker answers (response
+    key `thread-reply:summary:<replier>`, so the dashboard counts it among the thread
+    answers); a thread whose only repliers are the asker stays open; the adapters'
+    unattributed placeholder answers nothing; a count with no attributable replier stays
+    open — a replier the platform did not name would be a guess, and the engine never
+    guesses. The replies' text is not in view here, so the sweep's `is_answer` verdict
+    cannot be applied; the setting that turns this route on turns that verdict off too
+    (core/schedule.py: in the sweep a reply that is itself a question still answers, and
+    is owed on its own row). An ask tied HERE is not fetched afterwards — the sweep works
+    from open asks — so a question already in its thread is not journaled by this route;
+    the follow-up sweep of answered asks' threads (PR #12) is what reaches it. The tie is
+    stamped at the poll that sighted the summary (`at` default):
+    the reply's own platform time predates the row's first sighting, and a tie stamped
+    there would read every such ask as EDITED AFTER RESPONSE.
+
+    Returns [(ask_ts, replier), ...]; None when the adapter has no `thread_summary` —
+    the capability is absent, which the caller must read as "cannot conclude", never as
+    "no thread" (the same rule as sweep()).
+    """
+    if not hasattr(adapter, "thread_summary"):
+        return None
+    ties = []
+    for m in messages:
+        if m.get("thread_id"):
+            continue                        # a reply says nothing about its own thread
+        row = journal.get(channel, m["ts"])
+        if row is None or row["responded_at"] is not None or row["kind"] not in ACTIONABLE_KINDS:
+            continue
+        summary = adapter.thread_summary(m)
+        if not summary:
+            continue
+        asker = row["sender_id"]
+        repliers = [r for r in (summary.get("repliers") or ())
+                    if r and r != asker and r not in UNATTRIBUTED_SENDERS]
+        if not repliers:
+            continue
+        journal.mark_responded(channel, str(m["ts"]), f"thread-reply:summary:{repliers[0]}")
+        ties.append((str(m["ts"]), repliers[0]))
+    return ties
 
 
 def open_asks_for(journal, channel: str) -> list:
