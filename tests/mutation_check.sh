@@ -1763,7 +1763,7 @@ run_mutation "config: a quoted escalate_ambiguous loads clean and counts as true
 # (the ENH-7 adapter-wiring lesson).
 run_mutation "scheduler.py: the wiring drops the escalate flag" \
   "scripts/scheduler.py" \
-  "('                      escalate_ambiguous=inst.escalate_ambiguous)', '                      escalate_ambiguous=False)')" \
+  "('                      escalate_ambiguous=inst.escalate_ambiguous,', '                      escalate_ambiguous=False,')" \
   "test_schedule"
 
 # first-poll journals rows that read as never-classified — the hedge count starts
