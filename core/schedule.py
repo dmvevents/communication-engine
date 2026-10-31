@@ -117,6 +117,14 @@ class Source:
     # only logging them. Per source, like the taxonomy: whether hedges deserve human
     # eyes depends on the channel's vocabulary and traffic, not on the engine.
     escalate_ambiguous: bool = False
+    # threaded_is_answered (2026-10-31): a message that has a thread is answered. ON: an
+    # open ask whose polled row shows a reply from someone other than the asker is tied
+    # at ingest (core/threads.answered_from_summary, no platform call), and in the sweep
+    # any such reply answers, a question included (the follow-up is owed on its own
+    # row). OFF: the sweep is the one in-thread route and a reply that is itself an ask
+    # does not answer (review F7). Per source, like the taxonomy: what counts as an
+    # answer in a 1:1 channel with an agent differs from a team's support channel.
+    threaded_is_answered: bool = True
 
 
 class Scheduler:
@@ -192,6 +200,16 @@ class Scheduler:
                 # journal absorbs the duplicates; the swapped order loses the tail
                 # of the batch forever (the incumbent's 24-auto-reconcile seam).
                 fresh += self._journal_and_route(ch, mine, src)
+                if src.threaded_is_answered:
+                    # An ask that visibly has a thread — its own polled row names a
+                    # replier other than the asker — is answered here, at ingest, with
+                    # no replies() call (threaded_is_answered). Before the cursor
+                    # commits, like the journaling: a crash between the two re-polls
+                    # the row and ties it again. The sweep below serves the asks whose
+                    # thread grew after their row was polled (a cursored history poll
+                    # never serves a parent twice).
+                    ties = threads.answered_from_summary(src.adapter, self.journal, ch, mine)
+                    answered += len(ties or ())
                 self._commit_cursor(src.name, ch, cursor, new_cursor)
                 polled += len(mine)
             # ENH-30: the open asks' threads. A history poll never serves a thread
@@ -227,14 +245,20 @@ class Scheduler:
                     continue
                 swept_now.append(ch)
                 allow = max(1, budget - (len(order) - 1 - i))
+                # A reply that classifies as an ask of its own is a new question,
+                # never the answer (review F7); the source's vocabulary decides —
+                # unless the source counts a message that has a thread as answered
+                # (threaded_is_answered): then any reply from someone else answers,
+                # and the follow-up question is owed on its own row.
+                is_answer = None
+                if not src.threaded_is_answered:
+                    is_answer = lambda m, _src=src: classify(  # noqa: E731
+                        m.get("text") or "", _src.taxonomy,
+                        attachments=m.get("attachments")).kind not in ACTIONABLE_KINDS
                 swept = threads.sweep(
                     src.adapter, self.store, self.journal, ch, max_threads=allow,
                     start=self.store.sweep_start_get(src.name, ch),
-                    # A reply that classifies as an ask of its own is a new question,
-                    # never the answer (review F7); the source's vocabulary decides.
-                    is_answer=lambda m, _src=src: classify(
-                        m.get("text") or "", _src.taxonomy,
-                        attachments=m.get("attachments")).kind not in ACTIONABLE_KINDS)
+                    is_answer=is_answer)
                 if swept is not None:
                     # Charged by ATTEMPT: a refused fetch cost the platform a call too
                     # (review F2 — an all-errors channel was charged nothing, and the

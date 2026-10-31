@@ -200,6 +200,29 @@ class ConfigTest(unittest.TestCase):
             from_dict(d, base_dir=self.base, env={"ADOPTER_TOKEN": "x"})
         self.assertIn("escalate_ambiguous", str(ctx.exception))
 
+    def test_threaded_is_answered_defaults_on(self):
+        """A message that has a thread is answered: the operator's measured expectation
+        of the dashboard (aws-do-agent, 2026-10-31) is the shipped default."""
+        c = from_dict(self.cfg_dict(), base_dir=self.base, env={"ADOPTER_TOKEN": "x"})
+        self.assertIs(c.instance("adopter-workspace").threaded_is_answered, True)
+
+    def test_threaded_is_answered_is_read_from_the_instance(self):
+        d = self.cfg_dict()
+        d["instances"][0]["threaded_is_answered"] = False
+        c = from_dict(d, base_dir=self.base, env={"ADOPTER_TOKEN": "x"})
+        self.assertIs(c.instance("adopter-workspace").threaded_is_answered, False,
+                      "the key loads but configures nothing — the silently inert "
+                      "class ENH-17 exists to kill")
+
+    def test_a_quoted_threaded_is_answered_is_refused(self):
+        """"false" (a string) is truthy: accepted, it would keep the route ON for the
+        adopter who typed the word off."""
+        d = self.cfg_dict()
+        d["instances"][0]["threaded_is_answered"] = "false"
+        with self.assertRaises(ConfigError) as ctx:
+            from_dict(d, base_dir=self.base, env={"ADOPTER_TOKEN": "x"})
+        self.assertIn("threaded_is_answered", str(ctx.exception))
+
     def test_missing_config_file_raises_clearly(self):
         with self.assertRaises(ConfigError):
             load(self.base / "nope.json")

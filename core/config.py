@@ -46,7 +46,7 @@ VALID_POLICIES = ("never", "staged", "direct")
 _TOP_KEYS = frozenset(("engine", "instances"))
 _ENGINE_KEYS = frozenset(("state_dir", "channels_dir", "store", "journal", "outbox"))
 _INSTANCE_KEYS = frozenset(("name", "adapter", "channels", "principals", "auth",
-                            "taxonomy", "escalate_ambiguous"))
+                            "taxonomy", "escalate_ambiguous", "threaded_is_answered"))
 _CHANNEL_KEYS = frozenset(("id", "label", "poll_interval_s", "reply_policy",
                            "thread_reply_policy", "triggers"))
 
@@ -109,6 +109,12 @@ class InstanceConfig:
     # (owed:operator) instead of only logging them. Default off: the safe direction is
     # unchanged behaviour plus the journal's visible hedge count.
     escalate_ambiguous: bool = False
+    # threaded_is_answered (2026-10-31): a message that has a thread is answered — tied
+    # at ingest from the polled row's own thread summary, and in the sweep by any reply
+    # from someone other than the asker, a question included (core/schedule.Source).
+    # Default on: the operator's measured expectation of the dashboard. false restores
+    # the sweep-only route with the review-F7 verdict (a follow-up question is no answer).
+    threaded_is_answered: bool = True
 
     def policies(self) -> dict:
         """target id -> policy, for core.outbox. Absent targets are denied by default."""
@@ -340,11 +346,18 @@ def from_dict(raw: dict, base_dir: str | Path, env: dict | None = None) -> Engin
             raise ConfigError(
                 f"instance {name!r}: escalate_ambiguous must be a JSON boolean "
                 f"(true/false), got {esc!r}")
+        threaded = spec.get("threaded_is_answered", True)
+        if not isinstance(threaded, bool):
+            # The same footgun the other way: a quoted "false" would keep the route ON
+            # for the adopter who typed the word off.
+            raise ConfigError(
+                f"instance {name!r}: threaded_is_answered must be a JSON boolean "
+                f"(true/false), got {threaded!r}")
         instances.append(InstanceConfig(
             name=name, adapter=adapter, channels=tuple(channels),
             principals=tuple(spec.get("principals", ())), auth=auth,
             taxonomy=spec.get("taxonomy", {}) or {},
-            escalate_ambiguous=esc))
+            escalate_ambiguous=esc, threaded_is_answered=threaded))
 
     if not instances:
         raise ConfigError("no instances configured — the engine would poll nothing")

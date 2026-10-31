@@ -295,6 +295,33 @@ class Adapter:
                                "drop the rest of the thread")
         return out
 
+    # ---- optional capability: the parent row's thread summary (channels/CONTRACT.md) ----
+    @staticmethod
+    def thread_summary(message):
+        """What one polled row says about the thread under it, or None.
+
+        conversations.history serves a thread PARENT with the platform's own summary of
+        its thread - reply_count, reply_users (the repliers, the few Slack names) and
+        latest_reply - and the first poll of a channel serves every parent that way.
+        _normalize keeps the whole row in `raw`; this reads the summary back, so the
+        engine can tie an ask that visibly has a thread without a conversations.replies
+        call (core/threads.py answered_from_summary). None for a row with no replies on
+        it, for a reply (its thread_id is set), and for a row this adapter did not shape.
+        """
+        raw = message.get("raw")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                return None
+        if not isinstance(raw, dict) or message.get("thread_id"):
+            return None
+        if not raw.get("reply_count"):
+            return None
+        return {"reply_count": int(raw["reply_count"]),
+                "repliers": [u for u in (raw.get("reply_users") or ()) if u],
+                "latest_reply": raw.get("latest_reply")}
+
     # ---- optional capability: the platform snapshot (channels/CONTRACT.md) ------
     def retrievable_ts(self, channel, oldest=None, latest=None):
         """Every ts the platform will serve for this channel RIGHT NOW.
