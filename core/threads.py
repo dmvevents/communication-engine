@@ -44,8 +44,11 @@ replier other than the asker — no platform call, so the sweep's window and a 4
 hold a visibly answered ask open. Measured on the aws-do-agent integration (operator,
 2026-10-31): asks whose thread anyone could see on the platform read UNANSWERED for as long
 as the bounded sweep took to reach them, and the dashboard kept "qualifying them as
-unanswered". The sweep stays the route for a thread that grows AFTER its parent was polled:
-a cursored history poll never serves a parent twice.
+unanswered". The sweep stays the route for a thread that grows AFTER its parent was polled
+while that ask is still open: a cursored history poll never serves a parent twice, and the
+sweep works from open asks — once an ask is tied, by either route, its thread is not fetched
+again at this pin, so a later reply there (a follow-up question) reaches the engine only with
+the follow-up sweep of answered asks' threads (PR #12).
 """
 from __future__ import annotations
 
@@ -103,8 +106,11 @@ def answered_from_summary(adapter, journal, channel: str, messages) -> list | No
     open — a replier the platform did not name would be a guess, and the engine never
     guesses. The replies' text is not in view here, so the sweep's `is_answer` verdict
     cannot be applied; the setting that turns this route on turns that verdict off too
-    (core/schedule.py: a reply that is itself a question still answers, and is owed on
-    its own row). The tie is stamped at the poll that sighted the summary (`at` default):
+    (core/schedule.py: in the sweep a reply that is itself a question still answers, and
+    is owed on its own row). An ask tied HERE is not fetched afterwards — the sweep works
+    from open asks — so a question already in its thread is not journaled by this route;
+    the follow-up sweep of answered asks' threads (PR #12) is what reaches it. The tie is
+    stamped at the poll that sighted the summary (`at` default):
     the reply's own platform time predates the row's first sighting, and a tie stamped
     there would read every such ask as EDITED AFTER RESPONSE.
 

@@ -367,7 +367,11 @@ surface says so instead of implying one.
   summary (the adapter's optional thread_summary(), from Slack's reply_users on a history
   parent) names a replier other than the asker; the summary carries no text, so that route
   cannot tell a follow-up question from an answer, and with the setting on the sweep
-  counts any such reply too. "Responded" means exactly that, not
+  counts any such reply too - a teammate's "+1" or question, an app's auto-reply. An ask
+  tied at ingest is not fetched afterwards (the sweep works from open asks), so a question
+  already in its thread is not journaled until a sweep of answered asks' threads exists
+  (PR #12); the same holds, at this pin, for any reply posted in a thread after its ask was
+  tied by either route. "Responded" means exactly that, not
   "resolved": a third party's "+1" closes an ask too, and the dashboard counts
   thread-closed asks apart from answers sent from here. A reply posted top-level in the
   channel by anyone else is stored and listed but cannot be tied to the ask, and the
