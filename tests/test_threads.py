@@ -19,6 +19,17 @@ Properties pinned here (each has a mutation in tests/mutation_check.sh):
 * an adapter without replies() yields None: declared absent, never "nothing new";
 * the sweep is bounded per cycle and SAYS when it truncated;
 * a platform 429 stops the sweep and is reported, never swallowed.
+
+threaded_is_answered (2026-10-31) — the tie at INGEST, from the polled row's own thread
+summary (`answered_from_summary`, through the adapter's optional `thread_summary()`):
+
+* a replier other than the asker in the summary answers the ask, with no replies() call,
+  and the key names the replier (`thread-reply:summary:<replier>`);
+* a thread whose only repliers are the asker stays open; a count with no attributable
+  replier stays open; the unattributed placeholder answers nothing;
+* only open ASKS are tied — a STATEMENT parent and an already-answered ask are left alone;
+* an adapter without thread_summary() yields None: declared absent, never "no thread";
+* the tie is stamped at the sighting, so the row does not read EDITED AFTER RESPONSE.
 """
 import sys
 import tempfile
@@ -35,8 +46,8 @@ from core.ratelimit import RateLimited  # noqa: E402
 from core.schedule import ROUTES  # noqa: E402
 from core.store import Store  # noqa: E402
 from core.threads import (  # noqa: E402
-    FOLLOWUP_WINDOW_S, SWEEP_MAX, _is_engine_post, answered_by, close_dm_asks, sweep,
-    sweep_followups)
+    FOLLOWUP_WINDOW_S, SWEEP_MAX, _is_engine_post, answered_by, answered_from_summary,
+    close_dm_asks, sweep, sweep_followups)
 
 FakeAdapter = load_adapter_class(ROOT / "channels", "fake")
 
@@ -101,6 +112,176 @@ class SweepHarness(unittest.TestCase):
     def responded(self, ts, channel="C1"):
         row = self.journal.get(channel, ts)
         return row["responded_at"], row["response_key"]
+
+
+class AnsweredFromSummaryTest(SweepHarness):
+    """The ingest-time tie: what the polled parent row says about its thread, without a
+    platform call. The fake adapter derives the summary from the messages it holds, the
+    way Slack puts reply_count / reply_users / latest_reply on a history parent."""
+
+    def polled(self, ts="1.0"):
+        """The ask as the poller handed it to the journal — the normalized row."""
+        return [msg("C1", ts, "where is the dashboard?")]
+
+    def test_a_replier_other_than_the_asker_answers_at_ingest(self):
+        self.ask()
+        self.reply("2.0", "B_AGENT")                 # on the platform before the poll
+        ties = answered_from_summary(self.adapter, self.journal, "C1", self.polled())
+        self.assertEqual(ties, [("1.0", "B_AGENT")])
+        at, key = self.responded("1.0")
+        self.assertIsNotNone(at, "an ask whose row shows a foreign reply stayed open")
+        self.assertEqual(key, "thread-reply:summary:B_AGENT",
+                         "the key must name the replier, and carry the thread-reply: "
+                         "prefix the dashboard counts thread answers by")
+        self.assertEqual(self.adapter.calls, [], "the summary route made a replies() call")
+
+    def test_the_first_foreign_replier_is_named_not_the_asker(self):
+        self.ask()
+        self.reply("2.0", "U_ASKER", text="bump")
+        self.reply("3.0", "U_X")
+        self.reply("4.0", "U_Y")
+        answered_from_summary(self.adapter, self.journal, "C1", self.polled())
+        self.assertEqual(self.responded("1.0")[1], "thread-reply:summary:U_X")
+
+    def test_a_thread_of_the_askers_own_replies_stays_open(self):
+        self.ask()
+        self.reply("2.0", "U_ASKER", text="any update?")
+        ties = answered_from_summary(self.adapter, self.journal, "C1", self.polled())
+        self.assertEqual(ties, [])
+        self.assertIsNone(self.responded("1.0")[0],
+                          "an asker bumping their own thread was read as an answer")
+
+    def test_an_unattributed_replier_answers_nothing(self):
+        self.ask()
+        self.reply("2.0", "unknown", text="This message was deleted.")
+        self.assertEqual(answered_from_summary(self.adapter, self.journal, "C1",
+                                               self.polled()), [])
+        self.assertIsNone(self.responded("1.0")[0])
+
+    def test_a_count_with_no_attributable_replier_stays_open(self):
+        """A summary that says 'replies: 3' and names nobody is not evidence of who
+        replied — a replier the platform did not name would be a guess."""
+        self.ask()
+        self.reply("2.0", "B_AGENT")
+
+        class CountOnly(CountingFake):
+            def thread_summary(self, message):
+                s = super().thread_summary(message)
+                return None if s is None else dict(s, repliers=[])
+        adapter = CountOnly()
+        adapter.seed(self.adapter.messages)
+        self.assertEqual(answered_from_summary(adapter, self.journal, "C1", self.polled()), [])
+        self.assertIsNone(self.responded("1.0")[0])
+
+    def test_only_open_asks_are_tied(self):
+        self.ask(ts="1.0", kind="STATEMENT", text="the deploy finished")
+        self.reply("2.0", "U_X", thread="1.0")
+        self.ask(ts="3.0", text="second question?")
+        self.journal.mark_responded("C1", "3.0", "outbox-key")
+        self.reply("4.0", "U_Y", thread="3.0")
+        polled = [msg("C1", "1.0", "the deploy finished"), msg("C1", "3.0", "second question?")]
+        self.assertEqual(answered_from_summary(self.adapter, self.journal, "C1", polled), [])
+        self.assertIsNone(self.responded("1.0")[0], "a STATEMENT parent was marked answered")
+        self.assertEqual(self.responded("3.0")[1], "outbox-key",
+                         "an already-answered ask was re-tied")
+
+    def test_a_reply_row_says_nothing_about_its_own_thread(self):
+        """History serves a broadcast reply with its thread_id set; the summary of the
+        thread belongs to the parent, so a reply row ties nothing."""
+        self.ask(ts="1.0", kind="STATEMENT", text="status thread", sender="U_A")
+        self.ask(ts="2.0", text="is the dashboard up?", sender="U_B", thread="1.0")
+        self.reply("3.0", "U_C", text="yes", thread="1.0")
+        polled = [msg("C1", "2.0", "is the dashboard up?", sender="U_B", thread="1.0")]
+        self.assertEqual(answered_from_summary(self.adapter, self.journal, "C1", polled), [])
+        self.assertIsNone(self.responded("2.0")[0])
+
+    def test_a_reply_row_is_not_tied_even_when_the_adapter_summarises_it(self):
+        """The reply-row guard is the engine's, not the adapter's: an adapter that hands
+        a reply row its thread's summary still ties nothing on that row."""
+        self.ask(ts="1.0", kind="STATEMENT", text="status thread", sender="U_A")
+        self.ask(ts="2.0", text="is the dashboard up?", sender="U_B", thread="1.0")
+        self.reply("3.0", "U_C", text="yes", thread="1.0")
+
+        class SummarisesReplies(CountingFake):
+            def thread_summary(self, message):
+                root = dict(message, thread_id=None, ts=message.get("thread_id") or message["ts"])
+                return super().thread_summary(root)
+        adapter = SummarisesReplies()
+        adapter.seed(self.adapter.messages)
+        polled = [msg("C1", "2.0", "is the dashboard up?", sender="U_B", thread="1.0")]
+        self.assertIsNotNone(adapter.thread_summary(polled[0]), "the stub must summarise")
+        self.assertEqual(answered_from_summary(adapter, self.journal, "C1", polled), [])
+        self.assertIsNone(self.responded("2.0")[0], "a reply row was tied from a summary")
+
+    def test_a_failing_summary_is_recorded_by_ask_and_the_next_row_still_ties(self):
+        self.ask(ts="1.0")
+        self.ask(ts="3.0", text="where are the logs?")
+        self.reply("4.0", "U_X", thread="3.0")
+
+        class Flaky(CountingFake):
+            def thread_summary(self, message):
+                if message["ts"] == "1.0":
+                    raise RuntimeError("boom")
+                return super().thread_summary(message)
+        adapter = Flaky()
+        adapter.seed(self.adapter.messages)
+        errors = []
+        ties = answered_from_summary(adapter, self.journal, "C1",
+                                     [msg("C1", "1.0", "where is the dashboard?"),
+                                      msg("C1", "3.0", "where are the logs?")], errors=errors)
+        self.assertEqual(ties, [("3.0", "U_X")])
+        self.assertEqual(errors, [("1.0", "RuntimeError: boom")])
+
+    def test_named_answerers_restrict_who_ties_at_ingest(self):
+        """ENH-31's answerers apply to the summary route as to the sweep: a bystander's
+        reply ties nothing; an answerer's ask is tied by the other party."""
+        self.ask(ts="1.0")
+        self.reply("2.0", "U_BYSTANDER", thread="1.0")
+        self.assertEqual(answered_from_summary(self.adapter, self.journal, "C1", self.polled(),
+                                               answerers=("B_AGENT",)), [])
+        self.reply("3.0", "B_AGENT", thread="1.0")
+        self.assertEqual(answered_from_summary(self.adapter, self.journal, "C1", self.polled(),
+                                               answerers=("B_AGENT",)), [("1.0", "B_AGENT")])
+        self.ask(ts="5.0", text="which log do you need?", sender="B_AGENT")
+        self.reply("6.0", "U_ASKER", thread="5.0")
+        self.assertEqual(answered_from_summary(
+            self.adapter, self.journal, "C1",
+            [msg("C1", "5.0", "which log do you need?", sender="B_AGENT")],
+            answerers=("B_AGENT",)), [("5.0", "U_ASKER")])
+
+    def test_an_adapter_without_thread_summary_is_declared_absent(self):
+        self.journal.record("C1", "1.0", sender_id="U", text="where?", kind="QUESTION")
+        self.assertIsNone(answered_from_summary(NoRepliesAdapter(), self.journal, "C1",
+                                                self.polled()),
+                          "an adapter that cannot see a thread summary must read as "
+                          "'cannot conclude', never as 'no thread'")
+        self.assertIsNone(self.responded("1.0")[0])
+
+    def test_the_tie_is_stamped_at_the_sighting_not_at_the_reply(self):
+        """The reply's platform time predates the row's first sighting (the reply was
+        there before the poll), so a tie stamped at the reply would make revision 1,
+        recorded at the sighting, read as an edit AFTER the response (R23)."""
+        self.ask()
+        self.reply("0.5", "B_AGENT")      # platform ts before the ask's — as a float
+        answered_from_summary(self.adapter, self.journal, "C1", self.polled())
+        row = self.journal.get("C1", "1.0")
+        self.assertGreaterEqual(row["responded_at"], row["first_seen_at"],
+                                "the tie predates the row's first sighting")
+        self.assertEqual([(r["channel"], r["ts"]) for r in self.journal.edited_after_response()],
+                         [], "a summary-tied ask reads as EDITED AFTER RESPONSE")
+
+    def test_the_fake_adapters_summary_names_repliers_in_reply_order(self):
+        a = FakeAdapter()
+        a.seed([msg("C1", "1.0", "parent"),
+                msg("C1", "2.0", "r1", sender="U_X", thread="1.0"),
+                msg("C1", "3.0", "r2", sender="U_Y", thread="1.0"),
+                msg("C1", "4.0", "r3", sender="U_X", thread="1.0"),
+                msg("C2", "5.0", "other channel", sender="U_Z", thread="1.0")])
+        self.assertEqual(a.thread_summary(msg("C1", "1.0", "parent")),
+                         {"reply_count": 3, "repliers": ["U_X", "U_Y"], "latest_reply": "4.0"})
+        self.assertIsNone(a.thread_summary(msg("C1", "2.0", "r1", sender="U_X", thread="1.0")),
+                          "a reply row has no thread summary of its own")
+        self.assertIsNone(a.thread_summary(msg("C2", "9.0", "no thread")))
 
 
 class AnsweredByTest(unittest.TestCase):

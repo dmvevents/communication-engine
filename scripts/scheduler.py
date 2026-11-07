@@ -102,14 +102,15 @@ def report_lines(summary) -> list:
 
 def sources_from(cfg, adapters) -> list:
     """One Source per instance, carrying everything the loop reads from config — the
-    taxonomy, the hedge routing, the answerers and the DM channels (ENH-31). Module-level
+    taxonomy, the hedge routing, the answerers and the DM channels (ENH-31), and threaded_is_answered. Module-level
     so a test can load a settings file and see what the loop would run with (review X5/X6:
     the wiring could drop a key and every test stayed green)."""
     return [Source(name=inst.name, adapter=adapters[inst.name],
                    channels=tuple(ch.id for ch in inst.channels),
                    taxonomy=Taxonomy.from_config(inst.taxonomy),
                    escalate_ambiguous=inst.escalate_ambiguous,
-                   answerers=inst.answerers, dm_channels=inst.dm_channels())
+                   answerers=inst.answerers, dm_channels=inst.dm_channels(),
+                   threaded_is_answered=inst.threaded_is_answered)
             for inst in cfg.instances]
 
 

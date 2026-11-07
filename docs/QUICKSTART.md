@@ -288,19 +288,28 @@ the open *ask* backlog: rows whose kind is one of `core/classify.ACTIONABLE_KIND
 them. A STATEMENT — a status remark, a join notice — owes nobody an answer and is never
 listed there (it still counts as a message, and the Journal tab's kind table shows it);
 a row with no recorded kind is shown as *unclassified* rather than hidden. An ask
-becomes answered in exactly two ways, both recorded in `journal.db` with a response key
+becomes answered in three ways, each recorded in `journal.db` with a response key
 naming what answered: a reply **sent from the write surface** with the ask's Reply
 button (the outbox key, tied the moment the send is proven on the target — staging
-alone never ties), or a reply **inside the ask's thread from someone other than the
+alone never ties); a reply **inside the ask's thread from someone other than the
 asker**, which the reference scheduler sweeps every cycle through the adapter's
 optional `replies()` (`core/threads.py`; the shipped `fake` and `slack` adapters have
-it). A top-level reply posted in the channel by someone else cannot be attributed to the
+it); or, **at ingest**, the polled row's own summary of the thread under it — Slack
+serves a thread parent with its `reply_count` and `reply_users`, and the first poll of a
+channel serves every parent that way — read through the adapter's optional
+`thread_summary()` and tied when it names a replier other than the asker, with no
+platform call (key `thread-reply:summary:<replier>`). That third route, and the rule that
+in the sweep any reply from someone else answers, a question included, is the instance
+setting `threaded_is_answered` (default `true`: a message that has a thread is answered;
+`false` keeps the sweep as the one in-thread route and refuses a reply that is itself an
+ask as the answer). A top-level reply posted in the channel by someone else cannot be attributed to the
 ask it answers, so it leaves the ask open — answer in the thread, or from this surface's
 Reply button, which ties the ask itself wherever the reply lands. "Responded" means
 exactly that — somebody else replied in the thread, or you sent an answer — not
 "resolved": a third party's "+1" closes an ask too, and the Journal tab counts those
 apart from answers sent from here. The scheduler's cycle line reports `answered=N` — the
-in-thread ties the sweep made that cycle; answers sent from the surface are tied by the
+ties made that cycle, at ingest from a polled parent's thread summary and in the thread
+sweep; answers sent from the surface are tied by the
 surface and never appear in that count — and
 one line per channel whenever the sweep was rate-limited, truncated, or refused by the
 platform for one ask (a deleted ask answers `thread_not_found` forever; it is reported
@@ -450,17 +459,28 @@ surface says so instead of implying one.
   from the write surface's Reply button (tied by the ask itself, in its thread or
   top-level as the channel's thread policy allows), by an in-thread reply from someone
   other than the asker — from a listed answerer, when the source names them — swept each
-  scheduler cycle, or, in a 1:1 direct message (declared or inferred), by the next
-  top-level message that is an answer, which closes the most recent open ask it can answer
-  (never its own sender's), once — in a DM a message closes at most one ask, ever; in a
-  thread one reply closes every open ask under its root, by design, flagged on the Journal
-  tab — and the engine's own deliveries are never credited by either rule; a reply inside a
-  DM's thread is not credited (0 of 535 DM messages measured in-thread), and DM asks spend no
-  thread-sweep budget. "Responded" means exactly that, not
+  scheduler cycle, or — with the instance setting threaded_is_answered on, the default — at
+  ingest, when the polled row's own thread summary (the adapter's optional
+  thread_summary(), from Slack's reply_users on a history parent) names such a replier; the
+  summary carries no text, so that route cannot tell a follow-up question from an answer,
+  and with the setting on the sweep counts any such reply too — a teammate's "+1" or
+  question, an app's auto-reply; or, in a 1:1 direct message
+  (declared or inferred), by the next top-level message that is an answer, which closes the
+  most recent open ask it can answer (never its own sender's), once — in a DM a message
+  closes at most one ask, ever; in a thread one reply closes every open ask under its root,
+  by design, flagged on the Journal tab — and the engine's own deliveries are never credited
+  by the sweep or the DM rule (a thread summary names repliers only, so the ingest route
+  cannot see the engine's delivery metadata); a reply inside a DM's thread is not credited
+  (0 of 535 DM messages measured in-thread), and DM asks spend no thread-sweep budget. An
+  ask tied at ingest, or by any route, is answered like any other, so for 24 h the
+  follow-up sweep fetches its thread: a question already in it, or posted there later, is
+  journaled and owed. "Responded" means exactly that, not
   "resolved": a third party's "+1" closes an ask too, and the dashboard counts
   thread-closed asks apart from answers sent from here. A reply posted top-level in the
   channel by anyone else is stored and listed but cannot be tied to the ask, and the
-  engine never guesses. Adapters with neither `replies()` nor send capability — today
+  engine never guesses; a thread that grows after its parent was polled reaches the engine
+  through the sweep alone, since a cursored history poll never serves a parent twice.
+  Adapters with neither `replies()` nor send capability — today
   `slack_socket`, `telegram` and `email` — have no route to answered at all: their asks
   stay UNANSWERED until a send-capable path exists for that platform.
 - **The thread sweep spends platform calls.** Each open ask costs one
