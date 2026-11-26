@@ -1,0 +1,503 @@
+"""Tests for core/journal.py (gate G10; requirement R16).
+
+The invariant: **one row per distinct message, however many times it is seen.** The incumbent
+log holds 323 entries for 177 distinct messages (77 duplicated, one 9 times), so this suite
+reproduces that scenario and asserts the count stays honest.
+"""
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from core.journal import Journal  # noqa: E402
+
+CH = "C_EXAMPLE"
+
+
+class JournalTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.j = Journal(Path(self.tmp.name) / "j.db")
+
+    def tearDown(self):
+        self.j.close()
+        self.tmp.cleanup()
+
+    # ---- R16: idempotence -------------------------------------------------
+    def test_first_sighting_reports_true_and_creates_one_row(self):
+        self.assertTrue(self.j.record(CH, "1.1", text="hello"))
+        self.assertEqual(self.j.row_count(), 1)
+
+    def test_re_recording_the_same_message_does_not_append(self):
+        self.j.record(CH, "1.1", text="hello")
+        self.assertFalse(self.j.record(CH, "1.1", text="hello"))
+        self.assertEqual(self.j.row_count(), 1)
+
+    def test_the_incumbent_scenario_one_message_seen_nine_times(self):
+        """A real message in the live log was re-appended 9 times."""
+        for _ in range(9):
+            self.j.record(CH, "1700000000.000100", text="the same ask")
+        self.assertEqual(self.j.row_count(), 1,
+                         "a message seen 9 times produced more than one audit row")
+        self.assertEqual(self.j.get(CH, "1700000000.000100")["seen_count"], 9,
+                         "re-sightings must be observable, just not duplicated")
+
+    def test_row_count_equals_distinct_count_always(self):
+        """The invariant the incumbent violates by 45%."""
+        for i in range(20):
+            self.j.record(CH, f"{i}.0", text=f"m{i}")
+        for i in range(20):                      # replay the whole window twice
+            self.j.record(CH, f"{i}.0", text=f"m{i}")
+            self.j.record(CH, f"{i}.0", text=f"m{i}")
+        self.assertEqual(self.j.row_count(), self.j.distinct_count())
+        self.assertEqual(self.j.row_count(), 20)
+
+    def test_same_ts_in_different_channels_are_distinct(self):
+        self.j.record("C_ONE", "1.1", text="a")
+        self.j.record("C_TWO", "1.1", text="b")
+        self.assertEqual(self.j.row_count(), 2)
+
+    def test_seen_count_starts_at_one(self):
+        self.j.record(CH, "1.1")
+        self.assertEqual(self.j.get(CH, "1.1")["seen_count"], 1)
+
+    def test_last_seen_advances_while_first_seen_is_stable(self):
+        self.j.record(CH, "1.1")
+        first = self.j.get(CH, "1.1")["first_seen_at"]
+        self.j.record(CH, "1.1")
+        row = self.j.get(CH, "1.1")
+        self.assertEqual(row["first_seen_at"], first)
+        self.assertGreaterEqual(row["last_seen_at"], first)
+
+    # ---- classification/routing are part of the audit ---------------------
+    def test_classification_is_recorded_and_can_be_refined(self):
+        self.j.record(CH, "1.1", text="x", kind="STATEMENT", reason="initial")
+        self.j.record(CH, "1.1", text="x", kind="EXEC-REQUEST", reason="refined")
+        row = self.j.get(CH, "1.1")
+        self.assertEqual(row["kind"], "EXEC-REQUEST")
+        self.assertEqual(self.j.row_count(), 1)
+
+    def test_a_later_null_does_not_erase_a_recorded_classification(self):
+        self.j.record(CH, "1.1", kind="QUESTION", reason="asked")
+        self.j.record(CH, "1.1")                 # a bare re-sighting
+        self.assertEqual(self.j.get(CH, "1.1")["kind"], "QUESTION")
+
+    def test_by_kind_counts_distinct_messages_not_sightings(self):
+        for _ in range(5):
+            self.j.record(CH, "1.1", kind="QUESTION")
+        self.j.record(CH, "2.2", kind="STATEMENT")
+        self.assertEqual(self.j.by_kind(), {"QUESTION": 1, "STATEMENT": 1})
+
+    # ---- answering the audit's real question ------------------------------
+    def test_unanswered_lists_asks_with_no_response(self):
+        self.j.record(CH, "1.1", text="ask one")
+        self.j.record(CH, "2.2", text="ask two")
+        self.j.mark_responded(CH, "1.1", response_key="abc123")
+        self.assertEqual([r["ts"] for r in self.j.unanswered()], ["2.2"])
+
+    def test_response_is_linked_to_the_outbox_key(self):
+        self.j.record(CH, "1.1")
+        self.j.mark_responded(CH, "1.1", response_key="deadbeef")
+        row = self.j.get(CH, "1.1")
+        self.assertEqual(row["response_key"], "deadbeef")
+        self.assertIsNotNone(row["responded_at"])
+
+    def test_unanswered_can_be_scoped_to_a_channel(self):
+        self.j.record("C_ONE", "1.1")
+        self.j.record("C_TWO", "2.2")
+        self.assertEqual(len(self.j.unanswered("C_ONE")), 1)
+
+    def test_answered_is_the_exact_complement_of_unanswered(self):
+        """The reference scheduler closes owed work from answered() — a row appearing
+        in both lists (or neither) would close open asks or strand closed ones."""
+        self.j.record(CH, "1.1", text="ask one")
+        self.j.record(CH, "2.2", text="ask two")
+        self.j.mark_responded(CH, "1.1", response_key="abc123")
+        self.assertEqual([r["ts"] for r in self.j.answered()], ["1.1"])
+        self.assertEqual([r["ts"] for r in self.j.unanswered()], ["2.2"])
+        self.assertEqual(len(self.j.answered("C_ELSEWHERE")), 0)
+
+    def test_export_emits_one_line_per_distinct_message(self):
+        for _ in range(4):
+            self.j.record(CH, "1.1", text="dup")
+        self.j.record(CH, "2.2", text="other")
+        self.assertEqual(len(self.j.export_jsonl().splitlines()), 2)
+
+    def test_journal_survives_a_restart(self):
+        self.j.record(CH, "1.1", text="durable")
+        path = self.j.path if hasattr(self.j, "path") else None
+        del path
+        j2 = Journal(Path(self.tmp.name) / "j.db")
+        self.assertEqual(j2.row_count(), 1)
+        self.assertFalse(j2.record(CH, "1.1", text="durable"),
+                         "a restarted journal re-appended an existing message")
+
+
+class RevisionTest(unittest.TestCase):
+    """R23 — edits. Found by probing, not by reading: the first version of this journal
+    silently discarded an edit, keeping the ORIGINAL text and classification."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.j = Journal(Path(self.tmp.name) / "j.db")
+
+    def tearDown(self):
+        self.j.close()
+        self.tmp.cleanup()
+
+    def test_an_edit_updates_the_recorded_text(self):
+        self.j.record(CH, "1.1", text="Notes from the meeting are in the doc.",
+                      kind="STATEMENT")
+        self.j.record(CH, "1.1", text="Please deploy the patched image now.",
+                      kind="EXEC-REQUEST")
+        row = self.j.get(CH, "1.1")
+        self.assertIn("deploy", row["text"],
+                      "the audit still quotes the ORIGINAL text — it misquotes the channel")
+        self.assertEqual(row["kind"], "EXEC-REQUEST",
+                         "an edit that turns a remark into an instruction kept the old class")
+
+    def test_an_edit_is_reported_as_a_revision_not_a_duplicate(self):
+        self.j.record(CH, "1.1", text="first")
+        res = self.j.record(CH, "1.1", text="second")
+        self.assertTrue(res.is_revision)
+        self.assertFalse(res.is_new)
+        self.assertEqual(res.revision, 2)
+
+    def test_an_edit_does_not_create_a_second_row(self):
+        self.j.record(CH, "1.1", text="first")
+        self.j.record(CH, "1.1", text="second")
+        self.j.record(CH, "1.1", text="third")
+        self.assertEqual(self.j.row_count(), 1)
+        self.assertEqual(self.j.row_count(), self.j.distinct_count())
+
+    def test_full_revision_history_is_retained_for_audit(self):
+        self.j.record(CH, "1.1", text="v1", kind="STATEMENT")
+        self.j.record(CH, "1.1", text="v2", kind="QUESTION")
+        self.j.record(CH, "1.1", text="v3", kind="EXEC-REQUEST")
+        revs = self.j.revisions(CH, "1.1")
+        self.assertEqual([r["text"] for r in revs], ["v1", "v2", "v3"])
+        self.assertEqual([r["kind"] for r in revs],
+                         ["STATEMENT", "QUESTION", "EXEC-REQUEST"])
+
+    def test_revision_history_reads_as_records_not_row_handles(self):
+        """ENH-22: revisions() is the RUNBOOK's per-edit audit walk, read by a human
+        disputing a recorded decision; a list of raw sqlite3.Row objects prints as
+        '[<sqlite3.Row object at 0x...>]' and shows none of the history it holds."""
+        self.j.record(CH, "1.1", text="v1", kind="STATEMENT")
+        self.j.record(CH, "1.1", text="v2", kind="QUESTION")
+        revs = self.j.revisions(CH, "1.1")
+        self.assertIn("v2", repr(revs),
+                      "printing the revision history shows object addresses, not edits")
+        self.assertEqual([r["text"] for r in revs], ["v1", "v2"])
+
+    def test_identical_text_is_a_resighting_not_a_revision(self):
+        self.j.record(CH, "1.1", text="same")
+        res = self.j.record(CH, "1.1", text="same")
+        self.assertEqual(res.status, "reseen")
+        self.assertEqual(self.j.get(CH, "1.1")["revision"], 1)
+        self.assertEqual(len(self.j.revisions(CH, "1.1")), 1)
+
+    def test_a_bare_resighting_with_no_text_is_not_an_edit_to_empty(self):
+        """A poller that re-sights without re-sending the body must not wipe the record."""
+        self.j.record(CH, "1.1", text="real content", kind="QUESTION")
+        res = self.j.record(CH, "1.1")
+        self.assertEqual(res.status, "reseen")
+        self.assertEqual(self.j.get(CH, "1.1")["text"], "real content")
+
+    def test_an_edit_after_we_answered_is_surfaced(self):
+        """We answered version 1; the channel now shows version 2. Somebody must look."""
+        self.j.record(CH, "1.1", text="original ask")
+        self.j.mark_responded(CH, "1.1", response_key="k1")
+        self.assertEqual(self.j.edited_after_response(), [])
+        self.j.record(CH, "1.1", text="actually, do something else entirely")
+        flagged = self.j.edited_after_response()
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged[0]["ts"], "1.1")
+
+    def test_seen_count_still_counts_every_sighting_including_edits(self):
+        self.j.record(CH, "1.1", text="a")
+        self.j.record(CH, "1.1", text="a")
+        self.j.record(CH, "1.1", text="b")
+        self.assertEqual(self.j.get(CH, "1.1")["seen_count"], 3)
+
+
+class AuditLinkTest(unittest.TestCase):
+    """R22: the journal row is where a classification gets DISPUTED — possibly months
+    later, possibly after the taxonomy changed, so re-running the classifier over the
+    text is not evidence of what the engine decided at the time. The row itself must
+    link back to the cues the decision actually matched."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "j.db"
+        self.j = Journal(self.path)
+
+    def tearDown(self):
+        self.j.close()
+        self.tmp.cleanup()
+
+    def test_a_journal_row_links_back_to_the_decision_cues(self):
+        self.j.record(CH, "1.1", text="Please deploy the image.", kind="EXEC-REQUEST",
+                      reason="imperative or directed request to perform work",
+                      matched=["deploy", "please"])
+        a = self.j.audit(CH, "1.1")
+        self.assertEqual(a["kind"], "EXEC-REQUEST")
+        self.assertTrue(a["reason"])
+        self.assertEqual(a["matched"], ["deploy", "please"],
+                         "the cues never reached the journal — the decision cannot be "
+                         "disputed from the audit trail")
+
+    def test_the_audit_link_survives_a_restart(self):
+        self.j.record(CH, "1.1", text="Where is the doc?", kind="QUESTION",
+                      reason="asks for information", matched=["where is"])
+        self.j.close()
+        self.j = Journal(self.path)
+        self.assertEqual(self.j.audit(CH, "1.1")["matched"], ["where is"])
+
+    def test_a_bare_resighting_does_not_erase_the_cues(self):
+        self.j.record(CH, "1.1", text="Please deploy it.", kind="EXEC-REQUEST",
+                      reason="imperative", matched=["deploy", "please"])
+        self.j.record(CH, "1.1")
+        self.assertEqual(self.j.audit(CH, "1.1")["matched"], ["deploy", "please"])
+
+    def test_each_revision_keeps_its_own_decisions_cues(self):
+        """An edit re-classifies; the dispute 'why did you answer version 1 that way?'
+        needs version 1's cues, not the live row's."""
+        import json
+        self.j.record(CH, "1.1", text="Where is the doc?", kind="QUESTION",
+                      reason="asks for information", matched=["where is"])
+        self.j.record(CH, "1.1", text="Please deploy the doc fix.", kind="EXEC-REQUEST",
+                      reason="imperative", matched=["deploy", "please"])
+        revs = self.j.revisions(CH, "1.1")
+        self.assertEqual([json.loads(r["matched"]) for r in revs],
+                         [["where is"], ["deploy", "please"]])
+        self.assertEqual(self.j.audit(CH, "1.1")["matched"], ["deploy", "please"])
+
+    def test_export_carries_the_audit_link(self):
+        """The export is what any rendering surface (dashboard included) reads; cues
+        that die before the export are not auditable, only stored."""
+        import json
+        self.j.record(CH, "1.1", text="Please deploy it.", kind="EXEC-REQUEST",
+                      reason="imperative", matched=["deploy", "please"])
+        line = json.loads(self.j.export_jsonl())
+        self.assertEqual(json.loads(line["matched"]), ["deploy", "please"])
+
+    def test_recorded_empty_cues_stay_distinct_from_never_recorded(self):
+        """[] means 'the classifier matched nothing'; None means 'no decision was ever
+        recorded'. Collapsing them would let an absent record masquerade as evidence."""
+        self.j.record(CH, "1.1", text="plain remark", kind="STATEMENT",
+                      reason="no directive, question or commitment cue", matched=[])
+        self.j.record(CH, "2.2", text="unclassified sighting")
+        self.assertEqual(self.j.audit(CH, "1.1")["matched"], [])
+        self.assertIsNone(self.j.audit(CH, "2.2")["matched"])
+
+    def test_a_pre_audit_database_is_migrated_on_open(self):
+        """Adopters already hold journal.db files created before the cues column
+        existed. Refusing to open one would destroy an audit trail in order to improve
+        it — the column must be added in place, with legacy rows reading as None."""
+        import sqlite3
+        old = Path(self.tmp.name) / "old.db"
+        conn = sqlite3.connect(old)
+        conn.executescript("""
+            CREATE TABLE journal (
+                channel TEXT NOT NULL, ts TEXT NOT NULL, sender_id TEXT, text TEXT,
+                text_hash TEXT, kind TEXT, reason TEXT, routed TEXT,
+                first_seen_at REAL NOT NULL, last_seen_at REAL NOT NULL,
+                seen_count INTEGER NOT NULL DEFAULT 1,
+                revision INTEGER NOT NULL DEFAULT 1,
+                responded_at REAL, response_key TEXT,
+                PRIMARY KEY (channel, ts));
+            CREATE TABLE revisions (
+                channel TEXT NOT NULL, ts TEXT NOT NULL, seq INTEGER NOT NULL,
+                text TEXT, kind TEXT, reason TEXT, recorded_at REAL NOT NULL,
+                PRIMARY KEY (channel, ts, seq));
+            INSERT INTO journal VALUES ('C_LEGACY', '0.9', NULL, 'old row', 'h',
+                'STATEMENT', 'legacy reason', NULL, 1.0, 1.0, 1, 1, NULL, NULL);
+        """)
+        conn.commit()
+        conn.close()
+        j2 = Journal(old)
+        try:
+            self.assertIsNone(j2.audit("C_LEGACY", "0.9")["matched"])
+            j2.record("C_LEGACY", "1.0", text="Please deploy it.", kind="EXEC-REQUEST",
+                      reason="imperative", matched=["deploy", "please"])
+            self.assertEqual(j2.audit("C_LEGACY", "1.0")["matched"],
+                             ["deploy", "please"])
+        finally:
+            j2.close()
+
+
+class ConcurrencyTest(unittest.TestCase):
+    """This probe caught the outbox delivering 3× from 6 concurrent senders (fire=13):
+    the property really did hold only by accident. The INTENT insert is now the claim
+    (see the deterministic window tests in test_outbox_faults); this stays as the
+    whole-system stress that found the race in the first place."""
+
+    def test_concurrent_senders_deliver_exactly_once(self):
+        import threading
+        from core.outbox import Outbox
+
+        class A:
+            def __init__(self):
+                self.delivered = []
+                self.lock = threading.Lock()
+
+            def send(self, target, text, key=None):
+                with self.lock:
+                    self.delivered.append((target, text, key))
+                return {"ts": "r", "key": key}
+
+            def read_back(self, target, key):
+                with self.lock:
+                    return any(k == key for _, _, k in self.delivered)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "o.db"
+            ad = A()
+            errs = []
+
+            def worker():
+                try:
+                    Outbox(db, ad, {"C": "direct"}).send("C", "1.1", "same text")
+                except BaseException as e:      # noqa: BLE001
+                    errs.append(type(e).__name__)
+
+            threads = [threading.Thread(target=worker) for _ in range(6)]
+            [t.start() for t in threads]
+            [t.join() for t in threads]
+            self.assertEqual(len(ad.delivered), 1,
+                             f"{len(ad.delivered)} deliveries from 6 concurrent senders")
+            self.assertEqual(errs, [], f"concurrent senders raised: {errs}")
+
+
+class AmbiguityCountTest(unittest.TestCase):
+    """ENH-9: 'ambiguity silently becomes STATEMENT — safe but lossy and invisible.'
+    The journal is where the loss becomes countable: each row records whether the
+    classifier hedged, and ambiguity_stats() answers 'how often?' over the whole trail.
+    Three states must stay distinct on disk (the matched-column lesson): hedged (1),
+    confident (0), and never-recorded (NULL) — a legacy row must not masquerade as a
+    confident decision, or the hedge rate reads lower than it is."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.j = Journal(Path(self.tmp.name) / "j.db")
+        self.addCleanup(self.j.close)
+
+    def test_the_signal_is_recorded_and_readable(self):
+        self.j.record(CH, "1.1", text="the build and test cycle takes an hour",
+                      kind="STATEMENT", reason="ambiguous", ambiguous=True)
+        self.j.record(CH, "2.2", text="notes are in the doc",
+                      kind="STATEMENT", reason="no cue", ambiguous=False)
+        self.assertIs(self.j.audit(CH, "1.1")["ambiguous"], True)
+        self.assertIs(self.j.audit(CH, "2.2")["ambiguous"], False)
+
+    def test_ambiguity_stats_counts_distinct_messages_not_sightings(self):
+        self.j.record(CH, "1.1", text="hedge one", ambiguous=True)
+        self.j.record(CH, "2.2", text="hedge two", ambiguous=True)
+        self.j.record(CH, "3.3", text="confident", ambiguous=False)
+        self.j.record(CH, "1.1", text="hedge one", ambiguous=True)   # re-sighting
+        self.assertEqual(self.j.ambiguity_stats(),
+                         {"ambiguous": 2, "confident": 1, "unrecorded": 0},
+                         "a re-poll inflated the hedge count — the stats must count "
+                         "messages, or every duplicate sighting moves the rate")
+
+    def test_a_recorded_confident_decision_stays_distinct_from_never_recorded(self):
+        """False means 'the classifier decided, confidently'; None means 'no decision
+        was ever supplied'. Collapsing them would fabricate confidence for rows that
+        were never classified at all."""
+        self.j.record(CH, "1.1", text="classified", kind="STATEMENT", ambiguous=False)
+        self.j.record(CH, "2.2", text="bare sighting, no decision")
+        self.assertIs(self.j.audit(CH, "1.1")["ambiguous"], False)
+        self.assertIsNone(self.j.audit(CH, "2.2")["ambiguous"])
+        self.assertEqual(self.j.ambiguity_stats(),
+                         {"ambiguous": 0, "confident": 1, "unrecorded": 1})
+
+    def test_a_bare_resighting_does_not_erase_the_signal(self):
+        self.j.record(CH, "1.1", text="hedge", ambiguous=True)
+        self.j.record(CH, "1.1", text="hedge")            # decision-less re-sighting
+        self.assertIs(self.j.audit(CH, "1.1")["ambiguous"], True,
+                      "a later null erased the recorded signal — the count decays "
+                      "under re-polling")
+
+    def test_a_pre_signal_database_is_migrated_on_open(self):
+        """Adopters hold journal.db files created before the ambiguous column existed
+        (the matched-column migration precedent verbatim): the column is added in
+        place, and legacy rows read back as unrecorded, never as confident."""
+        import sqlite3
+        old = Path(self.tmp.name) / "old.db"
+        conn = sqlite3.connect(old)
+        conn.executescript("""
+            CREATE TABLE journal (
+                channel TEXT NOT NULL, ts TEXT NOT NULL, sender_id TEXT, text TEXT,
+                text_hash TEXT, kind TEXT, reason TEXT, matched TEXT, routed TEXT,
+                first_seen_at REAL NOT NULL, last_seen_at REAL NOT NULL,
+                seen_count INTEGER NOT NULL DEFAULT 1,
+                revision INTEGER NOT NULL DEFAULT 1,
+                responded_at REAL, response_key TEXT,
+                PRIMARY KEY (channel, ts));
+            CREATE TABLE revisions (
+                channel TEXT NOT NULL, ts TEXT NOT NULL, seq INTEGER NOT NULL,
+                text TEXT, kind TEXT, reason TEXT, matched TEXT, recorded_at REAL NOT NULL,
+                PRIMARY KEY (channel, ts, seq));
+            INSERT INTO journal VALUES ('C_LEGACY', '0.9', NULL, 'old row', 'h',
+                'STATEMENT', 'legacy reason', NULL, NULL, 1.0, 1.0, 1, 1, NULL, NULL);
+        """)
+        conn.commit()
+        conn.close()
+        j2 = Journal(old)
+        try:
+            self.assertIsNone(j2.audit("C_LEGACY", "0.9")["ambiguous"])
+            j2.record("C_LEGACY", "1.0", text="new hedge", kind="STATEMENT",
+                      ambiguous=True)
+            self.assertEqual(j2.ambiguity_stats(),
+                             {"ambiguous": 1, "confident": 0, "unrecorded": 1})
+        finally:
+            j2.close()
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+
+class ResponseTimestampTest(unittest.TestCase):
+    """mark_responded() stamps responded_at at the moment the ANSWER was written when the
+    caller says so (the draft's created_at; a swept reply's arrival), not the moment the
+    tie is recorded. Stamping at tie time launders an edit made in between: R23's
+    edited_after_response compares revision.recorded_at > responded_at, so an edit sighted
+    before a late tie vanished (independent review F9, 2026-10-13)."""
+
+    def test_an_explicit_time_is_recorded_verbatim(self):
+        with tempfile.TemporaryDirectory() as d:
+            j = Journal(f"{d}/j.db")
+            j.record("C", "1.0", sender_id="U", text="deploy to staging?", kind="QUESTION")
+            j.mark_responded("C", "1.0", "k", at=1234.5)
+            self.assertEqual(j.get("C", "1.0")["responded_at"], 1234.5)
+            j.close()
+
+    def test_the_default_is_now(self):
+        with tempfile.TemporaryDirectory() as d:
+            j = Journal(f"{d}/j.db")
+            j.record("C", "1.0", sender_id="U", text="deploy to staging?", kind="QUESTION")
+            before = time.time()
+            j.mark_responded("C", "1.0", "k")
+            self.assertGreaterEqual(j.get("C", "1.0")["responded_at"], before)
+            j.close()
+
+    def test_an_edit_sighted_after_the_answer_was_written_is_flagged(self):
+        """The laundering scenario end to end: answer written at t=100 (a draft at the
+        gate), the asker edits at t=200 (revision recorded), the tie lands at t=300 with
+        at=100 -> the edit is AFTER the answer and must surface."""
+        with tempfile.TemporaryDirectory() as d:
+            j = Journal(f"{d}/j.db")
+            j.record("C", "1.0", sender_id="U", text="deploy to staging?", kind="QUESTION")
+            j.record("C", "1.0", sender_id="U", text="deploy to PROD?", kind="QUESTION")
+            edit_seen = j.revisions("C", "1.0")[-1]["recorded_at"]
+            j.mark_responded("C", "1.0", "k", at=edit_seen - 50)
+            self.assertEqual([(r["channel"], r["ts"]) for r in j.edited_after_response()],
+                             [("C", "1.0")],
+                             "an edit sighted after the answer was written was laundered")
+            j.close()
