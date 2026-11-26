@@ -53,6 +53,36 @@ class Adapter:
         out.sort(key=lambda m: float(m["ts"]))
         return out
 
+    def newest(self, channel_id, thread_id=None):
+        """Optional capability (channels/CONTRACT.md, ENH-31): the newest message in the
+        channel (top-level) or under one thread, or None — the outbox's pre-send
+        re-read. Deliveries are not messages here (they live in `delivered`), so the
+        engine's own posts never trip its own guard."""
+        pool = [m for m in self.messages if m.get("channel_id") == channel_id
+                and ((m.get("thread_id") == thread_id) if thread_id is not None
+                     else not m.get("thread_id"))]
+        return max(pool, key=lambda m: float(m["ts"])) if pool else None
+    def thread_summary(self, message):
+        """Optional capability (channels/CONTRACT.md): what a polled row says about the
+        thread under it - reply_count, the repliers in reply order, the newest reply's
+        ts - or None for a row without a thread. The fake derives it from the messages
+        it holds; a real adapter reads the summary its platform puts on the parent row
+        (Slack: reply_count / reply_users / latest_reply on a history entry)."""
+        if message.get("thread_id"):
+            return None
+        replies = [m for m in self.messages
+                   if m.get("channel_id") == message.get("channel_id")
+                   and m.get("thread_id") == message.get("ts")]
+        if not replies:
+            return None
+        replies.sort(key=lambda m: float(m["ts"]))
+        repliers = []
+        for m in replies:
+            if m.get("sender_id") not in repliers:
+                repliers.append(m.get("sender_id"))
+        return {"reply_count": len(replies), "repliers": repliers,
+                "latest_reply": replies[-1]["ts"]}
+
     def send(self, channel_id, text, key=None, thread_id=None):
         """Placement is recorded, not ignored: an adapter that accepts thread_id and
         drops it posts in the main channel while reporting success, which is the one

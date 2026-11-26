@@ -87,7 +87,31 @@ def report_lines(summary) -> list:
                  "channel" if why == "rate-limited" else
                  "this adapter's thread budget was spent before it reached this channel")
         lines.append(f"sweep: SKIPPED channel={ch} — {cause}; it is swept first next cycle")
+    for ch, why in summary.get("dm_refused", ()):
+        # the DM rule declined a whole channel; an empty answered count would hide it
+        lines.append(f"dm-rule: REFUSED channel={ch} — {why}")
+    # Issue #8: the follow-up sweep's own refusals (it reports thread errors with the rest).
+    for ch, method in summary.get("followup_rate_limited", ()):
+        lines.append(f"followup-sweep: RATE-LIMITED channel={ch} method={method} — "
+                     "follow-ups under answered asks not looked for this cycle")
+    for ch in summary.get("followup_truncated", ()):
+        lines.append(f"followup-sweep: TRUNCATED channel={ch} — more recently answered "
+                     "threads than this cycle's leftover budget; the rest wait for a later cycle")
     return lines
+
+
+def sources_from(cfg, adapters) -> list:
+    """One Source per instance, carrying everything the loop reads from config — the
+    taxonomy, the hedge routing, the answerers and the DM channels (ENH-31), and threaded_is_answered. Module-level
+    so a test can load a settings file and see what the loop would run with (review X5/X6:
+    the wiring could drop a key and every test stayed green)."""
+    return [Source(name=inst.name, adapter=adapters[inst.name],
+                   channels=tuple(ch.id for ch in inst.channels),
+                   taxonomy=Taxonomy.from_config(inst.taxonomy),
+                   escalate_ambiguous=inst.escalate_ambiguous,
+                   answerers=inst.answerers, dm_channels=inst.dm_channels(),
+                   threaded_is_answered=inst.threaded_is_answered)
+            for inst in cfg.instances]
 
 
 def main(argv=None):
@@ -118,11 +142,7 @@ def main(argv=None):
     if args.seed_demo:
         seed_demo(adapters, cfg)
 
-    sources = [Source(name=inst.name, adapter=adapters[inst.name],
-                      channels=tuple(ch.id for ch in inst.channels),
-                      taxonomy=Taxonomy.from_config(inst.taxonomy),
-                      escalate_ambiguous=inst.escalate_ambiguous)
-               for inst in cfg.instances]
+    sources = sources_from(cfg, adapters)
     # Base cadence: the fastest cadence any channel asked for; backoff may widen it
     # (never past 16x), owed work restores it (core/schedule.py, R3).
     base = min((ch.poll_interval_s for inst in cfg.instances

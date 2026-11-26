@@ -1,0 +1,17 @@
+# Streamlit config for the operator dashboard (scripts/dashboard.py), read from the repo root
+# when the dashboard is served from here. scripts/dashboard-serve.sh passes the same values as
+# flags, so a deployment that serves from another directory inherits them too.
+#
+# client.toolbarMode = "viewer": no Deploy menu. Streamlit's default toolbar offers "Deploy"
+# (Community Cloud, "unlimited public apps", other platforms) inside a tool that holds Slack
+# credentials and renders journal text — a public-publishing path the aws-do-agent UI review
+# (2026-10-13, CO-Deploy) flagged. Loopback-only stays the trust boundary; this closes the
+# one in-app publish control. tests/test_dashboard.py pins both the flag and this file.
+[client]
+toolbarMode = "viewer"
+
+[browser]
+gatherUsageStats = false
+
+[server]
+headless = true

@@ -26,7 +26,8 @@ window as you advance:
   what it has acknowledged, so parity is permanently fail-closed and core/parity's
   ENH-27 declaration is the honest explanation — a stub snapshot would mark every
   still-real message "deleted upstream", the one direction that hides a real loss;
-* no send path at any layer, same as channels/slack — and the live HMAC bridge on the
+* no send path at any layer (channels/slack grew one in ENH-31, behind core/outbox; this
+  adapter did not) — and the live HMAC bridge on the
   incumbent host is explicitly out of scope.
 
 All network I/O is faked via the injectable transport; nothing here touches Telegram.

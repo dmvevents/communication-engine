@@ -255,15 +255,29 @@ class Journal:
             args = (channel,)
         return self.conn.execute(q + " ORDER BY ts", args).fetchall()
 
-    def answered(self, channel: str | None = None) -> list:
+    def used_response_keys(self, channel: str, prefix: str) -> set:
+        """Every response_key in this channel starting with `prefix`. The DM rule asks
+        which messages already closed an ask, so one message closes at most one ask,
+        EVER — without this, the answer that closed ask 2.0 in one cycle closed ask 1.0
+        in the next, and its owed work with it (independent review of ENH-31, F1)."""
+        rows = self.conn.execute(
+            "SELECT response_key FROM journal WHERE channel=? AND response_key LIKE ?",
+            (channel, prefix + "%")).fetchall()
+        return {r[0] for r in rows}
+
+    def answered(self, channel: str | None = None, since: float | None = None) -> list:
         """The closable complement of unanswered(): rows already tied to a response.
         The reference scheduler closes message-routed owed work from this set — by
-        re-deriving each row's owed id, never by parsing ids back apart."""
+        re-deriving each row's owed id, never by parsing ids back apart. `since` keeps
+        the rows answered at or after it (the follow-up sweep's window, issue #8)."""
         q = "SELECT * FROM journal WHERE responded_at IS NOT NULL"
         args: tuple = ()
         if channel:
             q += " AND channel=?"
             args = (channel,)
+        if since is not None:
+            q += " AND responded_at >= ?"
+            args += (float(since),)
         return self.conn.execute(q + " ORDER BY ts", args).fetchall()
 
     def ambiguity_stats(self) -> dict:

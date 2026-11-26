@@ -22,9 +22,11 @@ jobs:
         # would SURVIVE and fail the teeth gate. Pinned to the version the downstream
         # container (aws-do-agent setup/install-comms.sh) pins.
         run: pip install streamlit==1.63.0
-      - name: unit tests
-        run: python3 -m unittest discover -s tests -v
+      - name: unit tests (under the loopback-only network guard)
+        # tests/netguard/sitecustomize.py refuses any non-loopback socket: the promise
+        # "nothing in the suite reaches slack.com" is enforced here, not only stated.
+        run: PYTHONPATH=tests/netguard python3 -m unittest discover -s tests -v
       - name: mutation check (the suite must have teeth)
         # A green suite proves nothing on its own — this deletes each load-bearing
         # property and requires the suite to go red. See tests/mutation_check.sh.
-        run: bash tests/mutation_check.sh
+        run: PYTHONPATH=tests/netguard bash tests/mutation_check.sh

@@ -202,7 +202,7 @@ classifier regresses silently.
 ```sh
 bash scripts/sanitize-gate.sh --self-test     # healthy: catches all 10 planted secret classes
 bash tests/mutation_check.sh                  # healthy: "every removed property turned the suite red"
-ls .git/hooks/pre-commit .git/hooks/pre-push  # healthy: both paths print
+ls .git/hooks/pre-commit .git/hooks/pre-push .git/hooks/commit-msg  # healthy: all three paths print
 ```
 
 A `No such file or directory` from that last line means a gate is not installed — run

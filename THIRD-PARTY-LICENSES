@@ -1,0 +1,60 @@
+THIRD-PARTY LICENSES — communication-engine v0.2.0
+
+The engine core (core/, channels/, watchers/ and the scripts other than the dashboard) uses only
+the Python standard library. The one third-party package the code imports is Streamlit, an
+optional extra for the operator dashboard (scripts/dashboard.py, scripts/dashboard_config.py,
+scripts/dashboard_write.py) and the tests of those three scripts. This repository vendors and
+redistributes no third-party code: the packages below are installed separately, by
+`pip install streamlit==1.63.0` (the version CI pins).
+
+Resolved by pip on 2026-11-26 for streamlit 1.63.0 on CPython 3.12 (Linux) and CPython 3.13
+(macOS). Only streamlit is pinned; the other versions can move with each install.
+
+Package                    Version     License (SPDX)                                      Required by                                       Project
+-------------------------  ----------  --------------------------------------------------  ------------------------------------------------  -------
+streamlit                  1.63.0      Apache-2.0                                          (direct)                                          https://streamlit.io
+altair                     6.3.0       BSD-3-Clause                                        streamlit                                         https://github.com/vega/altair
+anyio                      4.16.0      MIT                                                 starlette, streamlit                              https://github.com/agronholm/anyio
+attrs                      26.1.0      MIT                                                 jsonschema, referencing                           https://github.com/python-attrs/attrs
+certifi                    2026.11.20  MPL-2.0                                             requests                                          https://github.com/certifi/python-certifi
+charset-normalizer         3.5.3       MIT                                                 requests                                          https://charset-normalizer.readthedocs.io/
+click                      8.5.1       BSD-3-Clause                                        streamlit, uvicorn                                https://github.com/pallets/click/
+h11                        0.16.0      MIT                                                 uvicorn                                           https://github.com/python-hyper/h11
+httptools                  0.9.0       MIT                                                 streamlit                                         https://github.com/MagicStack/httptools
+idna                       3.20        BSD-3-Clause                                        anyio, requests                                   https://github.com/kjd/idna
+itsdangerous               2.2.0       BSD-3-Clause                                        streamlit                                         https://github.com/pallets/itsdangerous/
+Jinja2                     3.1.6       BSD-3-Clause                                        altair, pydeck                                    https://github.com/pallets/jinja/
+jsonschema                 4.26.0      MIT                                                 altair                                            https://github.com/python-jsonschema/jsonschema
+jsonschema-specifications  2025.9.1    MIT                                                 jsonschema                                        https://github.com/python-jsonschema/jsonschema-specifications
+MarkupSafe                 3.0.4       BSD-3-Clause                                        jinja2                                            https://github.com/pallets/markupsafe/
+narwhals                   2.29.0      MIT                                                 altair                                            https://github.com/narwhals-dev/narwhals
+numpy                      2.5.5       BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0  pandas, pydeck, streamlit                         https://numpy.org
+packaging                  26.4        Apache-2.0 OR BSD-2-Clause                          altair, streamlit                                 https://github.com/pypa/packaging
+pandas                     3.1.1       BSD-3-Clause                                        streamlit                                         https://pandas.pydata.org
+pillow                     12.3.0      MIT-CMU                                             streamlit                                         https://python-pillow.github.io
+protobuf                   7.36.2      BSD-3-Clause                                        streamlit                                         https://developers.google.com/protocol-buffers/
+pyarrow                    25.0.1      Apache-2.0                                          streamlit                                         https://arrow.apache.org/
+pydeck                     0.9.3       Apache-2.0                                          streamlit                                         https://github.com/visgl/deck.gl/tree/master/bindings/pydeck
+python-dateutil            4.0.0       Apache-2.0 AND BSD-3-Clause                         pandas                                            https://github.com/dateutil/dateutil
+python-multipart           0.0.34      Apache-2.0                                          streamlit                                         https://github.com/Kludex/python-multipart
+referencing                0.37.0      MIT                                                 jsonschema, jsonschema-specifications             https://github.com/python-jsonschema/referencing
+requests                   2.34.2      Apache-2.0                                          streamlit                                         https://github.com/psf/requests
+rpds-py                    2026.9.1    MIT                                                 jsonschema, referencing                           https://github.com/crate-py/rpds
+starlette                  1.10.0      BSD-3-Clause                                        streamlit                                         https://github.com/Kludex/starlette
+toml                       0.10.2      MIT                                                 streamlit                                         https://github.com/uiri/toml
+typing_extensions          4.16.0      PSF-2.0                                             altair, anyio, referencing, starlette, streamlit  https://github.com/python/typing_extensions
+tzdata                     2026.6      Apache-2.0                                          python-dateutil                                   https://github.com/python/tzdata
+urllib3                    2.8.0       MIT                                                 requests                                          https://urllib3.readthedocs.io
+uvicorn                    0.54.0      BSD-3-Clause                                        streamlit                                         https://uvicorn.dev/
+watchdog                   6.0.0       Apache-2.0                                          streamlit (not on macOS)                          https://github.com/gorakhargosh/watchdog/
+websockets                 16.1.1      BSD-3-Clause                                        streamlit                                         https://github.com/python-websockets/websockets
+
+Also used, not bundled:
+  CPython and its standard library      PSF-2.0   (the runtime; docs/QUICKSTART.md: Python 3.11+)
+  actions/checkout@v4                   MIT       (CI only, .github/workflows)
+  actions/setup-python@v5               MIT       (CI only, .github/workflows)
+
+License identifiers are the SPDX expression in each package's metadata or, where the metadata
+gives only a generic classifier or free text, the license of the file the package ships. Each
+package's own license file is authoritative; read it in the installed distribution's
+*.dist-info directory or at the project URL above.

@@ -1,8 +1,9 @@
 """channels/telegram — the read-only Telegram bot adapter (ENH-25).
 
-First NON-Slack platform, landed as a pure dir-drop (R11: zero core/ changes). Like
-channels/slack, read-only is enforced in layers, not promised in prose: no send,
-read_back, or delivery primitive exists on this class, and `_api` — the one funnel every
+First NON-Slack platform, landed as a pure dir-drop (R11: zero core/ changes). Read-only
+is enforced in layers, not promised in prose (as channels/slack's read path was before its
+ENH-31 send path, which is reachable only through core/outbox): no send, read_back, or
+delivery primitive exists on this class, and `_api` — the one funnel every
 request passes through — default-DENIES any Bot API method outside READ_METHODS before a
 byte reaches the wire. The incumbent host's live HMAC bridge and its reply path are
 explicitly out of scope; this adapter is a fresh, config-driven client.

@@ -117,6 +117,22 @@ class Source:
     # only logging them. Per source, like the taxonomy: whether hedges deserve human
     # eyes depends on the channel's vocabulary and traffic, not on the engine.
     escalate_ambiguous: bool = False
+    # ENH-31: who may close an ask (empty = any non-asker whose reply is not an ask),
+    # shared by the thread rule and the DM rule; and which channels are 1:1 DMs, where
+    # a TOP-LEVEL message from an answerer closes the ask (DMs have no threads in
+    # practice: measured 535 DM messages, 0 in-thread).
+    answerers: tuple = ()
+    dm_channels: tuple = ()
+    # threaded_is_answered (2026-10-31): a message that has a thread is answered. ON: an
+    # open ask whose polled row shows a reply from someone other than the asker is tied
+    # at ingest (core/threads.answered_from_summary, no platform call - the thread is
+    # fetched later by the follow-up sweep, which journals a question in it), and in the
+    # sweep any such reply answers, a question included (there the follow-up is fetched
+    # and owed on its own row). OFF: the sweep is the one in-thread route and a reply
+    # that is itself an ask does not answer (review F7). Per source, like the taxonomy:
+    # what counts as an answer in a 1:1 channel with an agent differs from a team's
+    # support channel.
+    threaded_is_answered: bool = True
 
 
 class Scheduler:
@@ -179,7 +195,8 @@ class Scheduler:
         now = self.clock()
         polled = fresh = answered = 0
         sweep_rate_limited, sweep_truncated, sweep_errors = [], [], []
-        sweep_skipped = []
+        sweep_skipped, dm_refused = [], []
+        followup_rate_limited, followup_truncated = [], []
         for src in self.sources:
             for ch in src.channels:
                 cursor = self.store.cursor_get(src.name, ch)
@@ -192,6 +209,20 @@ class Scheduler:
                 # journal absorbs the duplicates; the swapped order loses the tail
                 # of the batch forever (the incumbent's 24-auto-reconcile seam).
                 fresh += self._journal_and_route(ch, mine, src)
+                if src.threaded_is_answered:
+                    # An ask that visibly has a thread — its own polled row names a
+                    # replier other than the asker — is answered here, at ingest, with
+                    # no replies() call (threaded_is_answered). Before the cursor
+                    # commits, like the journaling: a crash between the two re-polls
+                    # the row and ties it again. The sweep below serves the asks whose
+                    # thread grew after their row was polled (a cursored history poll
+                    # never serves a parent twice).
+                    tie_errors = []         # one row's failure never holds the cursor
+                    ties = threads.answered_from_summary(
+                        src.adapter, self.journal, ch, mine, answerers=src.answerers,
+                        errors=tie_errors)
+                    answered += len(ties or ())
+                    sweep_errors.extend((ch, ts, msg) for ts, msg in tie_errors)
                 self._commit_cursor(src.name, ch, cursor, new_cursor)
                 polled += len(mine)
             # ENH-30: the open asks' threads. A history poll never serves a thread
@@ -214,7 +245,10 @@ class Scheduler:
             # one-Scheduler-per-run keeps every guarantee. A 429 ends this source's
             # sweeping for the cycle; polling is already done.
             budget = threads.SWEEP_MAX
-            order = self._sweep_order_for(src)
+            # A declared DM has no threads in practice (535 DM messages, 0 in-thread) and
+            # its asks close by the DM rule below, so its asks must not spend the thread
+            # budget every cycle (review N2).
+            order = [c for c in self._sweep_order_for(src) if c not in src.dm_channels]
             swept_now, skipped_now, spent = [], [], {}
             stopped = None              # set once a 429 ends this source's sweeping
             for i, ch in enumerate(order):
@@ -227,14 +261,20 @@ class Scheduler:
                     continue
                 swept_now.append(ch)
                 allow = max(1, budget - (len(order) - 1 - i))
+                # A reply that classifies as an ask of its own is a new question,
+                # never the answer (review F7); the source's vocabulary decides —
+                # unless the source counts a message that has a thread as answered
+                # (threaded_is_answered): then any reply from someone else answers,
+                # and the follow-up question, fetched here, is owed on its own row.
+                is_answer = None
+                if not src.threaded_is_answered:
+                    is_answer = lambda m, _src=src: classify(  # noqa: E731
+                        m.get("text") or "", _src.taxonomy,
+                        attachments=m.get("attachments")).kind not in ACTIONABLE_KINDS
                 swept = threads.sweep(
                     src.adapter, self.store, self.journal, ch, max_threads=allow,
                     start=self.store.sweep_start_get(src.name, ch),
-                    # A reply that classifies as an ask of its own is a new question,
-                    # never the answer (review F7); the source's vocabulary decides.
-                    is_answer=lambda m, _src=src: classify(
-                        m.get("text") or "", _src.taxonomy,
-                        attachments=m.get("attachments")).kind not in ACTIONABLE_KINDS)
+                    is_answer=is_answer, answerers=src.answerers)
                 if swept is not None:
                     # Charged by ATTEMPT: a refused fetch cost the platform a call too
                     # (review F2 — an all-errors channel was charged nothing, and the
@@ -258,6 +298,43 @@ class Scheduler:
                     if swept["truncated"]:
                         sweep_truncated.append(ch)
                     sweep_errors.extend((ch, ts, msg) for ts, msg in swept["errors"])
+            # ENH-31 B: a 1:1 DM has no threads to sweep; its asks close on the next
+            # top-level message by an answerer. Store-only — no platform call, no budget.
+            for ch in src.dm_channels:
+                answered += len(threads.close_dm_asks(
+                    self.store, self.journal, ch, answerers=src.answerers,
+                    is_answer=lambda m, _src=src: classify(
+                        m.get("text") or "", _src.taxonomy,
+                        attachments=m.get("attachments")).kind not in ACTIONABLE_KINDS,
+                    refusals=dm_refused))        # named, like the sweep's (round 2, R2-13)
+            # Issue #8: then the threads of asks answered within FOLLOWUP_WINDOW_S, so a
+            # follow-up under an answer (often a new question) is listed and, when it is
+            # an ask, owed. Lowest priority: only what the open asks left of this budget,
+            # one call still reserved for every channel waiting, nothing after a 429. It
+            # never ties: an answered ask stays answered by what answered it.
+            # `order` holds no DM channel (see above): a DM has no threads in practice
+            # and a follow-up in a DM is a top-level message the poll reads, so DMs stay
+            # out of this sweep as they stay out of the open-ask sweep.
+            fu_key = threads.followup_window_key(src.name)
+            for i, ch in enumerate(order):
+                if budget <= 0:
+                    break
+                fu = threads.sweep_followups(
+                    src.adapter, self.store, self.journal, ch,
+                    max_threads=max(1, budget - (len(order) - 1 - i)),
+                    start=self.store.sweep_start_get(fu_key, ch))
+                if fu is None:
+                    break               # no replies(): declared absent for this source
+                budget -= fu["calls"]
+                # Journaled before the window commits past them, as above (review R2-2).
+                fresh += self._journal_and_route(ch, fu["replies"], src)
+                self.store.sweep_start_set(fu_key, ch, fu["next_start"])
+                if fu["rate_limited"]:
+                    followup_rate_limited.append((ch, fu["rate_limited"]))
+                    budget = 0
+                if fu["truncated"]:
+                    followup_truncated.append(ch)
+                sweep_errors.extend((ch, ts, msg) for ts, msg in fu["errors"])
             # The channel that took the bulk — the one that SPENT the most — goes to the
             # back (review F3: rotating position 0 let a small channel's turn hand the
             # bulk straight back to the same backlog channel); skipped ones go first.
@@ -275,7 +352,9 @@ class Scheduler:
                 "unattended": unattended, "next_interval": self._interval,
                 "sweep_rate_limited": sweep_rate_limited,
                 "sweep_truncated": sweep_truncated, "sweep_errors": sweep_errors,
-                "sweep_skipped": sweep_skipped}
+                "followup_rate_limited": followup_rate_limited,
+                "followup_truncated": followup_truncated,
+                "sweep_skipped": sweep_skipped, "dm_refused": dm_refused}
 
     def _sweep_order_for(self, src) -> list:
         """This cycle's sweep order for one source, read from the store (so it survives
