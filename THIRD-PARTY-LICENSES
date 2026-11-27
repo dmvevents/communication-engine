@@ -1,4 +1,4 @@
-THIRD-PARTY LICENSES — communication-engine v0.2.0
+THIRD-PARTY LICENSES — communication-engine v0.2.1
 
 The engine core (core/, channels/, watchers/ and the scripts other than the dashboard) uses only
 the Python standard library. The one third-party package the code imports is Streamlit, an

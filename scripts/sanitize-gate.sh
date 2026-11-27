@@ -70,7 +70,9 @@ scan() {
 
   for entry in "${CLASSES[@]}"; do
     name="${entry%%|*}"; regex="${entry#*|}"
-    hits="$(printf '%s\n' "$files" | xargs -d '\n' grep -HnE "$regex" -- 2>/dev/null || true)"
+    # NUL-separated (`xargs -0`), never `xargs -d '\n'`: -d is GNU-only, BSD xargs (macOS)
+    # refuses it, and the `|| true` hid that, so on macOS the gate scanned nothing and PASSED.
+    hits="$(printf '%s\n' "$files" | tr '\n' '\0' | xargs -0 grep -HnE "$regex" -- 2>/dev/null || true)"
     if [ "$name" = "ipv4" ] && [ -n "$hits" ]; then
       hits="$(printf '%s\n' "$hits" | grep -vE "$IPV4_ALLOW" || true)"
     fi
@@ -90,7 +92,7 @@ scan() {
     dl="$HOME/.config/communication-engine/denylist.local"
   fi
   if [ -n "$dl" ]; then
-    hits="$(printf '%s\n' "$files" | xargs -d '\n' grep -HnEf "$dl" -- 2>/dev/null || true)"
+    hits="$(printf '%s\n' "$files" | tr '\n' '\0' | xargs -0 grep -HnEf "$dl" -- 2>/dev/null || true)"
     if [ -n "$hits" ]; then
       findings=1
       printf '%s\n' "$hits" | sed 's|^|[local-denylist] |'

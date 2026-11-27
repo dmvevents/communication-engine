@@ -25,13 +25,19 @@ policy `staged` — a human click on the write surface (ENH-31) — for a bot to
 other adapter is read-only, and `watchers/` is a stub. A reference scheduler ships
 (`scripts/scheduler.py`): a guarded, read-only probe → classify → journal → route → owed
 loop you run under your own supervisor. An operator dashboard ships too
-(`scripts/dashboard.py` over `core/dashboard.py`): a read-only, loopback-only Streamlit
-surface over YOUR journal and outboxes — severity-ordered attention (crashed sends,
-answers invalidated by edits, drafts at the gate, the unanswered backlog); streamlit is
-the one optional extra it needs, and the engine core never imports it. The gate itself
-is on the surface now, OFF by default: `COMMS_UI_WRITE_ENABLED=true` adds a write half
-(`scripts/dashboard_write.py`) where composing stages a draft and only a human click on
-that exact text releases it through the outbox ladder — the engine never auto-sends.
+(`scripts/dashboard.py` over `core/dashboard.py`): a loopback-only Streamlit surface over
+YOUR journal and outboxes that itself never sends anything by default — severity-ordered
+attention (crashed sends, answers invalidated by edits, drafts at the gate, the unanswered
+backlog); streamlit is the one optional extra it needs, and the engine core never imports it.
+Its "Check for new messages" button runs the configured watch script: `scripts/chat_intake.py`
+runs whatever `SLACK_WATCH_SCRIPT` names, once, with the dashboard's environment. The default,
+`/agent/slack-watch.sh`, is not part of this repo: the consumer's container image provides it
+(there, a read-only Slack intake that takes its own lock), and without it the button reports
+"missing". Any other script does whatever it does. That button is not gated by
+`COMMS_UI_WRITE_ENABLED`: it shows with the write half on or off.
+The gate itself is on the surface now, OFF by default: `COMMS_UI_WRITE_ENABLED=true` adds a
+write half (`scripts/dashboard_write.py`) where composing stages a draft and only a human
+click on that exact text releases it through the outbox ladder — the engine never auto-sends.
 
 ## Quickstart
 

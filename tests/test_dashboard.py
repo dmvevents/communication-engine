@@ -520,6 +520,49 @@ class DashboardAppTest(unittest.TestCase):
         self.assertIn("COMMS_SETTINGS", errors,
                       "the panel must say how to point the app at a real config")
 
+    def use_slack_dir(self, log, inbox=""):
+        """A responder state dir for the queue panel, SLACK_DIR for this test only."""
+        slack = Path(self.tmp.name) / "slack"
+        slack.mkdir()
+        (slack / "chat.log").write_text(log, encoding="utf-8")
+        (slack / "inbox.jsonl").write_text(inbox, encoding="utf-8")
+        saved = os.environ.get("SLACK_DIR")
+        os.environ["SLACK_DIR"] = str(slack)
+
+        def restore():
+            if saved is None:
+                os.environ.pop("SLACK_DIR", None)
+            else:
+                os.environ["SLACK_DIR"] = saved
+        self.addCleanup(restore)
+
+    def test_one_unreadable_responder_line_does_not_take_down_the_page(self):
+        """A text cut off by a newline in chat.log, a START whose timeout is no whole
+        number, an inbox line that is no JSON object: each raised inside the queue
+        panel and took the whole page with it. Each is skipped, and the panel says
+        how many."""
+        self.use_slack_dir(
+            '2000-01-01T08:01:22Z CHAT MSG ts=cut.1 kind=model text="cut by a newline\n'
+            "2000-01-01T08:01:22Z CHAT START poll=6s timeout=²s channels=C_EXAMPLE_CHANNEL\n",
+            "[1, 2]\n")
+        at = self.run_app(self.base / "settings.json")
+        self.assertFalse(at.exception, f"the app crashed: {at.exception}")
+        captions = "\n".join(str(c.value) for c in at.caption)
+        self.assertIn("unreadable lines skipped, not shown below: 2 in chat.log, "
+                      "1 in inbox.jsonl", captions)
+
+    def test_the_queue_panel_escapes_the_log_derived_model_duration(self):
+        """duration_s comes from the responder's log and lands in dom_table's
+        unsafe_allow_html block, so it is escaped like the cells beside it."""
+        self.use_slack_dir(
+            "2000-01-01T08:01:22Z CHAT MODEL ts=2.1 rc=0 duration=<u>dur</u>s posted=yes\n"
+            "2000-01-01T08:01:22Z CHAT REPLY ts=2.1 kind=model ok posted=3.1\n")
+        at = self.run_app(self.base / "settings.json")
+        self.assertFalse(at.exception, f"the app crashed: {at.exception}")
+        body = self.rendered(at)
+        self.assertIn("&lt;u&gt;dur&lt;/u&gt; s", body)
+        self.assertNotIn("<u>dur</u>", body)
+
 
 
 class HtmlTextTest(unittest.TestCase):

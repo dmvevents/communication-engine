@@ -7,8 +7,13 @@ write side uses), and everything on screen comes from that one read-only snapsho
 
 Read-only twice over BY DEFAULT: core/outbox is never imported by this file
 (tests/test_dashboard.py holds an AST check on it, like the scheduler's), and every
-database connection is core/dashboard's sqlite mode=ro — so no bug here can post as
-anyone or touch the audit trail it displays. The optional write surface (ENH-28) is a
+database connection is core/dashboard's sqlite mode=ro — so the dashboard itself never
+sends and cannot touch the audit trail it displays. One button reaches outside it:
+"Check for new messages" runs the configured watch script (SLACK_WATCH_SCRIPT, through
+scripts/chat_intake.py) with this process's environment; by default that is
+/agent/slack-watch.sh, which this repo does not ship (the consumer's container image
+provides it), and what any script does is that script's own.
+The optional write surface (ENH-28) is a
 separate module, scripts/dashboard_write.py, loaded ONLY when the environment says
 COMMS_UI_WRITE_ENABLED=true — with the gate off (or unset) the send layer is not just
 unused but unreachable, and even with it on, nothing sends without a human click on
@@ -39,6 +44,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.config import ConfigError, load  # noqa: E402
 from core.dashboard import SEVERITY, html_text, snapshot  # noqa: E402
+from core.chat_queue import snapshot as chat_queue_snapshot  # noqa: E402
+
+# The "Check for new messages" handler (G143): runs the Slack INTAKE once — a fetch into
+# the responder's inbox, never a send — so it lives beside this shell, not in core/.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import chat_intake  # noqa: E402
 
 try:
     import streamlit as st
@@ -125,15 +136,37 @@ with st.sidebar:
     st.markdown("### communication engine")
     st.caption(f"config: `{cfg_path.resolve()}`")
     st.caption(f"instances: {', '.join(sorted(outbox_paths))}")
-    if st.button("↻ Re-read state"):
+    col_reread, col_fetch = st.columns(2)
+    if col_reread.button("↻ Re-read state"):
         st.rerun()
+    # G143: Send/Receive. Runs the configured watch script (SLACK_WATCH_SCRIPT, by default
+    # /agent/slack-watch.sh, not shipped here) ONCE, then re-reads the state, so a
+    # message that just arrived shows in the Journal within seconds. With the responder's
+    # continuous intake on, this is a manual trigger of what runs every
+    # SLACK_CHAT_POLL_INTERVAL (default 5 s) anyway. The dashboard itself posts nothing.
+    if col_fetch.button("⇄ Check for new messages",
+                        help="Run the configured watch script now (SLACK_WATCH_SCRIPT; by "
+                             "default /agent/slack-watch.sh, which the consumer's image "
+                             "provides), once; a 429 pause is honored. Then re-read. The dashboard "
+                             "itself sends nothing. The continuous intake runs the same "
+                             "fetch every SLACK_CHAT_POLL_INTERVAL; this button does not "
+                             "wait for it."):
+        st.session_state["intake_result"] = chat_intake.run_once()
+        st.rerun()
+    intake_result = st.session_state.get("intake_result")
+    if intake_result:
+        glyph = {"ok": "✓", "busy": "…", "paused": "⏸", "failed": "✖", "missing": "✖",
+                 "timeout": "✖"}.get(intake_result["status"], "?")
+        st.caption(f"{glyph} intake {intake_result['status']} at {intake_result['utc']}"
+                   f" ({intake_result['seconds']} s): {intake_result['summary']}")
     if WRITE_ENABLED:
         st.caption(f"read {time.strftime('%H:%M:%SZ', time.gmtime())} · write surface "
                    "ENABLED (COMMS_UI_WRITE_ENABLED=true): composing stages a draft; "
                    "nothing sends without your click on that exact text")
     else:
         st.caption(f"read {time.strftime('%H:%M:%SZ', time.gmtime())} · every connection "
-                   "is read-only (sqlite mode=ro); this surface cannot send or edit")
+                   "is read-only (sqlite mode=ro); the dashboard itself cannot send or edit "
+                   "(⇄ runs the configured watch script)")
 
 st.title("operator dashboard")
 st.caption("What needs a human, from your journal and outbox — severity first, "
@@ -177,6 +210,64 @@ tiles[0].metric("Distinct messages", "—" if j is None else j["distinct"])
 for i, sev in enumerate(SEVERITY, start=1):
     tiles[i].metric(LABEL[sev].title(),
                     sum(1 for a in attention if a["severity"] == sev))
+
+# ---- the responder queue (G143) ---------------------------------------------------
+# What the Slack chat responder is doing RIGHT NOW, from the files it maintains — so a
+# slow answer is visible here and a harness restart is never needed to find out.
+slack_dir = Path(os.environ.get("SLACK_DIR", chat_intake.DEFAULT_SLACK_DIR))
+q = chat_queue_snapshot(slack_dir)
+q_state = q["state"]
+alive = q_state["pid_alive"]
+alive_word = ("alive" if alive else "NOT RUNNING") if alive is not None else "unknown"
+q_title = (f"Responder queue — {len(q['answering'])} answering · {len(q['waiting'])} waiting"
+           f" · responder {q_state['status']} ({alive_word})")
+with st.expander(q_title, expanded=bool(q["answering"] or q["waiting"]
+                                       or q_state["status"] != "POLLING")):
+    st.caption(f"source: `{slack_dir}` (chat.state, chat.log, inbox.jsonl, chat-intake.last) · "
+               f"read {q['now_utc']} · last intake "
+               f"{q['intake_last'] or 'unknown — no intake record yet'} · responder pid "
+               f"{q_state['fields'].get('pid', '—')} {alive_word}, last CHAT START "
+               f"{q['last_start'] or '—'} · answer bound SLACK_CHAT_TIMEOUT "
+               f"{q['timeout_s'] or '1500 (default)'} s")
+    junk = {name: n for name, n in q["skipped"].items() if n}
+    if junk:
+        st.caption("unreadable lines skipped, not shown below: "
+                   + ", ".join(f"{n} in {name}" for name, n in junk.items()))
+    if q_state["status"] == "missing":
+        st.markdown("_No responder state yet (`chat.state` missing) — the chat responder has not "
+                    "started here, or SLACK_DIR points elsewhere._")
+    if q["answering"]:
+        st.markdown("##### Being answered now")
+        dom_table(("thread", "arrived (ts)", "answering since", "elapsed", "text"),
+                  [(html.escape(a["thread"]), html.escape(a["ts"]), html.escape(a["since"]),
+                    f"{a['elapsed_s'] // 60} min {a['elapsed_s'] % 60} s"
+                    + (" <b>(past the timeout bound)</b>"
+                       if q["timeout_s"].isdigit() and a["elapsed_s"] > int(q["timeout_s"])
+                       else ""),
+                    html.escape(a["text"]))
+                   for a in q["answering"]])
+    else:
+        st.markdown("_Nothing being answered right now._")
+    if q["waiting"]:
+        st.markdown("##### Waiting in the inbox")
+        dom_table(("thread", "ts", "age", "user", "text"),
+                  [(html.escape(w["thread"]), html.escape(w["ts"]),
+                    "—" if w["age_s"] is None else f"{w['age_s'] // 60} min {w['age_s'] % 60} s",
+                    html.escape(str(w["user"])), html.escape(w["text"]))
+                   for w in q["waiting"]])
+    else:
+        st.markdown("_Inbox empty — nothing waiting._")
+    if q["answers"]:
+        st.markdown("##### Last answers (newest first)")
+        dom_table(("answered (UTC)", "thread", "arrival → answer", "model call", "kind"),
+                  [(html.escape(a["utc"]), html.escape(a["thread"]),
+                    "—" if a["arrival_to_answer_min"] is None
+                    else f"{a['arrival_to_answer_min']} min",
+                    f"{html.escape(a['duration_s'])} s" if a["duration_s"] else "—",
+                    html.escape(a["kind"] or "—"))
+                   for a in q["answers"]])
+    if q["resumes"]:
+        st.caption("re-answered after a restart (CHAT RESUME): " + ", ".join(q["resumes"]))
 
 # ---- the detail tabs ----------------------------------------------------------
 journal_tab, outbox_tab, parity_tab = st.tabs(["Journal", "Outbox", "Parity"])
